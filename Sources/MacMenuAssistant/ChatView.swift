@@ -267,6 +267,9 @@ final class ChatController: NSObject, ObservableObject {
     @Published var whatsappNotificationError: String?
     private var whatsappBridgeProcess: Process?
     private var whatsappTerminationObserver: NSObjectProtocol?
+    @Published var telegramBridgeStatus = "Not configured"
+    private var telegramBridgeProcess: Process?
+    private var telegramTerminationObserver: NSObjectProtocol?
     /// Bumped by the Control+Shift+§ shortcut; the menu bar label opens the HUD when it changes.
     @Published var hudRequests = 0
     /// Three background agents, each with its own engine, conversation and coloured cursor.
@@ -409,6 +412,98 @@ final class ChatController: NSObject, ObservableObject {
         }
         process.terminate()
         whatsappBridgeStatus = "Stopping…"
+    }
+
+    func startTelegramBridge() {
+        guard telegramBridgeProcess?.isRunning != true else {
+            telegramBridgeStatus = "Running"
+            return
+        }
+        guard let botToken = KeyStore.readSecret("telegram.bot-token") else {
+            telegramBridgeStatus = "Save the Telegram bot token first."
+            return
+        }
+        let python = projectRoot.appendingPathComponent(".venv/bin/python")
+        let script = projectRoot.appendingPathComponent("telegram_bridge.py")
+        guard FileManager.default.isExecutableFile(atPath: python.path),
+              FileManager.default.fileExists(atPath: script.path) else {
+            telegramBridgeStatus = "Project Python or telegram_bridge.py is missing."
+            return
+        }
+
+        let child = Process()
+        let output = Pipe()
+        child.executableURL = python
+        child.arguments = ["-u", script.path]
+        child.currentDirectoryURL = projectRoot
+        child.standardOutput = output
+        child.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["ASSISTANT_PROJECT_DIR"] = projectRoot.path
+        environment["HELM_TELEGRAM_BOT_TOKEN"] = botToken
+        environment["HELM_TELEGRAM_OWNER_CHAT_ID"] =
+            UserDefaults.standard.string(forKey: "telegram.owner-chat-id") ?? ""
+        environment["HELM_TELEGRAM_PYTHON"] = python.path
+        environment["HELM_TELEGRAM_PROVIDER"] = provider
+        if !model(for: provider).isEmpty {
+            environment["HELM_TELEGRAM_MODEL"] = model(for: provider)
+        }
+        if provider != "ollama", let key = KeyStore.read(provider) {
+            environment["HELM_API_KEY"] = key
+        }
+        environment["HELM_TELEGRAM_DISABLED_TOOLS"] = disabledTools.sorted().joined(separator: ",")
+        child.environment = environment
+        child.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async {
+                guard self?.telegramBridgeProcess === process else { return }
+                self?.telegramBridgeProcess = nil
+                self?.telegramBridgeStatus = process.terminationStatus == 0
+                    ? "Stopped"
+                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+            }
+        }
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async {
+                if let line = text.components(separatedBy: .newlines)
+                    .first(where: { $0.hasPrefix("TELEGRAM_BRIDGE_READY:") }) {
+                    self?.telegramBridgeStatus = "Running — " + line.dropFirst("TELEGRAM_BRIDGE_READY:".count)
+                } else if let line = text.components(separatedBy: .newlines)
+                    .first(where: { $0.hasPrefix("TELEGRAM_BRIDGE_ERROR:") }) {
+                    self?.telegramBridgeStatus = String(line.dropFirst("TELEGRAM_BRIDGE_ERROR:".count))
+                }
+            }
+        }
+        do {
+            try child.run()
+            telegramBridgeProcess = child
+            telegramBridgeStatus = "Starting…"
+            if telegramTerminationObserver == nil {
+                telegramTerminationObserver = NotificationCenter.default.addObserver(
+                    forName: NSApplication.willTerminateNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.stopTelegramBridge()
+                }
+            }
+        } catch {
+            telegramBridgeStatus = "Could not start bridge: \(error.localizedDescription)"
+        }
+    }
+
+    func stopTelegramBridge() {
+        guard let process = telegramBridgeProcess, process.isRunning else {
+            telegramBridgeStatus = "Stopped"
+            return
+        }
+        process.terminate()
+        telegramBridgeStatus = "Stopping…"
     }
 
     private var appShortcuts: [GlobalHotKey] = []
@@ -2400,6 +2495,82 @@ struct WhatsAppSettingsView: View {
     }
 }
 
+struct TelegramSettingsView: View {
+    @EnvironmentObject private var chat: ChatController
+    @AppStorage("telegram.owner-chat-id") private var ownerChatID = ""
+    @State private var tokenDraft = ""
+    @State private var saveStatus: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("TELEGRAM BOT")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
+            Text("No phone number, business account or public tunnel needed — the bot polls Telegram directly. The Mac and Helm must stay awake and online.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                SecureField(KeyStore.hasSecret("telegram.bot-token") ? "Bot token saved (enter to replace)" : "Bot token from @BotFather", text: $tokenDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") { saveToken() }
+                    .disabled(tokenDraft.isEmpty)
+            }
+            HStack(spacing: 10) {
+                TextField("Owner chat ID (leave empty to pair)", text: $ownerChatID)
+                    .textFieldStyle(.roundedBorder)
+                if let saveStatus {
+                    Text(saveStatus)
+                        .font(.system(size: 11))
+                        .foregroundStyle(saveStatus.hasPrefix("Could") ? .orange : .green)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    chat.startTelegramBridge()
+                } label: {
+                    Label("Start bridge", systemImage: "paperplane")
+                }
+                .disabled(!KeyStore.hasSecret("telegram.bot-token"))
+                Button("Stop") { chat.stopTelegramBridge() }
+                    .disabled(chat.telegramBridgeStatus == "Stopped" || chat.telegramBridgeStatus == "Not configured")
+                Text(chat.telegramBridgeStatus)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(chat.telegramBridgeStatus.hasPrefix("Running") ? .green : .secondary)
+                    .lineLimit(2)
+            }
+
+            GroupBox("Setup") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("1. In Telegram, message @BotFather and send /newbot. Paste the token it gives you above and save it.")
+                    Text("2. Leave the owner chat ID empty and press Start bridge. It runs in pairing mode and won't act on anything yet.")
+                    Text("3. Message your new bot anything in Telegram. It replies with your chat ID — copy that into the field above and save.")
+                    Text("4. Press Start bridge again. From then on only messages from that chat run on this Mac; sensitive steps pause and require APPROVE <code> or DENY <code> in Telegram.")
+                }
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("Log: ~/Library/Logs/Helm/telegram-bridge.log")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func saveToken() {
+        if KeyStore.saveSecret(tokenDraft.trimmingCharacters(in: .whitespacesAndNewlines), key: "telegram.bot-token") {
+            saveStatus = "Bot token saved in Keychain."
+            tokenDraft = ""
+        } else {
+            saveStatus = "Could not save the bot token to Keychain."
+        }
+    }
+}
+
 // MARK: - Settings
 
 struct SettingsView: View {
@@ -2413,6 +2584,7 @@ struct SettingsView: View {
                 Text("Abilities").tag(1)
                 Text("Permissions").tag(2)
                 Text("WhatsApp").tag(3)
+                Text("Telegram").tag(4)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -2423,7 +2595,8 @@ struct SettingsView: View {
                     case 0: ProviderSettingsView()
                     case 1: AbilitiesView()
                     case 2: PermissionsView()
-                    default: WhatsAppSettingsView()
+                    case 3: WhatsAppSettingsView()
+                    default: TelegramSettingsView()
                     }
                 }
                 .padding(.horizontal, 24)
