@@ -89,6 +89,10 @@ final class ChatController: ObservableObject {
     @Published var disabledTools = Set(UserDefaults.standard.stringArray(forKey: "disabledTools") ?? []) {
         didSet { UserDefaults.standard.set(Array(disabledTools), forKey: "disabledTools") }
     }
+    @Published var browser = UserDefaults.standard.string(forKey: "browser")
+        ?? (FileManager.default.fileExists(atPath: "/Applications/Google Chrome.app") ? "chrome" : "safari") {
+        didSet { UserDefaults.standard.set(browser, forKey: "browser") }
+    }
     @Published var voiceHotkey = UserDefaults.standard.object(forKey: "voiceHotkey") as? Bool ?? true {
         didSet { UserDefaults.standard.set(voiceHotkey, forKey: "voiceHotkey") }
     }
@@ -174,6 +178,19 @@ final class ChatController: ObservableObject {
         }
     }
     @Published var showProviderSettings = false
+    /// "hud" = full window, "menubar" = compact popup from the menu bar icon.
+    @Published var interfaceStyle = UserDefaults.standard.string(forKey: "interfaceStyle") ?? "hud" {
+        didSet { UserDefaults.standard.set(interfaceStyle, forKey: "interfaceStyle") }
+    }
+
+    /// Screen Recording grants only take effect after a relaunch.
+    static func relaunch() {
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.createsNewApplicationInstance = true
+        NSWorkspace.shared.openApplication(at: Bundle.main.bundleURL, configuration: configuration) { _, _ in
+            DispatchQueue.main.async { NSApp.terminate(nil) }
+        }
+    }
     @Published var savedKeys = Set(ProviderOption.all.compactMap { KeyStore.read($0.id) == nil ? nil : $0.id })
 
     /// Model per provider; empty means the provider's default.
@@ -260,6 +277,7 @@ final class ChatController: ObservableObject {
         if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
         if !disabledTools.isEmpty { arguments += ["--disable-tools", disabledTools.sorted().joined(separator: ",")] }
         if cloudVision { arguments.append("--cloud-vision") }
+        arguments += ["--browser", browser]
         launch(arguments)
     }
 
@@ -358,7 +376,7 @@ final class ChatController: ObservableObject {
         "set_volume": "Adjusting volume",
         "system_status": "Checking system status",
         "control_screen": "Taking control of the screen",
-        "web_search": "Searching the web",
+        "web_search": "Searching in your browser",
         "media_control": "Controlling music",
     ]
 
@@ -391,11 +409,61 @@ final class ChatController: ObservableObject {
     }
 }
 
+/// In HUD mode the menu bar icon is just a launcher, so there is only one chat UI.
+struct MenuLauncher: View {
+    @EnvironmentObject private var chat: ChatController
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 10) {
+                Orb(active: chat.isThinking || chat.isListening, size: 26)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("CHATBOT").font(.system(size: 12, weight: .bold, design: .monospaced)).tracking(3)
+                    Text(chat.isThinking ? "Working…" : chat.onboarded ? "Online" : "Setup not finished")
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                }
+            }
+            Button {
+                openWindow(id: "hud")
+                NSApp.activate(ignoringOtherApps: true)
+            } label: {
+                Label(chat.onboarded ? "Open Chatbot" : "Continue setup", systemImage: "macwindow")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(jarvisCyan)
+            HStack {
+                Button("Settings") {
+                    chat.showProviderSettings = true
+                    openWindow(id: "hud")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                Spacer()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+            }
+            .controlSize(.small)
+        }
+        .padding(16)
+        .preferredColorScheme(.dark)
+    }
+}
+
 /// Chat by default; the original panel stays reachable for permissions and MCP.
 struct ChatRootView: View {
+    @EnvironmentObject private var chat: ChatController
     @State private var showAdvanced = false
 
     var body: some View {
+        if chat.interfaceStyle == "hud" || !chat.onboarded {
+            MenuLauncher().frame(width: 280)
+        } else {
+            panel.frame(width: 420, height: 640)
+        }
+    }
+
+    @ViewBuilder
+    private var panel: some View {
         if showAdvanced {
             VStack(spacing: 0) {
                 HStack {
@@ -749,7 +817,19 @@ struct HUDView: View {
         .sheet(isPresented: $chat.showProviderSettings) {
             SettingsView().preferredColorScheme(.dark)
         }
-        .onAppear { chat.configureVoice() }
+        .onAppear {
+            chat.configureVoice()
+            if chat.onboarded && chat.interfaceStyle == "menubar" { closeHUDWindow() }
+        }
+        .onChange(of: chat.interfaceStyle) { style in
+            if style == "menubar" && chat.onboarded && !chat.showProviderSettings { closeHUDWindow() }
+        }
+    }
+
+    private func closeHUDWindow() {
+        DispatchQueue.main.async {
+            NSApp.windows.filter { $0.title == "Chatbot" && !($0 is NSPanel) }.forEach { $0.close() }
+        }
     }
 
     private var stateText: String {
@@ -1220,6 +1300,18 @@ struct AbilitiesView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
+            Text("INTERFACE")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 10) {
+                styleCard("hud", "Full HUD window", "Big Jarvis screen with the reactor. The menu bar icon just opens it.", "macwindow")
+                styleCard("menubar", "Menu bar popup", "Compact chat that drops down from the menu bar. No big window.", "menubar.rectangle")
+            }
+            Text("ABILITIES")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 ForEach(Ability.all) { ability in
                     let enabled = chat.isEnabled(ability.tools)
@@ -1255,6 +1347,12 @@ struct AbilitiesView: View {
                     .font(.system(size: 11, weight: .semibold, design: .monospaced))
                     .tracking(2)
                     .foregroundStyle(.secondary)
+                Picker("Browser for searches", selection: $chat.browser) {
+                    Text("Google Chrome").tag("chrome")
+                    Text("Safari").tag("safari")
+                }
+                .pickerStyle(.segmented)
+                .frame(maxWidth: 420)
                 Toggle("Voice shortcut — hold Control+Option to talk", isOn: $chat.voiceHotkey)
                 Toggle("Speak replies out loud", isOn: $chat.speakReplies)
                 Toggle("Full autonomy — act on the screen without asking first", isOn: Binding(
@@ -1265,6 +1363,32 @@ struct AbilitiesView: View {
             }
             .font(.system(size: 12))
         }
+    }
+}
+
+extension AbilitiesView {
+    fileprivate func styleCard(_ id: String, _ title: String, _ detail: String, _ symbol: String) -> some View {
+        let selected = chat.interfaceStyle == id
+        return Button {
+            chat.interfaceStyle = id
+        } label: {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: symbol).font(.system(size: 20)).foregroundStyle(selected ? jarvisCyan : .secondary).frame(width: 28)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(title).font(.system(size: 13, weight: .semibold))
+                    Text(detail).font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: selected ? "largecircle.fill.circle" : "circle").foregroundStyle(selected ? jarvisCyan : .secondary)
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, minHeight: 76, alignment: .topLeading)
+            .background(selected ? jarvisCyan.opacity(0.10) : Color.white.opacity(0.03))
+            .overlay(HUDBrackets(color: selected ? jarvisCyan : .gray.opacity(0.4)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
@@ -1302,11 +1426,34 @@ struct PermissionsView: View {
                         _ = AXIsProcessTrustedWithOptions(options)
                     }
                 }
+                if chat.isEnabled(["web_search"]) {
+                    Label(chat.browser == "chrome"
+                          ? "To let Chatbot read search results, in Chrome turn on View → Developer → Allow JavaScript from Apple Events."
+                          : "To let Chatbot read search results, in Safari turn on Develop → Allow JavaScript from Apple Events (Settings → Advanced → Show features for web developers).",
+                          systemImage: "globe")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 if chat.isEnabled(["media_control"]) {
                     Label("Music control: macOS asks once, the first time you ask Chatbot to play something.", systemImage: "info.circle")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .padding(.top, 4)
+                }
+                if chat.isEnabled(["control_screen"]) && !CGPreflightScreenCaptureAccess() {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Label("Already switched on in System Settings but still not allowed here?", systemImage: "exclamationmark.triangle.fill")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.orange)
+                        Text("macOS only applies Screen Recording after Chatbot restarts. If it is still off after a restart, the switch belongs to an older build: in Screen & System Audio Recording select LocalDesktopAssistant, press −, then click Allow here again.")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Restart Chatbot") { ChatController.relaunch() }
+                    }
+                    .padding(12)
+                    .background(Color.orange.opacity(0.08))
                 }
                 Button("Open Privacy & Security settings") {
                     if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy") {

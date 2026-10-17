@@ -248,6 +248,11 @@ struct MacMenuAssistantApp: App {
     @StateObject private var chat = ChatController()
 
     init() {
+        if CommandLine.arguments.contains("--check-permissions") {
+            // Diagnostic: what this exact signed binary is granted, as macOS reports it.
+            print("AX=\(AXIsProcessTrusted()) SCREEN=\(CGPreflightScreenCaptureAccess()) LISTEN=\(CGPreflightListenEventAccess())")
+            exit(0)
+        }
         NSApplication.shared.setActivationPolicy(.accessory)
         StartupDiagnostics.log()
     }
@@ -264,7 +269,6 @@ struct MacMenuAssistantApp: App {
             ChatRootView()
                 .environmentObject(controller)
                 .environmentObject(chat)
-                .frame(width: 420, height: 640)
         }
         .menuBarExtraStyle(.window)
     }
@@ -1072,7 +1076,7 @@ struct AssistantPanel: View {
                 .font(.system(size: 12, weight: .medium))
                 .toggleStyle(.checkbox)
                 .disabled(controller.isRunning)
-            Text("Your task text is sent to DuckDuckGo. Results appear in Activity.")
+            Text("Your task text is searched in your browser. Results appear in Activity.")
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .padding(.leading, 21)

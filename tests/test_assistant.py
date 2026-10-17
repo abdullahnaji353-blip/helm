@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 from assistant import (
     DesktopAssistant,
-    DuckDuckGoResultsParser,
     action_approved,
     simple_open_app_intent,
     search_web,
@@ -246,28 +245,32 @@ class SimpleOpenAppIntentTests(unittest.TestCase):
         self.assertIsNone(simple_open_app_intent("Open CapCut"))
 
 
-class DuckDuckGoResultsParserTests(unittest.TestCase):
-    def test_parses_result_title_snippet_and_redirect_url(self):
-        parser = DuckDuckGoResultsParser()
-        parser.feed(
-            '<a class="result__a" href="//duckduckgo.com/l/?uddg='
-            'https%3A%2F%2Fexample.com%2Fguide">Helpful <b>Guide</b></a>'
-            '<div class="result__snippet">A useful <b>example</b> snippet.</div>'
-        )
-        self.assertEqual(
-            parser.results,
-            [{
-                "title": "Helpful Guide",
-                "url": "https://example.com/guide",
-                "snippet": "A useful example snippet.",
-            }],
-        )
-
-    def test_search_rejects_empty_query_without_network_access(self):
-        with patch("assistant.urlopen") as urlopen:
+class BrowserSearchTests(unittest.TestCase):
+    def test_empty_query_opens_nothing(self):
+        with patch("assistant.subprocess.run") as run:
             with self.assertRaises(ValueError):
                 search_web(" ")
-        urlopen.assert_not_called()
+        run.assert_not_called()
+
+    def test_opens_youtube_search_in_chrome_and_keeps_only_videos(self):
+        links = json.dumps([
+            {"t": "SwiftUI full course for beginners", "u": "https://www.youtube.com/watch?v=abc"},
+            {"t": "YouTube home page link here", "u": "https://www.youtube.com/"},
+            {"t": "SwiftUI full course for beginners", "u": "https://www.youtube.com/watch?v=abc"},
+        ])
+        replies = [MagicMock(returncode=0), MagicMock(returncode=0, stdout=links)]
+        with patch("assistant.subprocess.run", side_effect=replies) as run, patch("assistant.time.sleep"):
+            url, results, _ = search_web("swiftui course", "youtube", "chrome")
+        self.assertEqual(run.call_args_list[0][0][0], ["open", "-a", "Google Chrome", url])
+        self.assertIn("youtube.com/results?search_query=swiftui+course", url)
+        self.assertEqual(results, [{"title": "SwiftUI full course for beginners", "url": "https://www.youtube.com/watch?v=abc"}])
+
+    def test_unreadable_page_still_reports_the_open_results(self):
+        replies = [MagicMock(returncode=0), MagicMock(returncode=1, stdout="")]
+        with patch("assistant.subprocess.run", side_effect=replies), patch("assistant.time.sleep"):
+            url, results, note = search_web("latte art", "tiktok", "safari")
+        self.assertEqual(results, [])
+        self.assertIn("Allow JavaScript from Apple Events", note)
 
 
 class MCPConnectorTests(unittest.TestCase):

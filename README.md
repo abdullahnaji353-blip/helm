@@ -59,8 +59,8 @@ Settings → Privacy & Security → Input Monitoring / Accessibility, then use
 The menu-bar microphone button is also available for starting and stopping
 voice capture manually.
 
-Select **Search the web for examples** to opt in to a DuckDuckGo search before
-a typed or spoken task. The task text is sent to DuckDuckGo and the results are
+Select **Search the web for examples** to opt in to a browser search (Chrome or
+Safari) before a typed or spoken task. The task text is searched on Google and the results are
 shown in Activity; only titles, links, and snippets are supplied to the local
 vision model. Web results are untrusted reference material, not instructions.
 Leave the option off to keep the task query local.
@@ -165,8 +165,9 @@ OPENAI_API_KEY=... python assistant.py --chat "hello" --provider openai --model 
 
 `--check-key` verifies a key without chatting. `--cloud-vision` sends screen-control screenshots to the chosen cloud model
 (much more accurate than the small local model). `--disable-tools web_search` turns off the
-web search tool, which queries DuckDuckGo (optionally limited to YouTube or
-TikTok) and returns links.
+web search tool, which opens a Google, YouTube or TikTok search in Chrome or
+Safari (`--browser chrome|safari`) and reads the result links when the browser
+allows JavaScript from Apple Events.
 
 ## Commands
 
@@ -257,5 +258,5 @@ This is an early desktop-controller prototype, not a fully reliable
 computer-use agent. It can misread the screen; autonomous actions may therefore
 do the wrong thing. It only supports visible mouse/keyboard interaction, not
 direct file-system access or app-specific integrations. Web research is
-optional and sends task text to DuckDuckGo. The menu-bar interface is a
+optional and searches the task text in your browser. The menu-bar interface is a
 development build launched from the project folder.
