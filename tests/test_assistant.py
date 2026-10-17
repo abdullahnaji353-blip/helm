@@ -682,5 +682,16 @@ class KnowledgeTests(unittest.TestCase):
             self.assertIn("Spotify", assistant.run_tool("app_knowledge", {"query": "music"}))
 
 
+class TypingTests(unittest.TestCase):
+    def test_documents_are_typed_not_pasted(self):
+        from assistant import type_out
+        fake = MagicMock()
+        with patch("assistant.subprocess.run") as run:
+            type_out(fake, "\u201cHi\u201d \u2014 it\u2019s fine")
+        fake.write.assert_called_once_with('"Hi"  -  it\'s fine', interval=0.01)
+        run.assert_not_called()  # no pbcopy, no Cmd+V
+        fake.hotkey.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

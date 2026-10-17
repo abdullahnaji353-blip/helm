@@ -21,6 +21,7 @@ from urllib.parse import quote_plus, urlparse
 from urllib.request import Request, urlopen
 
 from mcp_client import MCPConnector, MCPError
+from writing_check import grade
 from screen_elements import (
     bring_to_front, describe_elements, frontmost_app_name, frontmost_elements, mark_elements,
     choose_menu, find_in_app, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
@@ -55,7 +56,8 @@ SYSTEM_PROMPT = (
     "menu_in_app(path=File > New); 'go to example.com in Safari' -> keys_in_app(command+l) then "
     "type_in_app(text=example.com, submit=true); 'install X' -> install_app; 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
     "'how much is Spotify / what is Notion' -> answer from your private notes or app_knowledge; "
-    "'write an essay about X' -> compose the full essay yourself with proper grammar, then new_document(text=essay); "
+    "'write an essay about X' -> compose the full essay yourself with proper grammar (aim about 20% above any "
+    "word target, blank lines between paragraphs), then new_document(text=essay), which types it out; "
     "'ask ChatGPT X' -> ask_chatgpt(question=X); 'write X in a new TextEdit document' -> new_document(text=X); 'work out 47 times 23 with Calculator' -> "
     "click_in_app(app=Calculator, label='4 7 × 2 3 =') then say the number shown; 'copy the word X' -> clipboard(action=copy, text=X); 'paste what you copied into X' -> "
     "paste_into_app(app=X) with no text; 'is X a bot' -> send_message dry check reports bots; 'ask ChatGPT X' -> paste_into_app(app=ChatGPT, "
@@ -538,6 +540,23 @@ def remember_skill(task: str, steps: list[str]) -> None:
     SKILLS_PATH.write_text(json.dumps(skills, indent=1), encoding="utf-8")
 
 
+TYPOGRAPHY = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'", "\u2014": " - ", "\u2013": "-",
+              "\u2026": "...", "\u00a0": " ", "\u2022": "-"}
+
+
+def type_out(pyautogui, text: str, interval: float = 0.01) -> None:
+    """Type text key by key like a person (no clipboard). Smart quotes become plain ones;
+    other non-ASCII characters (é, emoji) go through System Events, which can type Unicode."""
+    for fancy, plain in TYPOGRAPHY.items():
+        text = text.replace(fancy, plain)
+    for chunk in re.findall(r"[\x00-\x7f]+|[^\x00-\x7f]+", text):
+        if chunk.isascii():
+            pyautogui.write(chunk, interval=interval)
+        else:
+            subprocess.run(["osascript", "-e", f'tell application "System Events" to keystroke {applescript_string(chunk)}'],
+                           capture_output=True)
+
+
 def written_tool_call(text: object, tools: list[dict]) -> list[dict]:
     """Small models sometimes write `clipboard(action=copy, text=x)` instead of calling it."""
     match = re.fullmatch(r"\s*`*\s*(\w+)\((.*)\)\s*`*\s*", text) if isinstance(text, str) else None
@@ -811,10 +830,20 @@ class DesktopAssistant:
                 error = self.focus_app(app)
                 if error:
                     return error
-                self.desktop_tools().hotkey("command", "n", interval=0.08)
+                pyautogui = self.desktop_tools()
+                pyautogui.hotkey("command", "n", interval=0.08)
                 time.sleep(0.8)
-                return self.paste_into_app(app, str(args.get("text", "")), submit=False).replace(
-                    "Pasted", "Made a new document and pasted", 1)
+                text = str(args.get("text", ""))
+                if not text.strip():
+                    return "There was no text to write."
+                print(f"Typing {len(text.split())} words into {app}…", flush=True)
+                type_out(pyautogui, text)
+                report = grade(text)
+                problems = report["spelling"][:5] + report["grammar"][:3]
+                return (f"Typed a new {app} document: {report['words']} words, {report['paragraphs']} paragraphs. "
+                        f"Spelling issues: {report['spelling'][:5] or 'none'}. Grammar issues: {report['grammar'][:3] or 'none'}."
+                        + (" If the task asked for more words or perfect grammar, write an improved full version "
+                           "and call new_document again." if problems else ""))
             if name == "ask_chatgpt":
                 return self.ask_chatgpt(str(args.get("question", "")))
             if name in {"click_in_app", "menu_in_app", "type_in_app", "keys_in_app"}:
@@ -1402,11 +1431,7 @@ class DesktopAssistant:
             return f"No '{field}' field in {app}."
         if frontmost_app_name() != app:
             return f"Focus moved away from {app}; nothing was typed."
-        if text.isascii():
-            pyautogui.write(text, interval=0.02)
-        else:  # pyautogui cannot type non-ASCII; paste it instead
-            subprocess.run(["pbcopy"], input=text, text=True, check=True)
-            pyautogui.hotkey("command", "v", interval=0.08)
+        type_out(pyautogui, text, interval=0.02)
         if args.get("submit"):
             pyautogui.press("enter")
         return f"Typed {len(text)} characters into {app}" + (" and pressed enter." if args.get("submit") else ".")
