@@ -218,26 +218,26 @@ def build() -> list[dict]:
     for a, b in [(17, 3), (12, 12), (25, 4), (9, 8), (13, 7), (21, 6), (15, 15), (11, 9), (14, 5), (19, 2),
                  (23, 3), (16, 6), (18, 4), (27, 3), (32, 2), (45, 2), (8, 8), (7, 9), (6, 13), (5, 17)]:
         task("hard", f"chatgpt-{a}x{b}", f"ask ChatGPT what {a} times {b} is and tell me what it answered",
-             "paste_into_app", number_in(a * b),
-             hint="paste the question into ChatGPT with submit, wait, then read_screen ChatGPT")
+             "ask_chatgpt", number_in(a * b),
+             hint="ask_chatgpt with the question")
     for phrase in PHRASES * 2:
         n = sum(1 for t in tasks if t["id"].startswith(f"type-{phrase}"))
         task("hard", f"type-{phrase}-{n}", f"type {phrase} into TextEdit", "type_in_app",
              lambda out, reply, phrase=phrase: phrase in textedit_text(),
-             hint="menu_in_app File > New in TextEdit, then type_in_app", setup=fresh_textedit)
+             hint="new_document with the text", setup=fresh_textedit)
 
     # ----- EXTREME ---------------------------------------------------------------
     for topic in TOPICS:
         task("extreme", f"chain-yt-textedit-{topic}",
              f"search youtube for {topic}, copy the first video link, and type it into a new TextEdit document",
              "web_search", lambda out, reply: "youtube.com/" in textedit_text(),
-             hint="web_search youtube -> clipboard copy -> menu_in_app TextEdit File > New -> type_in_app",
+             hint="web_search youtube -> new_document with the first video link",
              setup=fresh_textedit)
     for country, capital in list(CAPITALS.items())[:30]:
         task("extreme", f"chain-chatgpt-textedit-{country}",
              f"ask ChatGPT the capital of {country}, then type its answer into a new TextEdit document",
-             "paste_into_app", lambda out, reply, capital=capital: capital.lower() in textedit_text().lower(),
-             hint="paste_into_app ChatGPT submit -> read_screen ChatGPT -> TextEdit File > New -> type_in_app",
+             "ask_chatgpt", lambda out, reply, capital=capital: capital.lower() in textedit_text().lower(),
+             hint="ask_chatgpt -> new_document with the answer",
              setup=fresh_textedit)
     for word in WORDS[:30]:
         task("extreme", f"chain-copy-paste-{word}",
@@ -264,7 +264,10 @@ def build() -> list[dict]:
              hint="open their DM (dry run): a person can be called, a bot has no call button")
     for channel in ("polls", "announcements", "rules", "events", "assets"):
         task("insane", f"noperm-{channel}", f"post hello in the {channel} channel of the KeyMau Esports server on discord",
-             "send_message", lambda out, reply: "permission" in out.lower() or "Dry run: opened" in out,
+             "send_message",
+             # #polls is read-only for this account: it must notice; others may genuinely allow posting
+             lambda out, reply, channel=channel: "permission" in out.lower() if channel == "polls"
+             else ("permission" in out.lower() or "Dry run: opened" in out),
              hint="it is a channel in a server; if posting is not allowed, say so")
     for threshold, low, high in [(50, 20, 40), (30, 15, 35), (80, 25, 45), (60, 10, 30), (20, 5, 50)]:
         task("insane", f"if-battery-{threshold}",
@@ -287,7 +290,7 @@ def build() -> list[dict]:
              "and type ChatGPT's number into a new TextEdit document",
              "web_search",
              lambda out, reply, capital=capital: str(len(capital.replace(" ", ""))) in textedit_text(),
-             hint="web_search -> paste_into_app ChatGPT submit -> read_screen ChatGPT -> TextEdit File > New -> type_in_app",
+             hint="web_search -> ask_chatgpt -> new_document with the answer",
              setup=fresh_textedit)
     for first, second, taller in [("Eiffel Tower", "Statue of Liberty", "eiffel"), ("Burj Khalifa", "Empire State Building", "burj"),
                                   ("Mount Everest", "K2", "everest"), ("Big Ben", "Leaning Tower of Pisa", "big ben"),
@@ -307,7 +310,7 @@ def build() -> list[dict]:
         task("insane", f"yt-to-chatgpt-{topic}",
              f"find a youtube video about {topic}, copy its link, then paste it into ChatGPT asking for a one line summary of what that video is probably about",
              "web_search", lambda out, reply: "youtube.com/" in clipboard() and "TOOL: paste_into_app" in out,
-             hint="web_search youtube -> clipboard copy -> paste_into_app ChatGPT with the request and submit")
+             hint="web_search youtube -> clipboard copy -> ask_chatgpt with the link and the request")
     return tasks
 
 

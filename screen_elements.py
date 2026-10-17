@@ -154,7 +154,9 @@ def read_app(app_name: str, max_chars: int = 6000) -> tuple[str, list[dict[str, 
         return "", []
     if element is None:
         return "", []
-    window = _attribute(element, "AXFocusedWindow") or (_attribute(element, "AXWindows") or [None])[0]
+    # The main window, not a focused popup (e.g. Chrome's "Restore pages?" bubble).
+    window = (_attribute(element, "AXMainWindow") or _attribute(element, "AXFocusedWindow")
+              or (_attribute(element, "AXWindows") or [None])[0])
     if window is None:
         return "", []
     texts: list[str] = []
@@ -170,7 +172,8 @@ def read_app(app_name: str, max_chars: int = 6000) -> tuple[str, list[dict[str, 
             if url is not None and label:
                 links.append({"title": label[:150], "url": str(url)})
         elif role in {"AXStaticText", "AXHeading", "AXTextArea", "AXTextField"}:
-            value = _attribute(node, "AXValue") or _attribute(node, "AXTitle") or _attribute(node, "AXDescription")
+            value = (_attribute(node, "AXValue") or _attribute(node, "AXTitle") or _attribute(node, "AXDescription")
+                     or _attribute(node, "AXPlaceholderValue"))  # e.g. Discord's "no permission" notice
             text = " ".join(str(value or "").split())
             if text and (not texts or texts[-1] != text):
                 texts.append(text)

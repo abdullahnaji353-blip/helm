@@ -567,7 +567,8 @@ class SendMessageTests(unittest.TestCase):
         fake = MagicMock()
         with patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
                 patch("assistant.read_app", return_value=(screen, [])), \
-                patch("assistant.find_in_app", return_value=("button" if call_button else None, "")), \
+                patch("assistant.find_in_app", side_effect=lambda app, matches, roles=None:
+                      (None, "") if roles else ("button" if call_button else None, "")), \
                 patch("assistant.subprocess.run"), patch("assistant.time.sleep"), \
                 patch("assistant.wait_for_frontmost", return_value=True), \
                 patch("assistant.window_title", return_value=title), \

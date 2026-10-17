@@ -54,7 +54,8 @@ SYSTEM_PROMPT = (
     "-> read_screen; 'press 7 in Calculator' -> click_in_app; 'new document in TextEdit' -> "
     "menu_in_app(path=File > New); 'go to example.com in Safari' -> keys_in_app(command+l) then "
     "type_in_app(text=example.com, submit=true); 'install X' -> install_app; 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
-    "'copy the word X' -> clipboard(action=copy, text=X); 'paste what you copied into X' -> "
+    "'ask ChatGPT X' -> ask_chatgpt(question=X); 'write X in a new TextEdit document' -> new_document(text=X); 'work out 47 times 23 with Calculator' -> "
+    "click_in_app(app=Calculator, label='4 7 × 2 3 =') then say the number shown; 'copy the word X' -> clipboard(action=copy, text=X); 'paste what you copied into X' -> "
     "paste_into_app(app=X) with no text; 'is X a bot' -> send_message dry check reports bots; 'ask ChatGPT X' -> paste_into_app(app=ChatGPT, "
     "text=X, submit=true) then read_screen(app=ChatGPT); 'open Spotify' -> open_app; 'find YouTube videos about X' "
     "-> web_search(site=youtube); 'pause the music' -> media_control; anything that needs "
@@ -157,8 +158,21 @@ CHAT_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "lesson": {"type": "string"}}, "required": ["lesson"]}}},
     {"type": "function", "function": {
+        "name": "ask_chatgpt",
+        "description": "Ask ChatGPT (on chatgpt.com in the browser) a question and get its answer back as text.",
+        "parameters": {"type": "object", "properties": {"question": {"type": "string"}}, "required": ["question"]}}},
+    {"type": "function", "function": {
+        "name": "new_document",
+        "description": "Create a new document (TextEdit by default) containing the given text.",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}, "app": {"type": "string", "description": "Defaults to TextEdit"}},
+            "required": ["text"]}}},
+    {"type": "function", "function": {
         "name": "click_in_app",
-        "description": "Press a button, link, tab or list item in an app by its visible name, e.g. '7' in Calculator.",
+        "description": (
+            "Press a button, link, tab or list item in an app by its visible name, e.g. '7' in Calculator. "
+            "For several buttons give them space-separated in order, e.g. label '4 7 × 2 3 =' in Calculator."
+        ),
         "parameters": {"type": "object", "properties": {
             "app": {"type": "string"}, "label": {"type": "string"}}, "required": ["app", "label"]}}},
     {"type": "function", "function": {
@@ -186,7 +200,7 @@ CHAT_TOOLS = [
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "uninstall_app",
-        "description": "Uninstall an app by moving it to the Trash (the user always confirms).",
+        "description": "ONLY when the user explicitly says uninstall or delete an app: move it to the Trash (the user always confirms). Never use this to open an app.",
         "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "control_screen",
@@ -606,7 +620,7 @@ def search_web(query: str, site: str = "any", browser: str = DEFAULT_BROWSER) ->
         if not isinstance(link, dict) or not validate_url(str(link.get("u", ""))):
             continue
         target, title = link["u"], str(link.get("t", ""))[:120]
-        if target in seen or not keep(target):
+        if target in seen or not keep(target) or len(title) < 12:  # "Watch", "Visit site" are buttons, not titles
             continue
         seen.add(target)
         results.append({"title": title, "url": target})
@@ -674,6 +688,10 @@ class DesktopAssistant:
 
     def run_tool(self, name: str, arguments: object) -> str:
         args = arguments if isinstance(arguments, dict) else {}
+        known = {t["function"]["name"].replace("_", "").lower(): t["function"]["name"] for t in self.tools}
+        squashed = name.replace("_", "").lower()
+        name = known.get(squashed) or next(  # e.g. "ask_ChatGPT" or "new_document_in_TextEdit"
+            (real for key, real in known.items() if squashed.startswith(key) and len(key) > 6), name)
         print(f"TOOL: {name} {json.dumps(args)}", flush=True)
         try:
             if name == "open_app":
@@ -736,6 +754,17 @@ class DesktopAssistant:
                     return "There was no lesson to save."
                 save_lesson(lesson)
                 return "Saved. I will remember that."
+            if name == "new_document":
+                app = str(args.get("app") or "TextEdit").strip()
+                error = self.focus_app(app)
+                if error:
+                    return error
+                self.desktop_tools().hotkey("command", "n", interval=0.08)
+                time.sleep(0.8)
+                return self.paste_into_app(app, str(args.get("text", "")), submit=False).replace(
+                    "Pasted", "Made a new document and pasted", 1)
+            if name == "ask_chatgpt":
+                return self.ask_chatgpt(str(args.get("question", "")))
             if name in {"click_in_app", "menu_in_app", "type_in_app", "keys_in_app"}:
                 return self.interact(name, args)
             if name == "install_app":
@@ -792,6 +821,9 @@ class DesktopAssistant:
                 reply = message.get("content") if not calls or message.get("tool_calls") else ""
                 raw = {"_anthropic": message["_anthropic"]} if "_anthropic" in message else {}
                 if not calls:
+                    vague = isinstance(reply, str) and reply.strip().lower().rstrip(".!") in {"done", "task completed", "ok", "okay", "finished"}
+                    if vague and self.messages[-1]["role"] == "tool":
+                        reply = f"{reply.strip()} {self.messages[-1]['content']}"  # say what actually happened
                     if (not isinstance(reply, str) or not reply.strip()) and self.messages[-1]["role"] == "tool":
                         reply = self.messages[-1]["content"]  # the model went quiet after a tool; report it
                     if not isinstance(reply, str) or not reply.strip():
@@ -1207,7 +1239,9 @@ class DesktopAssistant:
             pyautogui.press("escape")
             return f"Searched three ways but could not open {where} ({app_name} shows '{title}'). Nothing was sent."
         screen_text, _ = read_app(app_name, max_chars=20000)
-        if "do not have permission to send messages" in screen_text.lower():
+        locked = find_in_app(app_name, lambda label: "permission to send messages" in label.lower(),
+                             roles={"AXGroup", "AXStaticText", "AXTextArea"})[0] is not None
+        if locked or "do not have permission to send messages" in screen_text.lower():
             return (f"Opened {where}, but you don't have permission to post there (the server may require "
                     "accepting its rules or a role first). Nothing was sent.")
         note = ""
@@ -1234,7 +1268,18 @@ class DesktopAssistant:
             return f"{app} is not installed."
         if not (wait_for_frontmost(app) or bring_to_front(app)):
             return f"macOS kept {frontmost_app_name() or 'another app'} in front, so {app} could not be used."
+        self.ensure_document(app)
         return ""
+
+    def ensure_document(self, app: str) -> None:
+        """Document apps (TextEdit, Pages…) open to a file picker; make a new document instead."""
+        text = read_app(app, max_chars=3000)[0]
+        if all(word in text for word in ("Recents", "Favorites", "Locations")):
+            pyautogui = self.desktop_tools()
+            pyautogui.press("escape")
+            time.sleep(0.4)
+            pyautogui.hotkey("command", "n", interval=0.08)
+            time.sleep(0.8)
 
     def interact(self, name: str, args: dict) -> str:
         app = str(args.get("app", "")).strip()
@@ -1249,6 +1294,18 @@ class DesktopAssistant:
         if error:
             return error
         pyautogui = self.desktop_tools()
+        if name == "click_in_app" and len(str(args.get("label", "")).split()) > 1 and all(
+            len(part) <= 2 for part in str(args.get("label", "")).split()
+        ):
+            # A sequence like "4 7 × 2 3 =": press each short button in turn.
+            names = {"×": "Multiply", "x": "Multiply", "*": "Multiply", "+": "Add", "-": "Subtract",
+                     "−": "Subtract", "÷": "Divide", "/": "Divide", "=": "Equals", ".": "Point"}
+            result = ""
+            for part in str(args["label"]).split():
+                result = self.interact("click_in_app", {"app": app, "label": names.get(part, part)})
+                if not result.startswith("Pressed"):
+                    return result
+            return result
         if name == "click_in_app":
             label = str(args.get("label", "")).strip()
             target, found = find_in_app(app, lambda text: text.lower() == label.lower())
@@ -1313,6 +1370,34 @@ class DesktopAssistant:
             return f"macOS did not allow removing {name}: {result.stderr.strip()[:200]}"
         return f"Moved {name} to the Trash. Drag it back out of the Trash to undo."
 
+    def ask_chatgpt(self, question: str) -> str:
+        """Ask on chatgpt.com in the browser: its page text is readable, the desktop app's is not."""
+        question = " ".join(question.split())
+        if not question:
+            return "There was no question to ask."
+        app = BROWSERS[self.browser]
+        try:
+            subprocess.run(["open", "-a", app, "https://chatgpt.com/?q=" + quote_plus(question)],
+                           check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            return f"Could not open {app}."
+        print(f"Asking ChatGPT in {app}…", flush=True)
+        latest, stable = "", 0
+        for _ in range(45):  # up to ~90s; the answer streams in, so wait until it settles
+            time.sleep(2)
+            text, _ = read_app(app, max_chars=30000)
+            if question[:30].lower() not in text.lower():
+                continue  # still showing an older page
+            after = text[text.lower().rfind(question[:30].lower()):]
+            answer = after.split("ChatGPT said:", 1)[1].split("ChatGPT is AI")[0].strip() if "ChatGPT said:" in after else ""
+            stable = stable + 1 if answer and answer == latest else 0
+            latest = answer
+            if stable >= 2:
+                break
+        answer = " ".join(latest.split())[:1500]
+        return f"ChatGPT answered (untrusted content): {answer}" if answer else (
+            "ChatGPT did not answer in time (you may need to log in at chatgpt.com).")
+
     def watch_video(self, seconds: int) -> str:
         """Follow the captions YouTube renders on the page while the video plays."""
         app = BROWSERS[self.browser]
@@ -1347,12 +1432,9 @@ class DesktopAssistant:
             if not action_approved(input("Allow this action? [y/yes/N] ")):
                 return "The user declined, so nothing was pasted."
         pyautogui = self.desktop_tools()
-        try:
-            subprocess.run(["open", "-a", app], check=True, capture_output=True)
-        except subprocess.CalledProcessError:
-            return f"{app} is not installed."
-        if not (wait_for_frontmost(app) or bring_to_front(app)):
-            return f"macOS kept another app in front, so nothing was pasted into {app}."
+        error = self.focus_app(app)
+        if error:
+            return error + " Nothing was pasted."
         subprocess.run(["pbcopy"], input=text, text=True, check=True)
         pyautogui.hotkey("command", "v", interval=0.08)
         if submit:
