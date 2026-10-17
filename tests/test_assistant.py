@@ -10,11 +10,16 @@ from unittest.mock import MagicMock, patch
 from assistant import (
     DesktopAssistant,
     action_approved,
+    calculator_display_value,
+    parse_calculation,
     names_match,
     apps_mentioned,
     written_tool_call,
     recall_skills,
     remember_skill,
+    redact_sensitive_text,
+    redact_sensitive_values,
+    requires_confirmation,
     chat_title_matches,
     simple_open_app_intent,
     search_web,
@@ -82,6 +87,18 @@ class ValidateDesktopActionTests(unittest.TestCase):
         self.assertTrue(action_approved(" yes "))
         self.assertFalse(action_approved("no"))
         self.assertFalse(action_approved("yes please"))
+
+    def test_sensitive_action_classifier_covers_irreversible_actions(self):
+        for action in (
+            "send a message",
+            "submit a purchase",
+            "format this drive",
+            "delete this file",
+            "change system settings",
+        ):
+            with self.subTest(action=action):
+                self.assertTrue(requires_confirmation(action))
+        self.assertFalse(requires_confirmation("read the current time"))
 
     def test_accepts_in_bounds_click(self):
         action = validate_desktop_action(
@@ -206,6 +223,28 @@ class DesktopTaskModeTests(unittest.TestCase):
         self.assertEqual(self.pyautogui.click.call_count, 2)
         prompt.assert_called_once()
         self.assertIn("Allow All enabled for this task", output.getvalue())
+
+    def test_autonomous_sensitive_screen_action_still_requires_confirmation(self):
+        assistant = DesktopAssistant(autonomous=True)
+        action = json.dumps({
+            "action": "click",
+            "x": 10,
+            "y": 20,
+            "reason": "Click Buy Now to complete the purchase",
+        })
+        output = io.StringIO()
+        with (
+            patch.object(DesktopAssistant, "desktop_tools", return_value=self.pyautogui),
+            patch.object(assistant, "vision_chat", return_value=action),
+            patch("builtins.input", return_value="no") as prompt,
+            redirect_stdout(output),
+        ):
+            result = assistant.desktop_task("Buy this item")
+
+        self.pyautogui.click.assert_not_called()
+        prompt.assert_called_once()
+        self.assertIn("declined", result)
+        self.assertIn("APPROVAL_REQUIRED:", output.getvalue())
 
     def test_missing_screen_permission_is_reported_before_capture(self):
         assistant = DesktopAssistant()
@@ -414,12 +453,87 @@ class ChatToolTests(unittest.TestCase):
             self.assertIn("not a valid", assistant.run_tool("open_app", {"name": "x; rm -rf /"}))
         run.assert_not_called()
 
+    def test_disabled_tool_cannot_be_called_even_if_the_model_returns_it(self):
+        assistant = DesktopAssistant(disabled_tools=frozenset({"open_app"}))
+        with patch("assistant.subprocess.run") as run, redirect_stdout(io.StringIO()):
+            result = assistant.run_tool("open_app", {"name": "Safari"})
+        self.assertIn("not enabled", result)
+        run.assert_not_called()
+
     def test_failed_chat_leaves_history_unchanged(self):
         assistant = DesktopAssistant()
         with patch.object(assistant, "model_turn", side_effect=RuntimeError("down")):
             with self.assertRaises(RuntimeError):
                 assistant.chat("hello")
         self.assertEqual(len(assistant.messages), 1)
+
+    def test_calculation_parser_accepts_supported_operations_and_rejects_extras(self):
+        buttons, expected = parse_calculation("3 × 5")
+        self.assertEqual(buttons, ["3", "Multiply", "5", "Equals"])
+        self.assertEqual(expected, 15)
+        _, expected = parse_calculation("3 - 9")
+        self.assertEqual(expected, -6)
+        _, expected = parse_calculation("7 / 2")
+        self.assertEqual(expected, 3.5)
+        with self.assertRaisesRegex(ValueError, "Division by zero"):
+            parse_calculation("1 / 0")
+        with self.assertRaisesRegex(ValueError, "one calculation"):
+            parse_calculation("__import__('os').system('id')")
+
+    def test_calculator_tool_clears_enters_and_verifies_actual_display(self):
+        assistant = DesktopAssistant(autonomous=True)
+        reads = iter([("0", []), ("3×5\n15", [])])
+        with patch.object(assistant, "focus_app", return_value="") as focus, \
+                patch.object(assistant, "interact", return_value="Pressed button") as interact, \
+                patch("assistant.read_app", side_effect=lambda *args, **kwargs: next(reads)), \
+                redirect_stdout(io.StringIO()):
+            result = assistant.run_tool("calculator", {"expression": "3 × 5"})
+        self.assertIn("verified", result)
+        self.assertIn("15", result)
+        focus.assert_called_once_with("Calculator")
+        self.assertEqual(interact.call_count, 5)
+        self.assertEqual(interact.call_args_list[0].args[1]["label"], "All Clear")
+        self.assertEqual(interact.call_args_list[-1].args[1]["label"], "Equals")
+
+    def test_calculator_tool_does_not_claim_success_if_display_is_wrong(self):
+        assistant = DesktopAssistant(autonomous=True)
+        reads = iter([("0", []), ("3×5\n14", [])])
+        with patch.object(assistant, "focus_app", return_value=""), \
+                patch.object(assistant, "interact", return_value="Pressed button"), \
+                patch("assistant.read_app", side_effect=lambda *args, **kwargs: next(reads)), \
+                redirect_stdout(io.StringIO()):
+            result = assistant.run_tool("calculator", {"expression": "3 × 5"})
+        self.assertIn("verification failed", result)
+        self.assertIn("shows 14", result)
+
+    def test_common_credentials_are_redacted_before_history_is_saved(self):
+        assistant = DesktopAssistant()
+        assistant.messages.append({
+            "role": "user",
+            "content": "password is hunter2; token sk-proj-123456789012345678901234",
+        })
+        assistant.messages.append({
+            "role": "assistant",
+            "api_key": "provider-secret",
+        })
+        with tempfile.TemporaryDirectory() as folder:
+            history = Path(folder) / "history.json"
+            with patch("assistant.CHAT_HISTORY_PATH", history):
+                assistant.save_history()
+            saved = history.read_text(encoding="utf-8")
+        self.assertNotIn("hunter2", saved)
+        self.assertNotIn("sk-proj-123456789012345678901234", saved)
+        self.assertNotIn("provider-secret", saved)
+        self.assertIn("[REDACTED]", saved)
+
+    def test_sensitive_text_redaction_preserves_nonsecret_text(self):
+        redacted = redact_sensitive_text("The password is hidden")
+        self.assertIn("[REDACTED]", redacted)
+        self.assertNotIn("hidden", redacted)
+        self.assertEqual(
+            redact_sensitive_values({"api_key": "secret-value", "label": "ordinary"}),
+            {"api_key": "[REDACTED]", "label": "ordinary"},
+        )
 
 
 class NewDesktopActionTests(unittest.TestCase):
@@ -575,27 +689,50 @@ class SendMessageTests(unittest.TestCase):
                 patch("assistant.window_title", return_value=title), \
                 patch("assistant.press_matching", return_value=""), \
                 patch("assistant.frontmost_app_name", return_value="Discord"), \
+                patch("builtins.input", return_value="yes") as prompt, \
                 redirect_stdout(io.StringIO()):
-            return assistant.send_message("Discord", "tiziz aziz", "hi"), fake
+            result = assistant.send_message("Discord", "tiziz aziz", "hi")
+        return result, fake, prompt
 
     def test_sends_only_after_the_right_chat_opens(self):
-        result, fake = self._run("@Tizi aziz - Discord")
+        result, fake, prompt = self._run("@Tizi aziz - Discord")
         self.assertIn("Sent", result)
+        prompt.assert_called_once()
         fake.write.assert_called_with("hi", interval=0.03)
 
     def test_no_permission_channel_sends_nothing(self):
-        result, fake = self._run("@Tizi aziz - Discord", screen="You do not have permission to send messages in this channel.")
+        result, fake, prompt = self._run("@Tizi aziz - Discord", screen="You do not have permission to send messages in this channel.")
         self.assertIn("don't have permission", result)
+        prompt.assert_not_called()
         fake.write.assert_not_called()
 
     def test_flags_bots_by_missing_call_button(self):
-        result, _ = self._run("@Tizi aziz - Discord", call_button=False)
+        result, _, _ = self._run("@Tizi aziz - Discord", call_button=False)
         self.assertIn("looks like a bot", result)
 
     def test_wrong_chat_sends_nothing(self):
-        result, fake = self._run("#polls | KeyMau Esports - Discord")
+        result, fake, prompt = self._run("#polls | KeyMau Esports - Discord")
         self.assertIn("Nothing was sent", result)
+        prompt.assert_not_called()
         self.assertNotIn(unittest.mock.call("hi", interval=0.03), fake.write.call_args_list)
+
+    def test_autonomous_send_still_requires_confirmation(self):
+        assistant = DesktopAssistant(autonomous=True)
+        fake = MagicMock()
+        with patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
+                patch("assistant.read_app", return_value=("", [])), \
+                patch("assistant.find_in_app", return_value=("button", "")), \
+                patch("assistant.subprocess.run"), patch("assistant.time.sleep"), \
+                patch("assistant.wait_for_frontmost", return_value=True), \
+                patch("assistant.window_title", return_value="@Tizi aziz - Discord"), \
+                patch("assistant.press_matching", return_value=""), \
+                patch("assistant.find_in_app", side_effect=lambda app, matches, roles=None:
+                      (None, "") if roles else ("button", "")), \
+                patch("assistant.frontmost_app_name", return_value="Discord"), \
+                patch("builtins.input", return_value="no"), redirect_stdout(io.StringIO()):
+            result = assistant.send_message("Discord", "Tizi aziz", "hi")
+        self.assertIn("declined", result)
+        fake.write.assert_not_called()
 
 
 class SkillMemoryTests(unittest.TestCase):
@@ -630,6 +767,25 @@ class AppManagementTests(unittest.TestCase):
     def test_refuses_to_remove_itself(self):
         with patch("assistant.Path.exists", return_value=True), redirect_stdout(io.StringIO()):
             self.assertIn("cannot be uninstalled", DesktopAssistant().uninstall_app("Finder"))
+
+    def test_install_requires_confirmation_even_in_autonomous_mode(self):
+        assistant = DesktopAssistant(autonomous=True)
+        with patch("assistant.Path.exists", return_value=False), \
+                patch("builtins.input", return_value="n") as prompt, \
+                patch("assistant.subprocess.run") as run, redirect_stdout(io.StringIO()):
+            result = assistant.install_app("Example App")
+        prompt.assert_called_once()
+        run.assert_not_called()
+        self.assertIn("declined", result)
+
+    def test_install_dry_run_has_no_external_effects(self):
+        assistant = DesktopAssistant(autonomous=True)
+        with patch.dict("os.environ", {"HELM_DRY_RUN": "1"}), \
+                patch("assistant.Path.exists", return_value=False), \
+                patch("assistant.subprocess.run") as run, redirect_stdout(io.StringIO()):
+            result = assistant.install_app("Example App")
+        run.assert_not_called()
+        self.assertIn("Dry run", result)
 
 
 class WrittenToolCallTests(unittest.TestCase):

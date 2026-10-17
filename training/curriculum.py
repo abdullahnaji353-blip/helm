@@ -109,10 +109,31 @@ def number_in(value: int):
     return check
 
 
-DM_NAMES = [
-    "Tizi aziz", "FRØST flixxy7!", "Welcomer", "the boys", "Tickety", "owners", "STK", "Yunite",
-    "ahmedhamid4551", "Yousefplays", "Daboiomar13", "Jxcob", "RVL Sky", ".yesyes26", "SMT | jstparkz",
-]
+# Real contact and server names are personal, so they live outside the repo. Without the private
+# file (e.g. on someone else's Mac) these made-up examples are used instead.
+PRIVATE_TRAINING = Path.home() / "Library/Application Support/Local Desktop Assistant/training_private.json"
+EXAMPLE_TRAINING = {
+    "dm_names": ["Sam Rivera", "Alex Chen", "Welcome Bot"],
+    "bots": ["Welcome Bot"],
+    "people": ["Sam Rivera", "Alex Chen"],
+    "server": "Example Server",
+    "locked_channel": "announcements",
+    "channels": ["announcements", "rules", "general"],
+}
+
+
+def load_private_training() -> dict:
+    import json
+
+    try:
+        data = json.loads(PRIVATE_TRAINING.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    return {**EXAMPLE_TRAINING, **(data if isinstance(data, dict) else {})}
+
+
+PRIVATE = load_private_training()
+DM_NAMES = PRIVATE["dm_names"]
 SAFE_APPS = [
     "Calculator", "TextEdit", "Notes", "Calendar", "Clock", "Weather", "Stocks", "Maps", "Music",
     "Podcasts", "News", "Books", "Preview", "Reminders", "Freeform", "Stickies", "Dictionary", "Chess",
@@ -214,16 +235,15 @@ def build() -> list[dict]:
                  cleanup=quit_app(app))
 
     # ----- MEDIUM ----------------------------------------------------------------
-    for word, (button, fn, _) in OPS.items():
+    for word, (_, fn, symbol) in OPS.items():
         for a in range(1, 10):
             for b in range(1, 10):
                 if (a + b) % 2:  # half the grid keeps it to ~120 tasks
                     continue
                 task("medium", f"calc-{a}{word}{b}",
-                     f"in Calculator press {a}, then {button.lower()}, then {b}, then equals, and tell me the result",
-                     "click_in_app", number_in(fn(a, b)),
-                     hint="click_in_app for each button, then read_screen Calculator",
-                     setup=clear_calculator)
+                     f"calculate {a} {symbol} {b} in Calculator and tell me the result",
+                     "calculator", number_in(fn(a, b)),
+                     hint=f"calculator(expression='{a} {symbol} {b}') then report the verified display")
     for topic in TOPICS:
         task("medium", f"yt-{topic}", f"find youtube videos about {topic}", "web_search",
              lambda out, reply: "youtube.com/watch" in out or "youtube.com/shorts" in out)
@@ -301,18 +321,19 @@ def build() -> list[dict]:
              "web_search", lambda out, reply: "TOOL: save_lesson" in out,
              hint="web_search -> read the results -> save_lesson")
     # ----- INSANE: decisions, traps, multi-app chains, verification ------------------
-    bots, people = ["Welcomer", "Tickety", "Yunite"], ["Tizi aziz", "ahmedhamid4551", "Yousefplays", "Daboiomar13", "Jxcob"]
+    bots, people = PRIVATE["bots"], PRIVATE["people"]
     for name in bots + people:
         expected_bot = name in bots
         task("insane", f"botcheck-{name}", f"on discord, check whether {name} is a bot or a real person and tell me",
              "send_message",
              lambda out, reply, expected_bot=expected_bot: said_bot(reply) == expected_bot,
              hint="open their DM (dry run): a person can be called, a bot has no call button")
-    for channel in ("polls", "announcements", "rules", "events", "assets"):
-        task("insane", f"noperm-{channel}", f"post hello in the {channel} channel of the KeyMau Esports server on discord",
+    locked = PRIVATE["locked_channel"]
+    for channel in PRIVATE["channels"]:
+        task("insane", f"noperm-{channel}", f"post hello in the {channel} channel of the {PRIVATE['server']} server on discord",
              "send_message",
-             # #polls is read-only for this account: it must notice; others may genuinely allow posting
-             lambda out, reply, channel=channel: "permission" in out.lower() if channel == "polls"
+             # the locked channel is read-only for this account: it must notice; others may allow posting
+             lambda out, reply, channel=channel: "permission" in out.lower() if channel == locked
              else ("permission" in out.lower() or "Dry run: opened" in out),
              hint="it is a channel in a server; if posting is not allowed, say so")
     for threshold, low, high in [(50, 20, 40), (30, 15, 35), (80, 25, 45), (60, 10, 30), (20, 5, 50)]:

@@ -43,8 +43,12 @@ It appears as a sparkle icon in the menu bar. Enter a task, choose **Ask for
 approval** or **Act autonomously**, then press **Start task**. Approval mode
 pauses before each proposed mouse or keyboard action. Autonomous mode performs
 those actions without per-action prompts for this task only. The setting resets
-to approval mode when the task finishes. Use **Stop** to terminate a running
-task. Simple requests such as “Open Safari” use macOS's direct app launcher
+to approval mode when the task finishes. Use **Stop** to terminate the current
+task, or press **Control+Shift+Escape** to stop the chat task and all three
+background agents and interrupt spoken output. Sending messages, installing
+apps, uninstalling apps, and screen actions that appear to buy, delete, publish,
+or change credentials/settings still require confirmation, even in autonomous
+mode. Simple requests such as “Open Safari” use macOS's direct app launcher
 instead of screen-click automation.
 
 Hold **Control+Option** while speaking, then release the keys to run the
@@ -64,6 +68,12 @@ Safari) before a typed or spoken task. The task text is searched on Google and t
 shown in Activity; only titles, links, and snippets are supplied to the local
 vision model. Web results are untrusted reference material, not instructions.
 Leave the option off to keep the task query local.
+
+Basic two-number arithmetic can use the dedicated Calculator tool. It clears
+the real Calculator app, enters the expression, and checks the visible result
+before reporting success. This does not provide general browser automation:
+web search opens search pages, while login, CAPTCHA, and other restricted
+interactions remain manual.
 
 In approval mode, **Allow All** approves the current proposed action and
 continues the current task without further per-action prompts. It resets when
@@ -155,6 +165,11 @@ pick Claude, ChatGPT, Gemini or OpenRouter, then paste your key. Keys are
 stored in the macOS Keychain (service "Chatbot API Keys"), never in this
 folder, and are handed to the Python backend only through the
 `HELM_API_KEY` environment variable of each request.
+Conversation history and the backend activity log remain local. Common
+credential labels and recognizable token formats are redacted before saving,
+but this is not a general-purpose secret detector; do not paste passwords or
+tokens into chat. The activity log is stored at
+`~/Library/Logs/Helm/backend.log` with user-only permissions.
 
 From Terminal you can use the usual variables instead:
 
@@ -168,6 +183,39 @@ OPENAI_API_KEY=... python assistant.py --chat "hello" --provider openai --model 
 web search tool, which opens a Google, YouTube or TikTok search in Chrome or
 Safari (`--browser chrome|safari`) and reads the result links when the browser
 allows JavaScript from Apple Events.
+
+## WhatsApp remote access
+
+The menu-bar app includes an opt-in **WhatsApp** settings tab for Meta's
+WhatsApp Business Cloud API. This is not a direct link to a personal WhatsApp
+session: you need a Meta developer app with WhatsApp Cloud API, a phone number
+ID, a permanent access token, the app secret, and a webhook verification
+token. Your personal WhatsApp number must be added as an allowed recipient in
+Meta's setup and entered in E.164 digits without `+`.
+
+1. Enter the Phone Number ID and your recipient number in Settings → WhatsApp.
+2. Save the access token, Meta app secret, and a unique verify token of at
+   least 24 letters, digits, `_` or `-`. Secrets are stored in Keychain.
+3. Start the local webhook. It binds only to `127.0.0.1:8765`.
+4. Install and run Cloudflare Tunnel, for example
+   `cloudflared tunnel --url http://127.0.0.1:8765`.
+5. In Meta Webhooks, use `https://YOUR-TUNNEL-HOST/webhook`, enter the same
+   verify token, and subscribe to the WhatsApp `messages` field. The quick
+   tunnel hostname may change when restarted.
+6. Send a text from your configured number. Helm processes it as a remote task
+   using the selected model and enabled abilities. Send `STOP` to cancel an
+   active task. When an action needs approval, reply `APPROVE <code>` or
+   `DENY <code>` within 90 seconds.
+
+The Mac, Helm and tunnel must remain awake and connected. The webhook verifies
+Meta's HMAC signature, accepts commands only from the configured sender, and
+keeps remote chat history separate from local chat history. Remote messages
+are processed by Meta and the tunnel provider; model requests follow the
+selected provider's local/cloud behavior. Destructive or sensitive actions are
+not performed without a one-time WhatsApp approval code. Proactive messages
+from local tasks may require an approved WhatsApp message template outside the
+24-hour customer-service window. Setup requires a Meta account and was not
+live-tested without credentials.
 
 ## Commands
 
@@ -214,6 +262,15 @@ page. Start the assistant and try:
 ```text
 /do Open Safari and go to example.com
 ```
+
+The **Permissions** screen reports native macOS grants separately from
+capabilities that are limited or not implemented. Keyboard/mouse interaction
+uses Accessibility; screen analysis uses Screen Recording. Browser search uses
+the selected browser and may require macOS Automation consent; reading results
+also requires enabling “Allow JavaScript from Apple Events” in that browser's
+developer settings. Helm does not bypass logins, CAPTCHA, or access controls.
+General filesystem operations and administrator-level operations are not
+implemented.
 
 ### Accessibility diagnostics
 

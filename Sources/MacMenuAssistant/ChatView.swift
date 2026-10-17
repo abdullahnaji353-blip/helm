@@ -13,19 +13,47 @@ private let jarvisBlue = Color(red: 0.16, green: 0.42, blue: 1.0)
 final class GlobalHotKey {
     private var hotKeyRef: EventHotKeyRef?
     private var handlerRef: EventHandlerRef?
+    private let hotKeyID: EventHotKeyID
     fileprivate let action: () -> Void
+    private(set) var registrationError: OSStatus?
 
     init(keyCode: UInt32, modifiers: UInt32, id: UInt32, action: @escaping () -> Void) {
         self.action = action
+        hotKeyID = EventHotKeyID(signature: OSType(0x4348_4254), id: id)
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+        let handlerStatus = InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
             guard let userData else { return noErr }
+            var receivedID = EventHotKeyID()
+            let status = GetEventParameter(
+                event,
+                EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID),
+                nil,
+                MemoryLayout<EventHotKeyID>.size,
+                nil,
+                &receivedID
+            )
+            guard status == noErr else { return status }
             let hotKey = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
+            guard receivedID.signature == hotKey.hotKeyID.signature,
+                  receivedID.id == hotKey.hotKeyID.id else { return noErr }
             DispatchQueue.main.async { hotKey.action() }
             return noErr
         }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handlerRef)
-        let hotKeyID = EventHotKeyID(signature: OSType(0x4348_4254), id: id)  // 'CHBT'
-        RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+        guard handlerStatus == noErr else {
+            registrationError = handlerStatus
+            return
+        }
+        let registrationStatus = RegisterEventHotKey(
+            keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef
+        )
+        if registrationStatus != noErr {
+            registrationError = registrationStatus
+            if let handlerRef {
+                RemoveEventHandler(handlerRef)
+                self.handlerRef = nil
+            }
+        }
     }
 
     deinit {
@@ -92,6 +120,25 @@ enum KeyStore {
     static func delete(_ provider: String) {
         SecItemDelete(query(provider) as CFDictionary)
     }
+
+    static func saveSecret(_ value: String, key: String) -> Bool {
+        delete(key)
+        var item = query(key)
+        item[kSecValueData as String] = Data(value.utf8)
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func readSecret(_ key: String) -> String? {
+        read(key)
+    }
+
+    static func hasSecret(_ key: String) -> Bool {
+        exists(key)
+    }
+
+    static func deleteSecret(_ key: String) {
+        delete(key)
+    }
 }
 
 struct ChatLine: Identifiable, Equatable {
@@ -112,6 +159,7 @@ final class ChatController: NSObject, ObservableObject {
     @Published var dictating = false
     private var dictationBase = ""
     @Published var voiceStatus = "Hold ⌃⌥ to talk"
+    @Published var emergencyStopShortcutAvailable = false
     @Published var pendingApproval: String?
     @Published var askBeforeActing = UserDefaults.standard.object(forKey: "askBeforeActing") as? Bool ?? true {
         didSet { UserDefaults.standard.set(askBeforeActing, forKey: "askBeforeActing") }
@@ -215,6 +263,10 @@ final class ChatController: NSObject, ObservableObject {
         }
     }
     @Published var showProviderSettings = false
+    @Published var whatsappBridgeStatus = "Not configured"
+    @Published var whatsappNotificationError: String?
+    private var whatsappBridgeProcess: Process?
+    private var whatsappTerminationObserver: NSObjectProtocol?
     /// Bumped by the Control+Shift+§ shortcut; the menu bar label opens the HUD when it changes.
     @Published var hudRequests = 0
     /// Three background agents, each with its own engine, conversation and coloured cursor.
@@ -255,6 +307,110 @@ final class ChatController: NSObject, ObservableObject {
         if provider != "ollama", let key = KeyStore.read(provider) { environment["HELM_API_KEY"] = key }
         return environment
     }
+
+    func startWhatsAppBridge() {
+        guard whatsappBridgeProcess?.isRunning != true else {
+            whatsappBridgeStatus = "Running"
+            return
+        }
+        guard let accessToken = KeyStore.readSecret("whatsapp.access-token"),
+              let appSecret = KeyStore.readSecret("whatsapp.app-secret"),
+              let verifyToken = KeyStore.readSecret("whatsapp.verify-token") else {
+            whatsappBridgeStatus = "Save the three WhatsApp secrets first."
+            return
+        }
+        let phoneNumberID = UserDefaults.standard.string(forKey: "whatsapp.phone-number-id") ?? ""
+        let ownerNumber = UserDefaults.standard.string(forKey: "whatsapp.owner-number") ?? ""
+        guard !phoneNumberID.isEmpty, !ownerNumber.isEmpty else {
+            whatsappBridgeStatus = "Enter the WhatsApp Phone Number ID and your number."
+            return
+        }
+        let python = projectRoot.appendingPathComponent(".venv/bin/python")
+        let script = projectRoot.appendingPathComponent("whatsapp_bridge.py")
+        guard FileManager.default.isExecutableFile(atPath: python.path),
+              FileManager.default.fileExists(atPath: script.path) else {
+            whatsappBridgeStatus = "Project Python or whatsapp_bridge.py is missing."
+            return
+        }
+
+        let child = Process()
+        let output = Pipe()
+        child.executableURL = python
+        child.arguments = ["-u", script.path]
+        child.currentDirectoryURL = projectRoot
+        child.standardOutput = output
+        child.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["ASSISTANT_PROJECT_DIR"] = projectRoot.path
+        environment["HELM_WHATSAPP_ACCESS_TOKEN"] = accessToken
+        environment["HELM_WHATSAPP_PHONE_NUMBER_ID"] = phoneNumberID
+        environment["HELM_WHATSAPP_APP_SECRET"] = appSecret
+        environment["HELM_WHATSAPP_VERIFY_TOKEN"] = verifyToken
+        environment["HELM_WHATSAPP_OWNER_NUMBER"] = ownerNumber
+        environment["HELM_WHATSAPP_API_VERSION"] =
+            UserDefaults.standard.string(forKey: "whatsapp.api-version") ?? "v23.0"
+        environment["HELM_WHATSAPP_PYTHON"] = python.path
+        environment["HELM_WHATSAPP_PROVIDER"] = provider
+        if !model(for: provider).isEmpty {
+            environment["HELM_WHATSAPP_MODEL"] = model(for: provider)
+        }
+        if provider != "ollama", let key = KeyStore.read(provider) {
+            environment["HELM_API_KEY"] = key
+        }
+        environment["HELM_WHATSAPP_DISABLED_TOOLS"] = disabledTools.sorted().joined(separator: ",")
+        child.environment = environment
+        child.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async {
+                guard self?.whatsappBridgeProcess === process else { return }
+                self?.whatsappBridgeProcess = nil
+                self?.whatsappBridgeStatus = process.terminationStatus == 0
+                    ? "Stopped"
+                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+            }
+        }
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async {
+                if text.contains("WHATSAPP_BRIDGE_READY:") {
+                    self?.whatsappBridgeStatus = "Running on 127.0.0.1:8765"
+                } else if let line = text.components(separatedBy: .newlines)
+                    .first(where: { $0.hasPrefix("WHATSAPP_BRIDGE_ERROR:") }) {
+                    self?.whatsappBridgeStatus = String(line.dropFirst("WHATSAPP_BRIDGE_ERROR:".count))
+                }
+            }
+        }
+        do {
+            try child.run()
+            whatsappBridgeProcess = child
+            whatsappBridgeStatus = "Starting…"
+            if whatsappTerminationObserver == nil {
+                whatsappTerminationObserver = NotificationCenter.default.addObserver(
+                    forName: NSApplication.willTerminateNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.stopWhatsAppBridge()
+                }
+            }
+        } catch {
+            whatsappBridgeStatus = "Could not start bridge: \(error.localizedDescription)"
+        }
+    }
+
+    func stopWhatsAppBridge() {
+        guard let process = whatsappBridgeProcess, process.isRunning else {
+            whatsappBridgeStatus = "Stopped"
+            return
+        }
+        process.terminate()
+        whatsappBridgeStatus = "Stopping…"
+    }
+
     private var appShortcuts: [GlobalHotKey] = []
 
     override init() {
@@ -285,6 +441,17 @@ final class ChatController: NSObject, ObservableObject {
             self?.showHUD()
             self?.toggleDictation()
         })
+        let stopShortcut = GlobalHotKey(keyCode: UInt32(kVK_Escape), modifiers: modifiers, id: 4) { [weak self] in
+            self?.emergencyStop()
+        }
+        appShortcuts.append(stopShortcut)
+        emergencyStopShortcutAvailable = stopShortcut.registrationError == nil
+        if let error = stopShortcut.registrationError {
+            lines.append(ChatLine(
+                role: .error,
+                text: "Could not register the emergency-stop shortcut (Carbon status \(error)). Use the stop button while a task runs."
+            ))
+        }
     }
 
     func showHUD() {
@@ -417,7 +584,7 @@ final class ChatController: NSObject, ObservableObject {
         guard !text.isEmpty, process == nil else { return }
         draft = ""
         lines.append(ChatLine(role: .user, text: text))
-        logBackend("\n=== \(Date()) you: \(text)\n")
+        logBackend("\n=== \(Date()) user submitted a request\n")
         var arguments = ["--chat", text, "--autonomy", askBeforeActing ? "approval" : "autonomous", "--provider", provider]
         if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
         if !disabledTools.isEmpty { arguments += ["--disable-tools", disabledTools.sorted().joined(separator: ",")] }
@@ -441,6 +608,20 @@ final class ChatController: NSObject, ObservableObject {
         process?.terminate()
     }
 
+    var hasActiveTasks: Bool {
+        process?.isRunning == true || agents.contains(where: \.isRunning)
+    }
+
+    func emergencyStop() {
+        let hadActiveTasks = hasActiveTasks
+        stop()
+        agents.filter(\.isRunning).forEach { $0.stop() }
+        speech.stopSpeaking(at: .immediate)
+        if hadActiveTasks {
+            addActivity("Emergency stop: stopped all running tasks. (⌃⇧Esc)")
+        }
+    }
+
     private func respond(_ answer: String) {
         guard let inputPipe, pendingApproval != nil else { return }
         inputPipe.fileHandleForWriting.write(Data(answer.utf8))
@@ -462,14 +643,43 @@ final class ChatController: NSObject, ObservableObject {
 
     private func logBackend(_ text: String) {
         let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Helm", isDirectory: true)
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let url = folder.appendingPathComponent("backend.log")
-        if let handle = try? FileHandle(forWritingTo: url) {
+        let redacted = Self.redactLogSecrets(text)
+        do {
+            try FileManager.default.createDirectory(
+                at: folder,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try Data().write(to: url, options: .atomic)
+            }
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            let handle = try FileHandle(forWritingTo: url)
             handle.seekToEndOfFile()
-            handle.write(Data(text.utf8))
-            try? handle.close()
-        } else {
-            try? Data(text.utf8).write(to: url)
+            handle.write(Data(redacted.utf8))
+            try handle.close()
+        } catch {
+            lines.append(ChatLine(role: .error, text: "Could not securely write the backend log: \(error.localizedDescription)"))
+        }
+    }
+
+    private static func redactLogSecrets(_ text: String) -> String {
+        let patterns: [(String, String)] = [
+            (#"(?i)(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passphrase|secret|authorization)\b(?:\s+(?:is\s+)?|[:=]\s*))[^\s,;]+"#, "$1[REDACTED]"),
+            (#"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+"#, "$1[REDACTED]"),
+            (#"\bsk-(?:ant-)?[A-Za-z0-9_-]{16,}\b"#, "[REDACTED]"),
+            (#"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"#, "[REDACTED]"),
+            (#"\bxox[baprs]-[A-Za-z0-9-]{10,}\b"#, "[REDACTED]"),
+            (#"\bAIza[A-Za-z0-9_-]{30,}\b"#, "[REDACTED]"),
+            (#"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b"#, "[REDACTED]"),
+        ]
+        return patterns.reduce(text) { value, item in
+            value.replacingOccurrences(
+                of: item.0,
+                with: item.1,
+                options: .regularExpression
+            )
         }
     }
 
@@ -492,6 +702,17 @@ final class ChatController: NSObject, ObservableObject {
         var environment = ProcessInfo.processInfo.environment
         if provider != "ollama", let key = KeyStore.read(provider) {
             environment["HELM_API_KEY"] = key
+        }
+        if UserDefaults.standard.bool(forKey: "whatsapp.notify-local-tasks"),
+           let accessToken = KeyStore.readSecret("whatsapp.access-token"),
+           let phoneNumberID = UserDefaults.standard.string(forKey: "whatsapp.phone-number-id"),
+           let ownerNumber = UserDefaults.standard.string(forKey: "whatsapp.owner-number") {
+            environment["HELM_WHATSAPP_NOTIFY"] = "1"
+            environment["HELM_WHATSAPP_ACCESS_TOKEN"] = accessToken
+            environment["HELM_WHATSAPP_PHONE_NUMBER_ID"] = phoneNumberID
+            environment["HELM_WHATSAPP_OWNER_NUMBER"] = ownerNumber
+            environment["HELM_WHATSAPP_API_VERSION"] =
+                UserDefaults.standard.string(forKey: "whatsapp.api-version") ?? "v23.0"
         }
         child.environment = environment
         child.terminationHandler = { [weak self] finished in
@@ -547,6 +768,8 @@ final class ChatController: NSObject, ObservableObject {
                 addActivity(Self.toolLabels[name] ?? "Working on it…")
             } else if line.hasPrefix("Error:") || line.hasPrefix("SCREEN_ACCESS_DENIED:") {
                 lines.append(ChatLine(role: .error, text: line))
+            } else if line.hasPrefix("WHATSAPP_NOTIFY_ERROR:") {
+                lines.append(ChatLine(role: .error, text: String(line.dropFirst("WHATSAPP_NOTIFY_ERROR:".count))))
             } else if !line.hasPrefix("Allow this action?") {
                 addActivity(line)
             }
@@ -739,6 +962,14 @@ struct ChatPanel: View {
             Menu {
                 Toggle("Ask before screen actions", isOn: $chat.askBeforeActing)
                 Toggle("Speak replies", isOn: $chat.speakReplies)
+                if chat.hasActiveTasks {
+                    Button(
+                        "Emergency stop all tasks\(chat.emergencyStopShortcutAvailable ? "  ⌃⇧Esc" : "")",
+                        role: .destructive
+                    ) {
+                        chat.emergencyStop()
+                    }
+                }
                 Divider()
                 Button("New chat") { chat.newChat() }
                 Button("AI model & API keys…") {
@@ -1107,6 +1338,14 @@ struct HUDView: View {
                 Menu {
                     Button("Settings (brain, abilities, permissions)…") { chat.showProviderSettings = true }
                     Toggle("Speak replies", isOn: $chat.speakReplies)
+                    if chat.hasActiveTasks {
+                        Button(
+                            "Emergency stop all tasks\(chat.emergencyStopShortcutAvailable ? "  ⌃⇧Esc" : "")",
+                            role: .destructive
+                        ) {
+                            chat.emergencyStop()
+                        }
+                    }
                     Button("New chat") { chat.newChat() }
                     Button("Permissions & MCP tools…") { showAdvanced = true }
                     Divider()
@@ -1504,11 +1743,11 @@ private struct Ability: Identifiable {
     let tools: [String]
 
     static let all = [
-        Ability(id: "screen", title: "Screen control", detail: "Clicks, types and finds its way around apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen"]),
-        Ability(id: "web", title: "Web, YouTube & TikTok", detail: "Searches the web and finds video examples", symbol: "magnifyingglass", tools: ["web_search"]),
-        Ability(id: "apps", title: "Apps & websites", detail: "Opens any app or website you name", symbol: "square.grid.2x2", tools: ["open_app", "open_url"]),
+        Ability(id: "screen", title: "Screen control", detail: "Clicks, types, reads and navigates apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard"]),
+        Ability(id: "web", title: "Web, YouTube & TikTok", detail: "Opens websites, searches the web and finds video examples", symbol: "magnifyingglass", tools: ["open_url", "web_search", "ask_chatgpt", "watch_video"]),
+        Ability(id: "apps", title: "Applications", detail: "Opens apps and manages installs with confirmation", symbol: "square.grid.2x2", tools: ["open_app", "install_app", "uninstall_app"]),
         Ability(id: "media", title: "Music & volume", detail: "Plays, pauses and skips in Spotify or Music", symbol: "music.note", tools: ["media_control", "set_volume"]),
-        Ability(id: "status", title: "Time & battery", detail: "Tells you the date, time and battery level", symbol: "battery.75percent", tools: ["system_status"]),
+        Ability(id: "status", title: "Time & battery", detail: "Reads the current date, time and battery level", symbol: "battery.75percent", tools: ["system_status"]),
     ]
 }
 
@@ -1614,46 +1853,193 @@ extension AbilitiesView {
 
 // MARK: - Permissions
 
+private enum PermissionState {
+    case granted
+    case needsPermission
+    case promptOnUse
+    case limited
+    case unavailable
+    case disabled
+
+    var label: String {
+        switch self {
+        case .granted: "Available"
+        case .needsPermission: "Needs permission"
+        case .promptOnUse: "macOS prompt on use"
+        case .limited: "Limited access"
+        case .unavailable: "Not implemented"
+        case .disabled: "Turned off"
+        }
+    }
+
+    var color: Color {
+        switch self {
+        case .granted: .green
+        case .needsPermission: .orange
+        case .promptOnUse, .limited: .yellow
+        case .unavailable, .disabled: .secondary
+        }
+    }
+}
+
+private struct PermissionItem: Identifiable {
+    let id: String
+    let symbol: String
+    let title: String
+    let detail: String
+    let state: PermissionState
+    let canRequest: Bool
+}
+
+private enum PermissionManager {
+    private static let desktopTools: Set<String> = [
+        "control_screen", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app",
+        "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard",
+    ]
+
+    static func items(
+        disabledTools: Set<String>,
+        voiceHotkey: Bool,
+        emergencyStopShortcutAvailable: Bool
+    ) -> [PermissionItem] {
+        let screenEnabled = !disabledTools.contains("control_screen")
+        let desktopEnabled = !desktopTools.isSubset(of: disabledTools)
+        let browserEnabled = !Set(["open_url", "web_search", "ask_chatgpt", "watch_video"]).isSubset(of: disabledTools)
+        let appsEnabled = !Set(["open_app", "install_app", "uninstall_app"]).isSubset(of: disabledTools)
+        let microphoneAllowed = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+        let speechAllowed = SFSpeechRecognizer.authorizationStatus() == .authorized
+        let accessibilityAllowed = AXIsProcessTrusted()
+
+        return [
+            PermissionItem(
+                id: "microphone", symbol: "mic.fill", title: "Microphone",
+                detail: "Used only when you start voice input.",
+                state: microphoneAllowed ? .granted : .needsPermission,
+                canRequest: true
+            ),
+            PermissionItem(
+                id: "speech", symbol: "text.bubble", title: "Speech recognition",
+                detail: "Voice transcription is configured for on-device recognition.",
+                state: speechAllowed ? .granted : .needsPermission,
+                canRequest: true
+            ),
+            PermissionItem(
+                id: "input-monitoring", symbol: "keyboard", title: "Input Monitoring",
+                detail: "Required for the Control+Option voice shortcut.",
+                state: voiceHotkey
+                    ? (CGPreflightListenEventAccess() ? .granted : .needsPermission)
+                    : .disabled,
+                canRequest: voiceHotkey
+            ),
+            PermissionItem(
+                id: "screen-recording", symbol: "rectangle.dashed.badge.record", title: "Screen Recording",
+                detail: "Required to capture the screen for screen-control tasks.",
+                state: screenEnabled
+                    ? (CGPreflightScreenCaptureAccess() ? .granted : .needsPermission)
+                    : .disabled,
+                canRequest: screenEnabled
+            ),
+            PermissionItem(
+                id: "keyboard", symbol: "keyboard", title: "Keyboard",
+                detail: "Accessibility access is used for in-app typing and shortcuts.",
+                state: desktopEnabled ? (accessibilityAllowed ? .granted : .needsPermission) : .disabled,
+                canRequest: desktopEnabled
+            ),
+            PermissionItem(
+                id: "mouse", symbol: "computermouse", title: "Mouse",
+                detail: "Accessibility access is used for named controls; coordinates are a fallback.",
+                state: desktopEnabled ? (accessibilityAllowed ? .granted : .needsPermission) : .disabled,
+                canRequest: desktopEnabled
+            ),
+            PermissionItem(
+                id: "browser", symbol: "globe", title: "Browser",
+                detail: browserEnabled
+                    ? "Search opens your browser. To read results, enable Allow JavaScript from Apple Events in its developer settings; macOS may prompt. Login and CAPTCHA are manual."
+                    : "Browser search is turned off in Abilities.",
+                state: browserEnabled ? .promptOnUse : .disabled,
+                canRequest: false
+            ),
+            PermissionItem(
+                id: "files", symbol: "folder", title: "Files",
+                detail: "No general file tools are built in. A configured MCP filesystem server has separate access; only trust servers you configure.",
+                state: .limited,
+                canRequest: false
+            ),
+            PermissionItem(
+                id: "applications", symbol: "square.grid.2x2", title: "Applications",
+                detail: appsEnabled
+                    ? "App launch and install tools are enabled; install/removal still needs confirmation."
+                    : "App launching is turned off in Abilities.",
+                state: appsEnabled ? .granted : .disabled,
+                canRequest: false
+            ),
+            PermissionItem(
+                id: "system-settings", symbol: "gearshape", title: "System Settings",
+                detail: "Helm can open Privacy & Security settings, but does not change settings for you.",
+                state: .limited,
+                canRequest: false
+            ),
+            PermissionItem(
+                id: "administration", symbol: "lock.shield", title: "Administrative operations",
+                detail: "No administrator or sudo operations are implemented or requested.",
+                state: .unavailable,
+                canRequest: false
+            ),
+            PermissionItem(
+                id: "emergency-stop", symbol: "stop.circle", title: "Emergency stop",
+                detail: "Control+Shift+Escape stops the chat task, background agents, and speech.",
+                state: emergencyStopShortcutAvailable ? .granted : .unavailable,
+                canRequest: false
+            ),
+        ]
+    }
+
+    static func request(_ id: String) {
+        switch id {
+        case "microphone":
+            if AVCaptureDevice.authorizationStatus(for: .audio) == .denied {
+                openPrivacySettings("Privacy_Microphone")
+            } else {
+                AVCaptureDevice.requestAccess(for: .audio) { _ in }
+            }
+        case "speech":
+            if SFSpeechRecognizer.authorizationStatus() == .denied {
+                openPrivacySettings("Privacy_SpeechRecognition")
+            } else {
+                SFSpeechRecognizer.requestAuthorization { _ in }
+            }
+        case "input-monitoring":
+            _ = CGRequestListenEventAccess()
+        case "screen-recording":
+            _ = CGRequestScreenCaptureAccess()
+        case "keyboard", "mouse":
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+            _ = AXIsProcessTrustedWithOptions(options)
+        default:
+            break
+        }
+    }
+
+    static func openPrivacySettings(_ pane: String = "Privacy") {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") else {
+            return
+        }
+        NSWorkspace.shared.open(url)
+    }
+}
+
 struct PermissionsView: View {
     @EnvironmentObject private var chat: ChatController
 
     var body: some View {
-        // Re-read every second so rows turn green as soon as the user flips a switch.
         TimelineView(.periodic(from: .now, by: 1)) { _ in
             VStack(alignment: .leading, spacing: 10) {
-                row("mic.fill", "Microphone", "Hear you when you talk to it",
-                    AVCaptureDevice.authorizationStatus(for: .audio) == .authorized) {
-                    AVCaptureDevice.requestAccess(for: .audio) { _ in }
-                }
-                row("text.bubble", "Speech Recognition", "Turn your voice into text, on this Mac",
-                    SFSpeechRecognizer.authorizationStatus() == .authorized) {
-                    SFSpeechRecognizer.requestAuthorization { _ in }
-                }
-                if chat.voiceHotkey {
-                    row("keyboard", "Input Monitoring", "Notice when you hold Control+Option",
-                        CGPreflightListenEventAccess()) {
-                        _ = CGRequestListenEventAccess()
-                    }
-                }
-                if chat.isEnabled(["control_screen"]) {
-                    row("rectangle.dashed.badge.record", "Screen Recording", "See the screen it is controlling",
-                        CGPreflightScreenCaptureAccess()) {
-                        _ = CGRequestScreenCaptureAccess()
-                    }
-                    row("hand.point.up.left.fill", "Accessibility", "Click, type and read buttons for you",
-                        AXIsProcessTrusted()) {
-                        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-                        _ = AXIsProcessTrustedWithOptions(options)
-                    }
-                }
-                if chat.isEnabled(["web_search"]) {
-                    Label(chat.browser == "chrome"
-                          ? "To let Helm read search results, in Chrome turn on View → Developer → Allow JavaScript from Apple Events."
-                          : "To let Helm read search results, in Safari turn on Develop → Allow JavaScript from Apple Events (Settings → Advanced → Show features for web developers).",
-                          systemImage: "globe")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                ForEach(PermissionManager.items(
+                    disabledTools: chat.disabledTools,
+                    voiceHotkey: chat.voiceHotkey,
+                    emergencyStopShortcutAvailable: chat.emergencyStopShortcutAvailable
+                )) { item in
+                    permissionRow(item)
                 }
                 if chat.isEnabled(["media_control"]) {
                     Label("Music control: macOS asks once, the first time you ask Helm to play something.", systemImage: "info.circle")
@@ -1676,9 +2062,7 @@ struct PermissionsView: View {
                     .background(Color.orange.opacity(0.08))
                 }
                 Button("Open Privacy & Security settings") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy") {
-                        NSWorkspace.shared.open(url)
-                    }
+                    PermissionManager.openPrivacySettings()
                 }
                 .font(.system(size: 11))
                 .padding(.top, 4)
@@ -1686,23 +2070,24 @@ struct PermissionsView: View {
         }
     }
 
-    private func row(_ symbol: String, _ title: String, _ detail: String, _ granted: Bool, request: @escaping () -> Void) -> some View {
+    private func permissionRow(_ item: PermissionItem) -> some View {
         HStack(spacing: 14) {
-            Image(systemName: symbol).font(.system(size: 17)).foregroundStyle(granted ? .green : jarvisCyan).frame(width: 26)
+            Image(systemName: item.symbol).font(.system(size: 17)).foregroundStyle(item.state.color).frame(width: 26)
             VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 13, weight: .semibold))
-                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                Text(item.title).font(.system(size: 13, weight: .semibold))
+                Text(item.detail).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
-            if granted {
-                Label("Allowed", systemImage: "checkmark.circle.fill").font(.system(size: 12)).foregroundStyle(.green)
-            } else {
-                Button("Allow", action: request)
+            Text(item.state.label)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundStyle(item.state.color)
+            if item.canRequest && item.state == .needsPermission {
+                Button("Allow") { PermissionManager.request(item.id) }
             }
         }
         .padding(11)
         .background(Color.white.opacity(0.03))
-        .overlay(HUDBrackets(color: granted ? .green.opacity(0.7) : jarvisCyan))
+        .overlay(HUDBrackets(color: item.state.color.opacity(0.7)))
     }
 }
 
@@ -1895,6 +2280,126 @@ struct OnboardingView: View {
     }
 }
 
+struct WhatsAppSettingsView: View {
+    @EnvironmentObject private var chat: ChatController
+    @AppStorage("whatsapp.phone-number-id") private var phoneNumberID = ""
+    @AppStorage("whatsapp.owner-number") private var ownerNumber = ""
+    @AppStorage("whatsapp.api-version") private var apiVersion = "v23.0"
+    @AppStorage("whatsapp.notify-local-tasks") private var notifyLocalTasks = false
+    @State private var accessTokenDraft = ""
+    @State private var appSecretDraft = ""
+    @State private var verifyTokenDraft = ""
+    @State private var saveStatus: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("WHATSAPP CLOUD API")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
+            Text("Link your WhatsApp Business Cloud API. Messages reach this Mac through a secure public tunnel; the Mac and Helm must stay awake and online.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                TextField("Phone Number ID", text: $phoneNumberID)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Your WhatsApp number, E.164 digits only", text: $ownerNumber)
+                    .textFieldStyle(.roundedBorder)
+            }
+            HStack(spacing: 10) {
+                SecureField(KeyStore.hasSecret("whatsapp.access-token") ? "Access token saved (enter to replace)" : "Permanent access token", text: $accessTokenDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") { saveSecret(accessTokenDraft, key: "whatsapp.access-token", label: "Access token") }
+                    .disabled(accessTokenDraft.isEmpty)
+            }
+            HStack(spacing: 10) {
+                SecureField(KeyStore.hasSecret("whatsapp.app-secret") ? "App secret saved (enter to replace)" : "Meta app secret", text: $appSecretDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") { saveSecret(appSecretDraft, key: "whatsapp.app-secret", label: "App secret") }
+                    .disabled(appSecretDraft.isEmpty)
+            }
+            HStack(spacing: 10) {
+                SecureField(KeyStore.hasSecret("whatsapp.verify-token") ? "Verify token saved (enter to replace)" : "Webhook verify token (24+ letters/digits/_/-)", text: $verifyTokenDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") { saveSecret(verifyTokenDraft, key: "whatsapp.verify-token", label: "Verify token") }
+                    .disabled(verifyTokenDraft.isEmpty)
+            }
+            HStack {
+                Text("Graph API version")
+                    .font(.system(size: 11))
+                TextField("v23.0", text: $apiVersion)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 100)
+                Spacer()
+                if let saveStatus {
+                    Text(saveStatus)
+                        .font(.system(size: 11))
+                        .foregroundStyle(saveStatus.hasPrefix("Could") ? .orange : .green)
+                }
+            }
+            Toggle("Text me when a task I start on this Mac finishes", isOn: $notifyLocalTasks)
+                .font(.system(size: 12))
+            Text("Proactive notifications may require an approved WhatsApp message template if you have not messaged the business number in the last 24 hours. Remote command replies are sent in response to your message.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 12) {
+                Button {
+                    chat.startWhatsAppBridge()
+                } label: {
+                    Label("Start local webhook", systemImage: "antenna.radiowaves.left.and.right")
+                }
+                .disabled(!hasRequiredSecrets || phoneNumberID.isEmpty || ownerNumber.isEmpty)
+                Button("Stop") { chat.stopWhatsAppBridge() }
+                    .disabled(chat.whatsappBridgeStatus == "Stopped" || chat.whatsappBridgeStatus == "Not configured")
+                Text(chat.whatsappBridgeStatus)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(chat.whatsappBridgeStatus.hasPrefix("Running") ? .green : .secondary)
+                    .lineLimit(2)
+            }
+
+            GroupBox("Setup") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("1. In Meta for Developers, create a WhatsApp Cloud API app. Save its Phone Number ID, permanent access token, and App Secret above.")
+                    Text("2. Save a random 24+ character verify token above. Start the webhook, then run in Terminal: cloudflared tunnel --url http://127.0.0.1:8765")
+                    Text("3. In Meta Webhooks, set the callback URL to https://YOUR-TUNNEL-HOST/webhook, enter the same verify token, and subscribe to the WhatsApp messages field.")
+                    Text("4. Send a WhatsApp text from your own number. Helm can perform remote tasks; sensitive steps pause and require APPROVE <code> or DENY <code> in WhatsApp.")
+                }
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("The bridge binds only to 127.0.0.1. Do not expose port 8765 directly; use an HTTPS tunnel. Log: ~/Library/Logs/Helm/whatsapp-bridge.log")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
+    }
+
+    private var hasRequiredSecrets: Bool {
+        KeyStore.hasSecret("whatsapp.access-token")
+            && KeyStore.hasSecret("whatsapp.app-secret")
+            && KeyStore.hasSecret("whatsapp.verify-token")
+    }
+
+    private func saveSecret(_ value: String, key: String, label: String) {
+        if KeyStore.saveSecret(value.trimmingCharacters(in: .whitespacesAndNewlines), key: key) {
+            saveStatus = "\(label) saved in Keychain."
+            switch key {
+            case "whatsapp.access-token": accessTokenDraft = ""
+            case "whatsapp.app-secret": appSecretDraft = ""
+            case "whatsapp.verify-token": verifyTokenDraft = ""
+            default: break
+            }
+        } else {
+            saveStatus = "Could not save \(label.lowercased()) to Keychain."
+        }
+    }
+}
+
 // MARK: - Settings
 
 struct SettingsView: View {
@@ -1907,6 +2412,7 @@ struct SettingsView: View {
                 Text("Brain").tag(0)
                 Text("Abilities").tag(1)
                 Text("Permissions").tag(2)
+                Text("WhatsApp").tag(3)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -1916,7 +2422,8 @@ struct SettingsView: View {
                     switch tab {
                     case 0: ProviderSettingsView()
                     case 1: AbilitiesView()
-                    default: PermissionsView()
+                    case 2: PermissionsView()
+                    default: WhatsAppSettingsView()
                     }
                 }
                 .padding(.horizontal, 24)
