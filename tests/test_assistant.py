@@ -562,10 +562,12 @@ class SendMessageTests(unittest.TestCase):
         self.assertTrue(names_match("Tizi Aziz", "Discord | @tizi aziz"))
         self.assertFalse(names_match("tizi aziz", "#polls | KeyMau Esports - Discord"))
 
-    def _run(self, title):
+    def _run(self, title, screen="", call_button=True):
         assistant = DesktopAssistant(autonomous=True)
         fake = MagicMock()
         with patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
+                patch("assistant.read_app", return_value=(screen, [])), \
+                patch("assistant.find_in_app", return_value=("button" if call_button else None, "")), \
                 patch("assistant.subprocess.run"), patch("assistant.time.sleep"), \
                 patch("assistant.wait_for_frontmost", return_value=True), \
                 patch("assistant.window_title", return_value=title), \
@@ -578,6 +580,15 @@ class SendMessageTests(unittest.TestCase):
         result, fake = self._run("@Tizi aziz - Discord")
         self.assertIn("Sent", result)
         fake.write.assert_called_with("hi", interval=0.03)
+
+    def test_no_permission_channel_sends_nothing(self):
+        result, fake = self._run("@Tizi aziz - Discord", screen="You do not have permission to send messages in this channel.")
+        self.assertIn("don't have permission", result)
+        fake.write.assert_not_called()
+
+    def test_flags_bots_by_missing_call_button(self):
+        result, _ = self._run("@Tizi aziz - Discord", call_button=False)
+        self.assertIn("looks like a bot", result)
 
     def test_wrong_chat_sends_nothing(self):
         result, fake = self._run("#polls | KeyMau Esports - Discord")
@@ -634,7 +645,8 @@ class InteractTests(unittest.TestCase):
         with patch.object(assistant, "focus_app", return_value=""), \
                 patch.object(DesktopAssistant, "desktop_tools", return_value=MagicMock()), \
                 patch("assistant.find_in_app", return_value=("button", "7")), \
-                patch("assistant.press") as press, patch("assistant.time.sleep"):
+                patch("assistant.press") as press, patch("assistant.time.sleep"), \
+                patch("assistant.read_app", return_value=("7", [])):
             result = assistant.interact("click_in_app", {"app": "Calculator", "label": "7"})
         press.assert_called_once_with("button")
         self.assertIn("Pressed '7'", result)

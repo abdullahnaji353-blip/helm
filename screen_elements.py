@@ -113,8 +113,9 @@ def press_matching(app_name: str, matches) -> str:
             if (a.localizedName() or "").lower() == app_name.lower()]
     if not apps:
         return ""
-    stack, visited, fallback = [AS.AXUIElementCreateApplication(apps[0].processIdentifier())], 0, None
-    while stack and visited < MAX_VISITED:
+    root = _app_element(app_name)  # also asks Electron apps to expose their content
+    stack, visited, fallback = [root], 0, None
+    while stack and visited < 40000:  # Discord's tree is huge; DMs far down are deep in it
         element = stack.pop()
         visited += 1
         if _attribute(element, "AXRole") in {"AXLink", "AXButton", "AXCell"}:

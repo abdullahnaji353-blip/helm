@@ -35,6 +35,17 @@ def textedit_text() -> str:
     return read_app("TextEdit")[0]
 
 
+def said_bot(reply: str) -> bool:
+    """True if the reply calls them a bot (and not 'not a bot')."""
+    text = reply.lower()
+    return "bot" in text and not re.search(r"(not|isn't|is not|n't) (a )?bot|real person|human", text)
+
+
+def battery() -> int:
+    match = re.search(r"(\d+)%", sh("pmset", "-g", "batt"))
+    return int(match.group(1)) if match else 100
+
+
 def fresh_textedit() -> None:
     subprocess.run(["osascript", "-e", 'tell application "TextEdit" to close every document saving no'],
                    capture_output=True)
@@ -45,7 +56,10 @@ def quit_app(name: str):
 
 
 def number_in(value: int):
-    return lambda out, reply: re.search(rf"(?<!\d){value}(?!\d)", reply.replace(",", "")) is not None
+    def check(out, reply):
+        text = reply.replace(",", "").replace("\u2212", "-").replace("\u200e", "")
+        return re.search(rf"(?<![\d-]){value}(?!\d)", text) is not None
+    return check
 
 
 DM_NAMES = [
@@ -240,11 +254,65 @@ def build() -> list[dict]:
              f"search the web for {topic}, read the top results and save one lesson you learned",
              "web_search", lambda out, reply: "TOOL: save_lesson" in out,
              hint="web_search -> read the results -> save_lesson")
+    # ----- INSANE: decisions, traps, multi-app chains, verification ------------------
+    bots, people = ["Welcomer", "Tickety", "Yunite"], ["Tizi aziz", "ahmedhamid4551", "Yousefplays", "Daboiomar13", "Jxcob"]
+    for name in bots + people:
+        expected_bot = name in bots
+        task("insane", f"botcheck-{name}", f"on discord, check whether {name} is a bot or a real person and tell me",
+             "send_message",
+             lambda out, reply, expected_bot=expected_bot: said_bot(reply) == expected_bot,
+             hint="open their DM (dry run): a person can be called, a bot has no call button")
+    for channel in ("polls", "announcements", "rules", "events", "assets"):
+        task("insane", f"noperm-{channel}", f"post hello in the {channel} channel of the KeyMau Esports server on discord",
+             "send_message", lambda out, reply: "permission" in out.lower() or "Dry run: opened" in out,
+             hint="it is a channel in a server; if posting is not allowed, say so")
+    for threshold, low, high in [(50, 20, 40), (30, 15, 35), (80, 25, 45), (60, 10, 30), (20, 5, 50)]:
+        task("insane", f"if-battery-{threshold}",
+             f"if my battery is below {threshold}% set the volume to {low}, otherwise set it to {high}",
+             "system_status",
+             lambda out, reply, threshold=threshold, low=low, high=high:
+             volume() == str(low if battery() < threshold else high),
+             hint="system_status first, decide, then set_volume")
+    for fake in ("Zorblax", "Quantum Toaster", "Blorp Studio", "Fakeapp Pro", "Nonexistent Notes"):
+        task("insane", f"trap-open-{fake}", f"open the app {fake}", "open_app",
+             lambda out, reply: any(w in reply.lower() for w in ("not installed", "couldn", "could not", "can't", "cannot", "not find", "doesn")),
+             hint="if the app is not installed, say so honestly")
+    for a, b in [(47, 23), (85, 12), (36, 19), (64, 27), (99, 11), (58, 34), (73, 16), (42, 42), (91, 28), (66, 15)]:
+        task("insane", f"calc-big-{a}x{b}", f"use the Calculator buttons to work out {a} times {b} and tell me the answer",
+             "click_in_app", number_in(a * b),
+             hint=f"click_in_app {' '.join(str(a))} Multiply {' '.join(str(b))} Equals one at a time, then read the display")
+    for country, capital in list(CAPITALS.items())[:25]:
+        task("insane", f"hop-{country}",
+             f"find the capital of {country} on the web, then ask ChatGPT how many letters that city name has, "
+             "and type ChatGPT's number into a new TextEdit document",
+             "web_search",
+             lambda out, reply, capital=capital: str(len(capital.replace(" ", ""))) in textedit_text(),
+             hint="web_search -> paste_into_app ChatGPT submit -> read_screen ChatGPT -> TextEdit File > New -> type_in_app",
+             setup=fresh_textedit)
+    for first, second, taller in [("Eiffel Tower", "Statue of Liberty", "eiffel"), ("Burj Khalifa", "Empire State Building", "burj"),
+                                  ("Mount Everest", "K2", "everest"), ("Big Ben", "Leaning Tower of Pisa", "big ben"),
+                                  ("CN Tower", "Space Needle", "cn tower")]:
+        task("insane", f"compare-{first}", f"search the web for how tall the {first} and the {second} are and tell me which is taller",
+             "web_search", lambda out, reply, taller=taller: taller in reply.lower().split("taller")[0] or reply.lower().startswith(taller),
+             hint="search both heights, compare the numbers")
+    for topic in TOPICS:
+        task("insane", f"top3-{topic}", f"search youtube for {topic} and give me the titles of the top 3 videos as a numbered list",
+             "web_search", lambda out, reply: all(f"{n}." in reply for n in (1, 2, 3)),
+             hint="web_search youtube, then list three result titles as 1. 2. 3.")
+    for word in WORDS[:20]:
+        task("insane", f"clip-count-{word}", f"copy the word {word}, then read the clipboard back and tell me how many letters it has",
+             "clipboard", lambda out, reply, word=word: number_in(len(word))(out, reply) and "TOOL: clipboard" in out,
+             hint="clipboard copy, clipboard read, then count")
+    for topic in TOPICS[:15]:
+        task("insane", f"yt-to-chatgpt-{topic}",
+             f"find a youtube video about {topic}, copy its link, then paste it into ChatGPT asking for a one line summary of what that video is probably about",
+             "web_search", lambda out, reply: "youtube.com/" in clipboard() and "TOOL: paste_into_app" in out,
+             hint="web_search youtube -> clipboard copy -> paste_into_app ChatGPT with the request and submit")
     return tasks
 
 
 TASKS = build()
-LEVELS = ("easy", "medium", "hard", "extreme")
+LEVELS = ("easy", "medium", "hard", "extreme", "insane")
 
 if __name__ == "__main__":
     from collections import Counter
