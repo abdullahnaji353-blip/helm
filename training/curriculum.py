@@ -82,6 +82,17 @@ def battery() -> int:
     return int(match.group(1)) if match else 100
 
 
+def clear_calculator() -> None:
+    """Start every Calculator task from 0."""
+    from screen_elements import find_in_app, press
+
+    subprocess.run(["open", "-a", "Calculator"], capture_output=True)
+    for label in ("All Clear", "Clear"):
+        element, _ = find_in_app("Calculator", lambda text, label=label: text == label)
+        if element is not None:
+            press(element)
+
+
 def fresh_textedit() -> None:
     subprocess.run(["osascript", "-e", 'tell application "TextEdit" to close every document saving no'],
                    capture_output=True)
@@ -212,8 +223,7 @@ def build() -> list[dict]:
                      f"in Calculator press {a}, then {button.lower()}, then {b}, then equals, and tell me the result",
                      "click_in_app", number_in(fn(a, b)),
                      hint="click_in_app for each button, then read_screen Calculator",
-                     setup=lambda: subprocess.run(["osascript", "-e", 'tell application "Calculator" to activate'],
-                                                  capture_output=True))
+                     setup=clear_calculator)
     for topic in TOPICS:
         task("medium", f"yt-{topic}", f"find youtube videos about {topic}", "web_search",
              lambda out, reply: "youtube.com/watch" in out or "youtube.com/shorts" in out)
@@ -318,7 +328,7 @@ def build() -> list[dict]:
              hint="if the app is not installed, say so honestly")
     for a, b in [(47, 23), (85, 12), (36, 19), (64, 27), (99, 11), (58, 34), (73, 16), (42, 42), (91, 28), (66, 15)]:
         task("insane", f"calc-big-{a}x{b}", f"use the Calculator buttons to work out {a} times {b} and tell me the answer",
-             "click_in_app", number_in(a * b),
+             "click_in_app", number_in(a * b), setup=clear_calculator,
              hint=f"click_in_app {' '.join(str(a))} Multiply {' '.join(str(b))} Equals one at a time, then read the display")
     for country, capital in list(CAPITALS.items())[:25]:
         task("insane", f"hop-{country}",
