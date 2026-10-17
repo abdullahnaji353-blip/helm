@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 from assistant import (
     DesktopAssistant,
     action_approved,
+    names_match,
     simple_open_app_intent,
     search_web,
     test_screen_capture,
@@ -541,6 +542,35 @@ class RepeatGuardTests(unittest.TestCase):
             result = assistant.desktop_task("Scroll forever")
         self.assertIn("kept repeating", result)
         self.assertEqual(fake.scroll.call_count, 2)
+
+
+class SendMessageTests(unittest.TestCase):
+    def test_names_match_tolerates_typos_but_not_other_people(self):
+        self.assertTrue(names_match("tiziz aziz", "@Tizi Aziz - Discord"))
+        self.assertTrue(names_match("Tizi Aziz", "Discord | @tizi aziz"))
+        self.assertFalse(names_match("tizi aziz", "#polls | KeyMau Esports - Discord"))
+
+    def _run(self, title):
+        assistant = DesktopAssistant(autonomous=True)
+        fake = MagicMock()
+        with patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
+                patch("assistant.subprocess.run"), patch("assistant.time.sleep"), \
+                patch("assistant.wait_for_frontmost", return_value=True), \
+                patch("assistant.window_title", return_value=title), \
+                patch("assistant.press_matching", return_value=""), \
+                patch("assistant.frontmost_app_name", return_value="Discord"), \
+                redirect_stdout(io.StringIO()):
+            return assistant.send_message("Discord", "tiziz aziz", "hi"), fake
+
+    def test_sends_only_after_the_right_chat_opens(self):
+        result, fake = self._run("@Tizi Aziz - Discord")
+        self.assertIn("Sent", result)
+        fake.write.assert_called_with("hi", interval=0.03)
+
+    def test_wrong_chat_sends_nothing(self):
+        result, fake = self._run("#polls | KeyMau Esports - Discord")
+        self.assertIn("Nothing was sent", result)
+        self.assertNotIn(unittest.mock.call("hi", interval=0.03), fake.write.call_args_list)
 
 
 if __name__ == "__main__":

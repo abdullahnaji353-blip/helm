@@ -63,6 +63,74 @@ def wait_for_frontmost(app_name: str, timeout: float = 4.0) -> bool:
     return False
 
 
+def bring_to_front(app_name: str) -> bool:
+    """Ask via Accessibility (honoured more often than a plain launch) to focus the app."""
+    try:
+        import ApplicationServices as AS
+        from AppKit import NSWorkspace
+    except ImportError:
+        return False
+    matches = [
+        a for a in NSWorkspace.sharedWorkspace().runningApplications()
+        if (a.localizedName() or "").lower() == app_name.lower()
+    ]
+    if not matches:
+        return False
+    element = AS.AXUIElementCreateApplication(matches[0].processIdentifier())
+    AS.AXUIElementSetAttributeValue(element, "AXFrontmost", True)
+    error, windows = AS.AXUIElementCopyAttributeValue(element, "AXWindows", None)
+    if error == 0 and windows:
+        AS.AXUIElementPerformAction(windows[0], "AXRaise")
+    return wait_for_frontmost(app_name, timeout=2.0)
+
+
+def window_title(app_name: str) -> str:
+    """Title of the app's frontmost window (Discord shows the open chat there)."""
+    try:
+        import ApplicationServices as AS
+        from AppKit import NSWorkspace
+    except ImportError:
+        return ""
+    for app in NSWorkspace.sharedWorkspace().runningApplications():
+        if (app.localizedName() or "").lower() == app_name.lower():
+            element = AS.AXUIElementCreateApplication(app.processIdentifier())
+            window = _attribute(element, "AXFocusedWindow") or (_attribute(element, "AXWindows") or [None])[0]
+            return str(_attribute(window, "AXTitle") or "") if window is not None else ""
+    return ""
+
+
+def press_matching(app_name: str, matches) -> str:
+    """Press the first control of the app whose label satisfies `matches`; return its label.
+
+    Direct-message links are preferred, so a person's DM wins over a same-named channel.
+    """
+    try:
+        import ApplicationServices as AS
+        from AppKit import NSWorkspace
+    except ImportError:
+        return ""
+    apps = [a for a in NSWorkspace.sharedWorkspace().runningApplications()
+            if (a.localizedName() or "").lower() == app_name.lower()]
+    if not apps:
+        return ""
+    stack, visited, fallback = [AS.AXUIElementCreateApplication(apps[0].processIdentifier())], 0, None
+    while stack and visited < MAX_VISITED:
+        element = stack.pop()
+        visited += 1
+        if _attribute(element, "AXRole") in {"AXLink", "AXButton", "AXCell"}:
+            label = str(_attribute(element, "AXTitle") or _attribute(element, "AXDescription") or "")
+            if label and matches(label.replace("(direct message)", "")):
+                if "direct message" in label.lower():
+                    AS.AXUIElementPerformAction(element, "AXPress")
+                    return label
+                fallback = fallback or (element, label)
+        stack.extend(reversed(list(_attribute(element, "AXChildren") or [])))
+    if fallback:
+        AS.AXUIElementPerformAction(fallback[0], "AXPress")
+        return fallback[1]
+    return ""
+
+
 def frontmost_elements(screen_size: tuple[int, int]) -> tuple[str, list[dict]]:
     """Return (app name, controls) for the frontmost app, in reading order.
 
