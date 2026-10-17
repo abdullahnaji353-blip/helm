@@ -57,7 +57,7 @@ SYSTEM_PROMPT = (
     "'what did Sam say on discord' -> read_chat(app=Discord, recipient=Sam); 'what does this page say' "
     "-> read_screen; 'press 7 in Calculator' -> click_in_app; 'new document in TextEdit' -> "
     "menu_in_app(path=File > New); 'go to example.com in Safari' -> keys_in_app(command+l) then "
-    "type_in_app(text=example.com, submit=true); 'download/install/get X (even "from Safari" or "from the web")' -> install_app right away (the Mac App Store is the safe source; do not ask first); 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
+    "type_in_app(text=example.com, submit=true); 'download/install/get X (even from Safari or from the web)' -> install_app right away (the Mac App Store is the safe source; do not ask first); 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
     "'how much is Spotify / what is Notion' -> answer from your private notes or app_knowledge; "
     "'write an essay about X' -> compose the full essay yourself (never ask ChatGPT to write it) with proper grammar (aim about 20% above any "
     "word target, blank lines between paragraphs), then new_document(text=essay), which types it out; "
