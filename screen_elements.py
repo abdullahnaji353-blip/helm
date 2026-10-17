@@ -345,3 +345,61 @@ def mark_elements(image, elements: list[dict]):
         draw.rectangle(box, fill=(255, 0, 90), outline=(255, 255, 255))
         draw.text((box[0] + 4, y - 6), label, fill=(255, 255, 255))
     return marked
+
+
+# --- Background input: send keys straight to one app (like cua-driver's background delivery) ---
+
+KEY_CODES = {
+    "a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12, "w": 13,
+    "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23, "=": 24, "9": 25,
+    "7": 26, "-": 27, "8": 28, "0": 29, "]": 30, "o": 31, "u": 32, "[": 33, "i": 34, "p": 35, "enter": 36,
+    "return": 36, "l": 37, "j": 38, "'": 39, "k": 40, ";": 41, "\\": 42, ",": 43, "/": 44, "n": 45, "m": 46,
+    ".": 47, "tab": 48, "space": 49, "`": 50, "backspace": 51, "delete": 51, "escape": 53, "left": 123,
+    "right": 124, "down": 125, "up": 126, "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+}
+MODIFIER_FLAGS = {"command": 1 << 20, "shift": 1 << 17, "option": 1 << 19, "ctrl": 1 << 18}
+
+
+def app_pid(app_name: str) -> int | None:
+    try:
+        from AppKit import NSWorkspace
+    except ImportError:
+        return None
+    return next((a.processIdentifier() for a in NSWorkspace.sharedWorkspace().runningApplications()
+                 if (a.localizedName() or "").lower() == app_name.lower()), None)
+
+
+def post_keys(pid: int, keys: list[str]) -> bool:
+    """Press a key or shortcut (e.g. ["command", "n"]) in one app without focusing it."""
+    import Quartz
+
+    *modifiers, key = [k.lower() for k in keys]
+    code = KEY_CODES.get(key)
+    if code is None:
+        return False
+    flags = 0
+    for modifier in modifiers:
+        flags |= MODIFIER_FLAGS.get(modifier, 0)
+    for down in (True, False):
+        event = Quartz.CGEventCreateKeyboardEvent(None, code, down)
+        Quartz.CGEventSetFlags(event, flags)
+        Quartz.CGEventPostToPid(pid, event)
+    return True
+
+
+def post_text(pid: int, text: str, interval: float = 0.012) -> None:
+    """Type Unicode text into one app without focusing it; keys can't land in any other window."""
+    import time
+
+    import Quartz
+
+    for line_number, line in enumerate(text.split("\n")):
+        if line_number:
+            post_keys(pid, ["enter"])
+        for start in range(0, len(line), 4):  # small chunks look like typing
+            chunk = line[start:start + 4]
+            for down in (True, False):
+                event = Quartz.CGEventCreateKeyboardEvent(None, 0, down)
+                Quartz.CGEventKeyboardSetUnicodeString(event, len(chunk), chunk)
+                Quartz.CGEventPostToPid(pid, event)
+            time.sleep(interval * len(chunk))

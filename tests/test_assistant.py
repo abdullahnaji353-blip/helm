@@ -687,7 +687,7 @@ class TypingTests(unittest.TestCase):
     def test_documents_are_typed_not_pasted(self):
         from assistant import type_out
         fake = MagicMock()
-        with patch("assistant.subprocess.run") as run:
+        with patch("assistant.subprocess.run") as run, patch("assistant.app_pid", return_value=None):
             type_out(fake, "\u201cHi\u201d \u2014 it\u2019s fine")
         self.assertEqual("".join(c.args[0] for c in fake.write.call_args_list), '"Hi"  -  it\'s fine')
         run.assert_not_called()  # no pbcopy, no Cmd+V
@@ -699,7 +699,8 @@ class FocusDuringTypingTests(unittest.TestCase):
         from assistant import FocusLost, type_out
         fake = MagicMock()
         fronts = iter(["TextEdit"] + ["Claude"] * 50)
-        with patch("assistant.frontmost_app_name", side_effect=lambda: next(fronts)):
+        with patch("assistant.frontmost_app_name", side_effect=lambda: next(fronts)), \
+                patch("assistant.app_pid", return_value=None):
             with self.assertRaises(FocusLost):
                 type_out(fake, "Netflix has changed how people watch entertainment at home today.", app="TextEdit")
         typed = "".join(call.args[0] for call in fake.write.call_args_list)
@@ -721,6 +722,16 @@ class CoordinateClickTests(unittest.TestCase):
             assistant.interact("click_in_app", {"app": "Calculator", "label": "7"})
         press.assert_called_once_with("button")  # pressed via Accessibility: the user's mouse stays put
         fake.click.assert_not_called()
+
+
+class BackgroundTypingTests(unittest.TestCase):
+    def test_known_app_gets_keys_directly_without_focus(self):
+        from assistant import type_out
+        fake = MagicMock()
+        with patch("assistant.app_pid", return_value=617), patch("assistant.post_text") as post:
+            type_out(fake, "hello \u201cworld\u201d", app="TextEdit")
+        post.assert_called_once_with(617, 'hello "world"')
+        fake.write.assert_not_called()  # nothing went through the shared keyboard
 
 
 if __name__ == "__main__":

@@ -24,7 +24,7 @@ from mcp_client import MCPConnector, MCPError
 from writing_check import grade
 from screen_elements import (
     bring_to_front, describe_elements, frontmost_app_name, frontmost_elements, mark_elements,
-    choose_menu, element_center, find_in_app, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
+    app_pid, choose_menu, element_center, find_in_app, post_keys, post_text, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
 )
 from providers import PROVIDERS, anthropic_turn, check_provider, openai_turn, parse_json_object, provider_key
 
@@ -588,6 +588,10 @@ def type_out(pyautogui, text: str, interval: float = 0.01, app: str | None = Non
     With `app`, focus is re-checked every few words so keys never land in another window."""
     for fancy, plain in TYPOGRAPHY.items():
         text = text.replace(fancy, plain)
+    pid = app_pid(app) if app else None
+    if pid:
+        post_text(pid, text)  # straight to that app: works in the background, never another window
+        return
     # Small pieces: words/spaces/newlines, so a focus check happens every ~30 characters.
     pieces = re.findall(r"[^\S\n]*\S{1,30}|\n|[^\S\n]+", text)
     typed = 0
@@ -885,7 +889,11 @@ class DesktopAssistant:
                 if error:
                     return error
                 pyautogui = self.desktop_tools()
-                pyautogui.hotkey("command", "n", interval=0.08)
+                pid = app_pid(app)
+                if pid:
+                    post_keys(pid, ["command", "n"])
+                else:
+                    pyautogui.hotkey("command", "n", interval=0.08)
                 time.sleep(0.8)
                 text = str(args.get("text", ""))
                 if not text.strip():
@@ -1511,7 +1519,9 @@ class DesktopAssistant:
                                         else {"action": "press", "key": keys[0] if keys else "", "reason": "r"}, (1, 1))
             except ValueError as error:
                 return str(error)
-            pyautogui.hotkey(*keys, interval=0.08) if len(keys) > 1 else pyautogui.press(keys[0])
+            pid = app_pid(app)
+            if not (pid and post_keys(pid, keys)):
+                pyautogui.hotkey(*keys, interval=0.08) if len(keys) > 1 else pyautogui.press(keys[0])
             time.sleep(0.5)
             return f"Pressed {'+'.join(keys)} in {app}."
         text = str(args.get("text", ""))
@@ -1519,14 +1529,14 @@ class DesktopAssistant:
         show_cursor(None, "typing…")
         if field and not focus_field(app, lambda label: names_match(field, label)):
             return f"No '{field}' field in {app}."
-        if frontmost_app_name() != app:
-            return f"Focus moved away from {app}; nothing was typed."
         try:
             type_out(pyautogui, text, interval=0.02, app=app)
         except FocusLost as error:
             return f"Stopped typing because {error}. Nothing went to other apps."
         if args.get("submit"):
-            pyautogui.press("enter")
+            pid = app_pid(app)
+            if not (pid and post_keys(pid, ["enter"])):
+                pyautogui.press("enter")
         return f"Typed {len(text)} characters into {app}" + (" and pressed enter." if args.get("submit") else ".")
 
     def uninstall_app(self, name: str) -> str:
@@ -1790,6 +1800,7 @@ def main() -> int:
         help="Model provider for chat. Cloud keys come from HELM_API_KEY or the provider's env var.",
     )
     parser.add_argument("--model", help="Model name for the chosen provider.")
+    parser.add_argument("--history", help="Conversation file (each Helm agent keeps its own).")
     parser.add_argument("--browser", choices=tuple(BROWSERS), default=DEFAULT_BROWSER, help="Browser for web searches.")
     parser.add_argument(
         "--cloud-vision",
@@ -1839,6 +1850,9 @@ def main() -> int:
         help="JSON object of arguments for --mcp-call.",
     )
     args = parser.parse_args()
+    if args.history:
+        global CHAT_HISTORY_PATH
+        CHAT_HISTORY_PATH = Path(args.history).expanduser()
     if args.screen_access or args.request_screen_access:
         try:
             granted = screen_capture_access_available(

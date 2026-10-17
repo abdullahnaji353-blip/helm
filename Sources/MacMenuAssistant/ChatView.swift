@@ -215,11 +215,50 @@ final class ChatController: NSObject, ObservableObject {
     @Published var showProviderSettings = false
     /// Bumped by the Control+Shift+§ shortcut; the menu bar label opens the HUD when it changes.
     @Published var hudRequests = 0
+    /// Three background agents, each with its own engine, conversation and coloured cursor.
+    lazy var agents: [AgentRun] = (1...3).map { AgentRun(number: $0, owner: self) }
+
+    /// Starts `task` on the first idle agent; false if all three are busy.
+    @discardableResult
+    func dispatch(_ task: String) -> Bool {
+        let text = task.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, let agent = agents.first(where: { !$0.isRunning }) else { return false }
+        agent.run(text)
+        objectWillChange.send()
+        return true
+    }
+
+    func dispatchDraft() {
+        if dispatch(draft) {
+            AgentCursor.shared.say("Sent to an agent: \(draft)")
+            draft = ""
+        } else {
+            lines.append(ChatLine(role: .error, text: "All three agents are busy. Stop one or wait."))
+        }
+    }
+
+    /// The same engine settings the main chat uses.
+    func engineArguments(for text: String, history: URL? = nil) -> [String] {
+        var arguments = ["--chat", text, "--autonomy", askBeforeActing ? "approval" : "autonomous", "--provider", provider]
+        if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
+        if !disabledTools.isEmpty { arguments += ["--disable-tools", disabledTools.sorted().joined(separator: ",")] }
+        if cloudVision { arguments.append("--cloud-vision") }
+        arguments += ["--browser", browser]
+        if let history { arguments += ["--history", history.path] }
+        return arguments
+    }
+
+    func engineEnvironment() -> [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        if provider != "ollama", let key = KeyStore.read(provider) { environment["HELM_API_KEY"] = key }
+        return environment
+    }
     private var appShortcuts: [GlobalHotKey] = []
 
     override init() {
         super.init()
         installAppShortcut()  // ready as soon as Helm launches
+        DispatchQueue.main.async { AgentCursor.shared.start() }
     }
 
     /// helm://ask?q=... runs a command as if it were typed into Helm. Off unless the user enables
@@ -301,7 +340,7 @@ final class ChatController: NSObject, ObservableObject {
     private let speech = AVSpeechSynthesizer()
     private var voiceConfigured = false
 
-    private var projectRoot: URL {
+    var projectRoot: URL {
         if let root = ProcessInfo.processInfo.environment["ASSISTANT_PROJECT_DIR"] {
             return URL(fileURLWithPath: root, isDirectory: true)
         }
@@ -343,6 +382,11 @@ final class ChatController: NSObject, ObservableObject {
 
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.lowercased().hasPrefix("agent:") {  // "agent: research X" runs in the background
+            draft = String(text.dropFirst("agent:".count))
+            dispatchDraft()
+            return
+        }
         guard !text.isEmpty, process == nil else { return }
         draft = ""
         lines.append(ChatLine(role: .user, text: text))
@@ -458,6 +502,7 @@ final class ChatController: NSObject, ObservableObject {
                 let json = Data(line.dropFirst("CHAT_REPLY_JSON:".count).utf8)
                 if let reply = try? JSONDecoder().decode(String.self, from: json) {
                     lines.append(ChatLine(role: .bot, text: reply))
+                    AgentCursor.shared.say(reply)
                     speak(reply)
                 }
             } else if line.hasPrefix("CURSOR: ") {
@@ -465,7 +510,7 @@ final class ChatController: NSObject, ObservableObject {
                 if let data = line.dropFirst("CURSOR: ".count).data(using: .utf8),
                    let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                     let point = (info["x"] as? Double).flatMap { x in (info["y"] as? Double).map { CGPoint(x: x, y: $0) } }
-                    AgentCursor.shared.move(to: point, action: info["action"] as? String ?? "",
+                    AgentCursor.shared.move("Helm", to: point, action: info["action"] as? String ?? "",
                                             click: info["click"] as? Bool ?? false)
                 }
             } else if line.hasPrefix("TOOL: ") {
@@ -1073,6 +1118,7 @@ struct HUDView: View {
             if let action = chat.pendingApproval {
                 HUDApproval(action: action)
             }
+            AgentsBoard().padding(.horizontal, 24)
             HUDInput()
         }
     }
@@ -1204,6 +1250,12 @@ private struct HUDInput: View {
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
                     .foregroundStyle(.red)
             } else {
+                Button("AGENT") { chat.dispatchDraft() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(AgentCursor.colors["Agent 1"] ?? jarvisCyan)
+                    .disabled(chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .help("Run this in the background on one of 3 agents")
                 Button("SEND") { chat.send() }
                     .buttonStyle(.plain)
                     .font(.system(size: 11, weight: .bold, design: .monospaced))
@@ -1847,36 +1899,96 @@ struct SettingsView: View {
     }
 }
 
-// MARK: - Helm's own cursor
+// MARK: - Helm's own cursors and the cursor buddy
 
-/// A visible cursor of Helm's own, separate from the user's mouse (like Codex's agent cursor).
-/// It floats above everything, ignores clicks, and slides to whatever Helm is about to touch.
+/// One drawn cursor per agent, separate from the user's mouse (like Codex's agent cursor).
+struct CursorState: Identifiable, Equatable {
+    let id: String          // "Helm", "Agent 1", ...
+    var position: CGPoint
+    var action: String
+    var visible: Bool
+    var clicks: Int
+    let color: Color
+}
+
+/// Click-through overlay above every window: agent cursors plus a small Helm buddy that rides
+/// next to the user's own pointer and says what is going on (HeyClicky-style).
 @MainActor
 final class AgentCursor: ObservableObject {
     static let shared = AgentCursor()
+    static let colors: [String: Color] = [
+        "Helm": jarvisCyan,
+        "Agent 1": Color(red: 1.0, green: 0.35, blue: 0.75),
+        "Agent 2": Color(red: 1.0, green: 0.72, blue: 0.2),
+        "Agent 3": Color(red: 0.45, green: 0.95, blue: 0.45),
+    ]
 
-    @Published var position = CGPoint(x: -100, y: -100)
-    @Published var action = ""
-    @Published var visible = false
-    @Published var clicks = 0
+    @Published var cursors: [CursorState] = []
+    @Published var mouse = CGPoint(x: -200, y: -200)
+    @Published var buddyText = ""
+    @Published var buddyEnabled = UserDefaults.standard.object(forKey: "cursorBuddy") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(buddyEnabled, forKey: "cursorBuddy")
+            buddyEnabled ? startFollowing() : stopFollowing()
+        }
+    }
     private var panel: NSPanel?
-    private var hideTask: DispatchWorkItem?
+    private var hideTasks: [String: DispatchWorkItem] = [:]
+    private var followTimer: Timer?
+    private var screenHeight: CGFloat = 0
 
-    /// `point` is in screen points with a top-left origin (what Accessibility and pyautogui use).
-    func move(to point: CGPoint?, action: String, click: Bool) {
+    func start() {
         ensurePanel()
-        if let point { position = point }
-        self.action = action
-        visible = true
-        if click { clicks += 1 }
-        hideTask?.cancel()
-        let task = DispatchWorkItem { [weak self] in self?.visible = false }
-        hideTask = task
+        if buddyEnabled { startFollowing() }
+    }
+
+    /// `point` uses screen points with a top-left origin (what Accessibility and pyautogui use).
+    func move(_ id: String, to point: CGPoint?, action: String, click: Bool) {
+        ensurePanel()
+        var cursor = cursors.first { $0.id == id }
+            ?? CursorState(id: id, position: point ?? CGPoint(x: mouse.x + 60, y: mouse.y + 40), action: "",
+                           visible: true, clicks: 0, color: Self.colors[id] ?? jarvisCyan)
+        if let point { cursor.position = point }
+        cursor.action = action
+        cursor.visible = true
+        if click { cursor.clicks += 1 }
+        if let index = cursors.firstIndex(where: { $0.id == id }) { cursors[index] = cursor } else { cursors.append(cursor) }
+        hideTasks[id]?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            if let index = self?.cursors.firstIndex(where: { $0.id == id }) { self?.cursors[index].visible = false }
+        }
+        hideTasks[id] = task
         DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: task)
+    }
+
+    func say(_ text: String) {
+        buddyText = String(text.prefix(140))
+        hideTasks["buddy"]?.cancel()
+        let task = DispatchWorkItem { [weak self] in self?.buddyText = "" }
+        hideTasks["buddy"] = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: task)
+    }
+
+    private func startFollowing() {
+        guard followTimer == nil else { return }
+        followTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let location = NSEvent.mouseLocation  // bottom-left origin
+                self.mouse = CGPoint(x: location.x, y: self.screenHeight - location.y)
+            }
+        }
+    }
+
+    private func stopFollowing() {
+        followTimer?.invalidate()
+        followTimer = nil
+        mouse = CGPoint(x: -200, y: -200)
     }
 
     private func ensurePanel() {
         guard panel == nil, let screen = NSScreen.screens.first else { return }
+        screenHeight = screen.frame.height
         let overlay = NSPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
                               backing: .buffered, defer: false)
         overlay.isOpaque = false
@@ -1892,29 +2004,46 @@ final class AgentCursor: ObservableObject {
 }
 
 private struct AgentCursorView: View {
-    @EnvironmentObject private var cursor: AgentCursor
-    @State private var ripple = false
+    @EnvironmentObject private var overlay: AgentCursor
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             Color.clear
+            ForEach(overlay.cursors) { cursor in
+                OneCursor(cursor: cursor)
+            }
+            if overlay.buddyEnabled {
+                Buddy(text: overlay.buddyText, busy: overlay.cursors.contains { $0.visible })
+                    .offset(x: overlay.mouse.x + 16, y: overlay.mouse.y + 18)
+            }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct OneCursor: View {
+    let cursor: CursorState
+    @State private var ripple = false
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
             Circle()
-                .stroke(jarvisCyan, lineWidth: 3)
+                .stroke(cursor.color, lineWidth: 3)
                 .frame(width: ripple ? 54 : 6, height: ripple ? 54 : 6)
                 .opacity(ripple ? 0 : 0.9)
                 .position(cursor.position)
             HStack(alignment: .top, spacing: 4) {
                 CursorArrow()
-                    .fill(jarvisCyan)
+                    .fill(cursor.color)
                     .overlay(CursorArrow().stroke(Color.white, lineWidth: 1.5))
                     .frame(width: 20, height: 26)
-                    .shadow(color: jarvisCyan.opacity(0.9), radius: 8)
-                Text(cursor.action.isEmpty ? "Helm" : "Helm · \(cursor.action)")
+                    .shadow(color: cursor.color.opacity(0.9), radius: 8)
+                Text(cursor.action.isEmpty ? cursor.id : "\(cursor.id) · \(cursor.action)")
                     .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white)
+                    .foregroundStyle(.black)
                     .padding(.horizontal, 7)
                     .padding(.vertical, 3)
-                    .background(jarvisBlue.opacity(0.92), in: Capsule())
+                    .background(cursor.color.opacity(0.95), in: Capsule())
                     .offset(y: 16)
             }
             .offset(x: cursor.position.x - 2, y: cursor.position.y - 2)
@@ -1926,7 +2055,38 @@ private struct AgentCursorView: View {
             ripple = false
             withAnimation(.easeOut(duration: 0.5)) { ripple = true }
         }
-        .allowsHitTesting(false)
+    }
+}
+
+/// The little Helm that rides next to your pointer.
+private struct Buddy: View {
+    let text: String
+    let busy: Bool
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            ZStack {
+                Circle().fill(jarvisCyan.opacity(0.35)).blur(radius: 5)
+                Circle().fill(AngularGradient(colors: [jarvisCyan, jarvisBlue, jarvisCyan], center: .center))
+                Circle().strokeBorder(Color.white.opacity(0.7), lineWidth: 1).padding(3)
+            }
+            .frame(width: 16, height: 16)
+            .scaleEffect(busy ? 1.15 : 1)
+            .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: busy)
+            if !text.isEmpty {
+                Text(text)
+                    .font(.system(size: 11, weight: .medium, design: .rounded))
+                    .foregroundStyle(.white)
+                    .lineLimit(3)
+                    .frame(maxWidth: 220, alignment: .leading)
+                    .padding(.horizontal, 9)
+                    .padding(.vertical, 6)
+                    .background(Color.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 10))
+                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(jarvisCyan.opacity(0.5)))
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: text)
     }
 }
 
@@ -1943,5 +2103,191 @@ private struct CursorArrow: Shape {
         path.addLine(to: CGPoint(x: w * 0.8, y: h * 0.56))
         path.closeSubpath()
         return path
+    }
+}
+
+
+// MARK: - Background agents
+
+/// One background agent: its own Helm engine process, conversation file, cursor colour and approvals.
+@MainActor
+final class AgentRun: ObservableObject, Identifiable {
+    let number: Int
+    var id: String { "Agent \(number)" }
+    var color: Color { AgentCursor.colors[id] ?? jarvisCyan }
+    @Published var task = ""
+    @Published var activity: [String] = []
+    @Published var reply = ""
+    @Published var pendingApproval: String?
+    @Published var isRunning = false
+    @Published var failed = false
+    private weak var owner: ChatController?
+    private var process: Process?
+    private var inputPipe: Pipe?
+    private var buffer = ""
+
+    init(number: Int, owner: ChatController) {
+        self.number = number
+        self.owner = owner
+    }
+
+    private var historyURL: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Local Desktop Assistant/agent\(number)_history.json")
+    }
+
+    func run(_ text: String) {
+        guard let owner, !isRunning else { return }
+        try? FileManager.default.removeItem(at: historyURL)  // each task starts fresh
+        task = text
+        activity = ["Starting…"]
+        reply = ""
+        failed = false
+        let child = Process()
+        let output = Pipe()
+        let input = Pipe()
+        child.executableURL = owner.projectRoot.appendingPathComponent(".venv/bin/python")
+        child.arguments = ["-u", owner.projectRoot.appendingPathComponent("assistant.py").path]
+            + owner.engineArguments(for: text, history: historyURL)
+        child.currentDirectoryURL = owner.projectRoot
+        child.standardOutput = output
+        child.standardError = output
+        child.standardInput = input
+        child.environment = owner.engineEnvironment()
+        child.terminationHandler = { [weak self] finished in
+            DispatchQueue.main.async { self?.finish(status: finished.terminationStatus) }
+        }
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty { handle.readabilityHandler = nil; return }
+            let chunk = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async { self?.receive(chunk) }
+        }
+        do {
+            try child.run()
+            process = child
+            inputPipe = input
+            isRunning = true
+        } catch {
+            activity = ["Could not start: \(error.localizedDescription)"]
+            failed = true
+        }
+    }
+
+    func approve(all: Bool = false) { respond(all ? "all\n" : "y\n") }
+    func reject() { respond("n\n") }
+
+    func stop() {
+        pendingApproval = nil
+        process?.terminate()
+    }
+
+    private func respond(_ answer: String) {
+        guard let inputPipe, pendingApproval != nil else { return }
+        inputPipe.fileHandleForWriting.write(Data(answer.utf8))
+        pendingApproval = nil
+        if answer != "n\n" { NSApp.deactivate() }  // let the agent's target app come forward
+    }
+
+    private func receive(_ text: String) {
+        buffer += text
+        let parts = buffer.components(separatedBy: .newlines)
+        buffer = parts.last ?? ""
+        for line in parts.dropLast() where !line.trimmingCharacters(in: .whitespaces).isEmpty {
+            if line.hasPrefix("APPROVAL_REQUIRED: ") {
+                pendingApproval = String(line.dropFirst("APPROVAL_REQUIRED: ".count))
+            } else if line.hasPrefix("CURSOR: ") {
+                if let data = line.dropFirst("CURSOR: ".count).data(using: .utf8),
+                   let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let point = (info["x"] as? Double).flatMap { x in (info["y"] as? Double).map { CGPoint(x: x, y: $0) } }
+                    AgentCursor.shared.move(id, to: point, action: info["action"] as? String ?? "",
+                                            click: info["click"] as? Bool ?? false)
+                }
+            } else if line.hasPrefix("CHAT_REPLY_JSON:") {
+                let json = Data(line.dropFirst("CHAT_REPLY_JSON:".count).utf8)
+                reply = (try? JSONDecoder().decode(String.self, from: json)) ?? ""
+                AgentCursor.shared.say("\(id): \(reply)")
+            } else if line.hasPrefix("TOOL: ") {
+                let tool = line.dropFirst("TOOL: ".count).split(separator: " ").first.map(String.init) ?? ""
+                note(tool.replacingOccurrences(of: "_", with: " "))
+                NSApp.deactivate()
+            } else if line.hasPrefix("Error:") {
+                note(line)
+                failed = true
+            } else if !line.hasPrefix("RESULT: ") && !line.hasPrefix("Allow this action?") {
+                note(line)
+            }
+        }
+    }
+
+    private func note(_ text: String) {
+        activity = Array((activity + [text]).suffix(3))
+    }
+
+    private func finish(status: Int32) {
+        if status != 0 && reply.isEmpty { failed = true; note("Stopped (exit \(status)).") }
+        process = nil
+        inputPipe = nil
+        pendingApproval = nil
+        isRunning = false
+    }
+}
+
+/// The three agent lanes shown in the HUD.
+struct AgentsBoard: View {
+    @EnvironmentObject private var chat: ChatController
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ForEach(chat.agents) { agent in
+                AgentLane(agent: agent)
+            }
+        }
+    }
+}
+
+private struct AgentLane: View {
+    @ObservedObject var agent: AgentRun
+
+    private var status: String {
+        if agent.pendingApproval != nil { return "needs your OK" }
+        if agent.isRunning { return "working" }
+        if agent.failed { return "stopped" }
+        return agent.task.isEmpty ? "idle" : "done"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 6) {
+                Circle().fill(agent.color).frame(width: 8, height: 8)
+                    .shadow(color: agent.color, radius: agent.isRunning ? 4 : 0)
+                Text(agent.id.uppercased()).font(.system(size: 10, weight: .bold, design: .monospaced))
+                Spacer()
+                Text(status).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+            }
+            Text(agent.task.isEmpty ? "Waiting for a task" : agent.task)
+                .font(.system(size: 11, weight: .medium))
+                .lineLimit(1)
+            Text(agent.reply.isEmpty ? agent.activity.joined(separator: " → ") : agent.reply)
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(agent.color.opacity(0.85))
+                .lineLimit(2)
+                .frame(maxWidth: .infinity, minHeight: 26, alignment: .topLeading)
+            if let action = agent.pendingApproval {
+                Text(action).font(.system(size: 10)).lineLimit(1)
+                HStack {
+                    Button("Allow") { agent.approve() }
+                    Button("All") { agent.approve(all: true) }
+                    Button("Stop") { agent.reject() }
+                }
+                .controlSize(.mini)
+            } else if agent.isRunning {
+                Button("Stop") { agent.stop() }.controlSize(.mini)
+            }
+        }
+        .padding(9)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(agent.color.opacity(agent.isRunning ? 0.10 : 0.04))
+        .overlay(HUDBrackets(color: agent.color.opacity(agent.isRunning ? 0.9 : 0.35)))
     }
 }
