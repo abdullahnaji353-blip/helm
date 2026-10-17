@@ -1,4 +1,4 @@
-"""1000+ generated training tasks for Chatbot, from easy to extreme.
+"""1000+ generated training tasks for Helm, from easy to extreme.
 
 Each task: id, level, say (what the user types), expect (tool it should use),
 check(out, reply) -> bool, optional hint (shown on the retry), optional setup.
@@ -162,8 +162,8 @@ CURRENCIES = {
     "Iraq": "dinar", "Morocco": "dirham",
 }
 PHRASES = [
-    "Hello from Chatbot", "Training day one", "Jarvis is online", "The quick brown fox", "Systems nominal",
-    "Good morning world", "Testing one two three", "Chatbot was here", "Learning every day", "Mission complete",
+    "Hello from Helm", "Training day one", "Jarvis is online", "The quick brown fox", "Systems nominal",
+    "Good morning world", "Testing one two three", "Helm was here", "Learning every day", "Mission complete",
 ]
 STATUS_PHRASES = [
     "what's my battery and the time?", "what time is it", "how much battery do I have", "what's today's date",
@@ -426,7 +426,7 @@ def build() -> list[dict]:
 
 
 def _no_outsourcing(tasks: list[dict]) -> list[dict]:
-    """Writing tasks fail if Chatbot had ChatGPT write the text instead of writing it itself."""
+    """Writing tasks fail if Helm had ChatGPT write the text instead of writing it itself."""
     for task in tasks:
         if task["expect"] == "new_document":
             task["check"] = (lambda out, reply, original=task["check"]:

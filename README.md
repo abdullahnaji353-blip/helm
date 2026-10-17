@@ -149,12 +149,12 @@ installed into the project virtual environment.
 
 ## AI providers and API keys
 
-Chatbot runs on local Ollama by default. To use a cloud model instead, open
+Helm runs on local Ollama by default. To use a cloud model instead, open
 **AI model & API keys…** in the settings menu (or the first-launch setup) and
 pick Claude, ChatGPT, Gemini or OpenRouter, then paste your key. Keys are
 stored in the macOS Keychain (service "Chatbot API Keys"), never in this
 folder, and are handed to the Python backend only through the
-`CHATBOT_API_KEY` environment variable of each request.
+`HELM_API_KEY` environment variable of each request.
 
 From Terminal you can use the usual variables instead:
 

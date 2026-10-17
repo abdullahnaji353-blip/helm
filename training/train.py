@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Train Chatbot on the curriculum (training/curriculum.py, 1000+ tasks).
+"""Train Helm on the curriculum (training/curriculum.py, 1000+ tasks).
 
-Chatbot does every task by itself (autonomous `assistant.py --chat`). A failed
+Helm does every task by itself (autonomous `assistant.py --chat`). A failed
 task is retried once with a small hint. Messages are dry runs: chats are
 opened and verified, never sent. Afterwards training/REPORT.md lists every
 failure with the likely problem and fix; it opens in VS Code and is copied to
@@ -45,7 +45,7 @@ def run(say: str) -> tuple[str, str, float]:
         proc = subprocess.run(
             [str(PYTHON), "-u", str(ROOT / "assistant.py"), "--chat", say, "--autonomy", "autonomous"],
             capture_output=True, text=True, timeout=300, cwd=ROOT,
-            env={**os.environ, "CHATBOT_DRY_RUN": "1"},
+            env={**os.environ, "HELM_DRY_RUN": "1"},
         )
         out = proc.stdout + proc.stderr
     except subprocess.TimeoutExpired as error:
@@ -82,9 +82,9 @@ def write_report(rows: list[dict]) -> str:
     by_level = {level: Counter(r["ok"] for r in rows if r["level"] == level) for level in LEVELS}
     failed = [r for r in rows if not r["ok"]]
     lines = [
-        "# Chatbot training report",
+        "# Helm training report",
         "",
-        "@workspace This is Chatbot's latest training run. For each failure below, propose the code change "
+        "@workspace This is Helm's latest training run. For each failure below, propose the code change "
         "(in assistant.py, screen_elements.py or providers.py) that would make it pass. Keep fixes small.",
         "",
         "| Level | Passed | Failed |", "|---|---|---|",
@@ -103,7 +103,7 @@ def write_report(rows: list[dict]) -> str:
             f"- **Reply:** {r['reply'][:200] or '(none)'}",
             f"- **Problem:** {r['problem']}",
             f"- **Suggested fix:** {r['fix']}",
-            f"- **Reproduce:** `CHATBOT_DRY_RUN=1 .venv/bin/python assistant.py --chat \"{r['say']}\" --autonomy autonomous`",
+            f"- **Reproduce:** `HELM_DRY_RUN=1 .venv/bin/python assistant.py --chat \"{r['say']}\" --autonomy autonomous`",
             "",
         ]
     report = "\n".join(lines)

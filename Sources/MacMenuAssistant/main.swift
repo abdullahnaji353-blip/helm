@@ -258,7 +258,7 @@ struct MacMenuAssistantApp: App {
     }
 
     var body: some Scene {
-        Window("Chatbot", id: "hud") {
+        Window("Helm", id: "hud") {
             HUDView()
                 .environmentObject(controller)
                 .environmentObject(chat)

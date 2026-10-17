@@ -101,10 +101,10 @@ struct ChatLine: Identifiable, Equatable {
     var text: String
 }
 
-/// Drives the Chatbot conversation through `assistant.py --chat`, which keeps
+/// Drives the Helm conversation through `assistant.py --chat`, which keeps
 /// history and calls device tools (apps, URLs, volume, status, screen control).
 @MainActor
-final class ChatController: ObservableObject {
+final class ChatController: NSObject, ObservableObject {
     @Published var lines: [ChatLine] = []
     @Published var draft = ""
     @Published var isThinking = false
@@ -145,7 +145,7 @@ final class ChatController: ObservableObject {
             .appendingPathComponent("Library/Application Support/Local Desktop Assistant", isDirectory: true)
     }
 
-    /// First run only if nothing of Chatbot exists on this Mac yet: no setup flag, no
+    /// First run only if nothing of Helm exists on this Mac yet: no setup flag, no
     /// setup marker (survives preference resets), no saved keys and no chat history.
     static func isFirstRun() -> Bool {
         let defaults = UserDefaults.standard
@@ -193,7 +193,7 @@ final class ChatController: ObservableObject {
         child.standardOutput = output
         child.standardError = output
         var environment = ProcessInfo.processInfo.environment
-        if provider != "ollama", let key = KeyStore.read(provider) { environment["CHATBOT_API_KEY"] = key }
+        if provider != "ollama", let key = KeyStore.read(provider) { environment["HELM_API_KEY"] = key }
         child.environment = environment
         child.terminationHandler = { [weak self] _ in
             let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
@@ -217,11 +217,22 @@ final class ChatController: ObservableObject {
     @Published var hudRequests = 0
     private var appShortcuts: [GlobalHotKey] = []
 
-    init() {
-        installAppShortcut()  // ready as soon as Chatbot launches
+    override init() {
+        super.init()
+        installAppShortcut()  // ready as soon as Helm launches
     }
 
-    /// Control+Shift+§ opens Chatbot from anywhere (§ is the ISO key left of 1; ` on US keyboards).
+    /// helm://ask?q=... runs a command as if it were typed into Helm. Off unless the user enables
+    /// developerURLCommands, because any web page could otherwise send Helm commands.
+    func handleOpenURL(_ url: URL) {
+        guard UserDefaults.standard.bool(forKey: "developerURLCommands"),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: false), components.host == "ask",
+              let query = components.queryItems?.first(where: { $0.name == "q" })?.value else { return }
+        draft = query
+        send()
+    }
+
+    /// Control+Shift+§ opens Helm from anywhere (§ is the ISO key left of 1; ` on US keyboards).
     func installAppShortcut() {
         guard appShortcuts.isEmpty else { return }
         let modifiers = UInt32(controlKey | shiftKey)
@@ -232,7 +243,7 @@ final class ChatController: ObservableObject {
 
     func showHUD() {
         if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
-        if let window = NSApp.windows.first(where: { $0.title == "Chatbot" && !($0 is NSPanel) }) {
+        if let window = NSApp.windows.first(where: { $0.title == "Helm" && !($0 is NSPanel) }) {
             // macOS may refuse to switch apps for a background hotkey; show the window on top anyway.
             window.orderFrontRegardless()
             window.makeKeyAndOrderFront(nil)
@@ -335,6 +346,7 @@ final class ChatController: ObservableObject {
         guard !text.isEmpty, process == nil else { return }
         draft = ""
         lines.append(ChatLine(role: .user, text: text))
+        logBackend("\n=== \(Date()) you: \(text)\n")
         var arguments = ["--chat", text, "--autonomy", askBeforeActing ? "approval" : "autonomous", "--provider", provider]
         if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
         if !disabledTools.isEmpty { arguments += ["--disable-tools", disabledTools.sorted().joined(separator: ",")] }
@@ -362,6 +374,32 @@ final class ChatController: ObservableObject {
         guard let inputPipe, pendingApproval != nil else { return }
         inputPipe.fileHandleForWriting.write(Data(answer.utf8))
         pendingApproval = nil
+        if answer != "n\n" { stepAside() }  // clicking Allow made Helm active again
+    }
+
+    /// Tools that must bring another app to the front.
+    private static let actingTools: Set<String> = [
+        "open_app", "open_url", "send_message", "read_chat", "control_screen", "click_in_app", "menu_in_app",
+        "type_in_app", "keys_in_app", "new_document", "paste_into_app", "web_search", "ask_chatgpt", "media_control",
+    ]
+
+    /// macOS won't let a background process pull focus away from the app the user is typing in,
+    /// and that app is Helm itself. Give up focus (the window stays visible) so the target can come forward.
+    private func stepAside() {
+        NSApp.deactivate()
+    }
+
+    private func logBackend(_ text: String) {
+        let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Helm", isDirectory: true)
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let url = folder.appendingPathComponent("backend.log")
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(text.utf8))
+            try? handle.close()
+        } else {
+            try? Data(text.utf8).write(to: url)
+        }
     }
 
     private func launch(_ arguments: [String]) {
@@ -382,7 +420,7 @@ final class ChatController: ObservableObject {
         child.standardInput = input
         var environment = ProcessInfo.processInfo.environment
         if provider != "ollama", let key = KeyStore.read(provider) {
-            environment["CHATBOT_API_KEY"] = key
+            environment["HELM_API_KEY"] = key
         }
         child.environment = environment
         child.terminationHandler = { [weak self] finished in
@@ -404,11 +442,12 @@ final class ChatController: ObservableObject {
             buffer = ""
             isThinking = true
         } catch {
-            lines.append(ChatLine(role: .error, text: "Could not start Chatbot: \(error.localizedDescription)"))
+            lines.append(ChatLine(role: .error, text: "Could not start Helm: \(error.localizedDescription)"))
         }
     }
 
     private func receive(_ text: String) {
+        logBackend(text)
         buffer += text
         let parts = buffer.components(separatedBy: .newlines)
         buffer = parts.last ?? ""
@@ -422,6 +461,8 @@ final class ChatController: ObservableObject {
                     speak(reply)
                 }
             } else if line.hasPrefix("TOOL: ") {
+                let tool = line.dropFirst("TOOL: ".count).split(separator: " ").first.map(String.init) ?? ""
+                if Self.actingTools.contains(tool) { stepAside() }
                 let name = line.dropFirst("TOOL: ".count).split(separator: " ").first.map(String.init) ?? ""
                 addActivity(Self.toolLabels[name] ?? "Working on it…")
             } else if line.hasPrefix("Error:") || line.hasPrefix("SCREEN_ACCESS_DENIED:") {
@@ -482,6 +523,7 @@ struct MenuBarIcon: View {
                 openWindow(id: "hud")
                 NSApp.activate(ignoringOtherApps: true)
             }
+            .onOpenURL { chat.handleOpenURL($0) }
     }
 }
 
@@ -495,7 +537,7 @@ struct MenuLauncher: View {
             HStack(spacing: 10) {
                 Orb(active: chat.isThinking || chat.isListening, size: 26)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("CHATBOT").font(.system(size: 12, weight: .bold, design: .monospaced)).tracking(3)
+                    Text("HELM").font(.system(size: 12, weight: .bold, design: .monospaced)).tracking(3)
                     Text(chat.isThinking ? "Working…" : chat.onboarded ? "Online" : "Setup not finished")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                 }
@@ -504,7 +546,7 @@ struct MenuLauncher: View {
                 openWindow(id: "hud")
                 NSApp.activate(ignoringOtherApps: true)
             } label: {
-                Label(chat.onboarded ? "Open Chatbot" : "Continue setup", systemImage: "macwindow")
+                Label(chat.onboarded ? "Open Helm" : "Continue setup", systemImage: "macwindow")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -606,7 +648,7 @@ struct ChatPanel: View {
         HStack(spacing: 12) {
             Orb(active: chat.isThinking || chat.isListening, size: 30)
             VStack(alignment: .leading, spacing: 2) {
-                Text("CHATBOT")
+                Text("HELM")
                     .font(.system(size: 13, weight: .bold, design: .rounded))
                     .tracking(3)
                 Text(status)
@@ -630,7 +672,7 @@ struct ChatPanel: View {
                 }
                 Button("Permissions & MCP tools…") { showAdvanced = true }
                 Divider()
-                Button("Quit Chatbot") { NSApplication.shared.terminate(nil) }
+                Button("Quit Helm") { NSApplication.shared.terminate(nil) }
             } label: {
                 Image(systemName: "slider.horizontal.3")
                     .font(.system(size: 13))
@@ -780,7 +822,7 @@ struct ChatPanel: View {
             .help("Talk (or hold Control+Option)")
             .accessibilityLabel(chat.isListening ? "Stop listening" : "Start voice input")
 
-            TextField("Message Chatbot…", text: $chat.draft, axis: .vertical)
+            TextField("Message Helm…", text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.system(size: 13))
                 .lineLimit(1...4)
@@ -853,7 +895,7 @@ private struct TypingDots: View {
         .padding(.vertical, 11)
         .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 15))
         .onAppear { phase = true }
-        .accessibilityLabel("Chatbot is thinking")
+        .accessibilityLabel("Helm is thinking")
     }
 }
 
@@ -893,6 +935,7 @@ struct HUDView: View {
         .sheet(isPresented: $chat.showProviderSettings) {
             SettingsView().preferredColorScheme(.dark)
         }
+        .onOpenURL { chat.handleOpenURL($0) }
         .onAppear {
             chat.configureVoice()
             // Menu bar style hides the big window at launch, but not when the shortcut asked for it.
@@ -905,7 +948,7 @@ struct HUDView: View {
 
     private func closeHUDWindow() {
         DispatchQueue.main.async {
-            NSApp.windows.filter { $0.title == "Chatbot" && !($0 is NSPanel) }.forEach { $0.close() }
+            NSApp.windows.filter { $0.title == "Helm" && !($0 is NSPanel) }.forEach { $0.close() }
         }
     }
 
@@ -919,7 +962,7 @@ struct HUDView: View {
     private var reactorColumn: some View {
         VStack(spacing: 22) {
             HStack {
-                Text("C · H · A · T · B · O · T")
+                Text("H · E · L · M")
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .foregroundStyle(jarvisCyan)
                 Spacer()
@@ -980,14 +1023,14 @@ struct HUDView: View {
                 .toggleStyle(.switch)
                 .controlSize(.mini)
                 .font(.system(size: 11, design: .monospaced))
-                .help("When on, Chatbot clicks and types without asking first.")
+                .help("When on, Helm clicks and types without asking first.")
                 Menu {
                     Button("Settings (brain, abilities, permissions)…") { chat.showProviderSettings = true }
                     Toggle("Speak replies", isOn: $chat.speakReplies)
                     Button("New chat") { chat.newChat() }
                     Button("Permissions & MCP tools…") { showAdvanced = true }
                     Divider()
-                    Button("Quit Chatbot") { NSApplication.shared.terminate(nil) }
+                    Button("Quit Helm") { NSApplication.shared.terminate(nil) }
                 } label: {
                     Image(systemName: "slider.horizontal.3").foregroundStyle(.secondary)
                 }
@@ -1073,7 +1116,7 @@ struct HUDView: View {
             }
         case .bot:
             VStack(alignment: .leading, spacing: 4) {
-                Text("CHATBOT ›").font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(jarvisCyan)
+                Text("HELM ›").font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(jarvisCyan)
                 Text(line.text).font(.system(size: 15)).textSelection(.enabled)
             }
             .padding(.leading, 10)
@@ -1248,7 +1291,7 @@ struct ProviderSettingsView: View {
     var body: some View {
         let option = ProviderOption.find(chat.provider)
         VStack(alignment: .leading, spacing: 14) {
-            Text("CHOOSE CHATBOT'S BRAIN")
+            Text("CHOOSE HELM'S BRAIN")
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .tracking(2)
                 .foregroundStyle(.secondary)
@@ -1505,15 +1548,15 @@ struct PermissionsView: View {
                 }
                 if chat.isEnabled(["web_search"]) {
                     Label(chat.browser == "chrome"
-                          ? "To let Chatbot read search results, in Chrome turn on View → Developer → Allow JavaScript from Apple Events."
-                          : "To let Chatbot read search results, in Safari turn on Develop → Allow JavaScript from Apple Events (Settings → Advanced → Show features for web developers).",
+                          ? "To let Helm read search results, in Chrome turn on View → Developer → Allow JavaScript from Apple Events."
+                          : "To let Helm read search results, in Safari turn on Develop → Allow JavaScript from Apple Events (Settings → Advanced → Show features for web developers).",
                           systemImage: "globe")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if chat.isEnabled(["media_control"]) {
-                    Label("Music control: macOS asks once, the first time you ask Chatbot to play something.", systemImage: "info.circle")
+                    Label("Music control: macOS asks once, the first time you ask Helm to play something.", systemImage: "info.circle")
                         .font(.system(size: 11))
                         .foregroundStyle(.secondary)
                         .padding(.top, 4)
@@ -1523,11 +1566,11 @@ struct PermissionsView: View {
                         Label("Already switched on in System Settings but still not allowed here?", systemImage: "exclamationmark.triangle.fill")
                             .font(.system(size: 12, weight: .semibold))
                             .foregroundStyle(.orange)
-                        Text("macOS only applies Screen Recording after Chatbot restarts. If it is still off after a restart, the switch belongs to an older build: in Screen & System Audio Recording select LocalDesktopAssistant, press −, then click Allow here again.")
+                        Text("macOS only applies Screen Recording after Helm restarts. If it is still off after a restart, the switch belongs to an older build: in Screen & System Audio Recording select LocalDesktopAssistant, press −, then click Allow here again.")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
-                        Button("Restart Chatbot") { ChatController.relaunch() }
+                        Button("Restart Helm") { ChatController.relaunch() }
                     }
                     .padding(12)
                     .background(Color.orange.opacity(0.08))
@@ -1571,7 +1614,7 @@ struct OnboardingView: View {
     @State private var step = 0
 
     private let steps = [
-        ("Welcome", "Meet Chatbot"),
+        ("Welcome", "Meet Helm"),
         ("Brain", "AI model & API key"),
         ("Abilities", "What it can do"),
         ("Permissions", "What macOS allows"),
@@ -1606,7 +1649,7 @@ struct OnboardingView: View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 10) {
                 Orb(active: false, size: 26)
-                Text("CHATBOT")
+                Text("HELM")
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
                     .tracking(3)
                     .foregroundStyle(jarvisCyan)
@@ -1647,7 +1690,7 @@ struct OnboardingView: View {
     }
 
     private var title: String {
-        ["Meet Chatbot", "Choose its brain", "Pick its abilities", "Give it permission", "All systems online"][step]
+        ["Meet Helm", "Choose its brain", "Pick its abilities", "Give it permission", "All systems online"][step]
     }
 
     private var subtitle: String {
@@ -1656,7 +1699,7 @@ struct OnboardingView: View {
             "Run free and private on this Mac with Ollama, or plug in a cloud AI with your own API key. Cloud models are smarter and much better at controlling the screen.",
             "Turn on only what you want. Anything off is never offered to the AI.",
             "macOS asks you to approve each one. Rows turn green as soon as you allow them.",
-            "Here's how Chatbot is set up. Hold Control+Option and say something, or type below.",
+            "Here's how Helm is set up. Hold Control+Option and say something, or type below.",
         ][step]
     }
 
@@ -1738,7 +1781,7 @@ struct OnboardingView: View {
                     .font(.system(size: 11))
                     .foregroundStyle(.orange)
             }
-            Button(step == steps.count - 1 ? "Launch Chatbot" : "Continue") {
+            Button(step == steps.count - 1 ? "Launch Helm" : "Continue") {
                 if step == steps.count - 1 { chat.completeSetup() } else { step += 1 }
             }
             .buttonStyle(.borderedProminent)

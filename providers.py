@@ -1,4 +1,4 @@
-"""Cloud model providers for Chatbot: Claude and OpenAI-compatible APIs.
+"""Cloud model providers for Helm: Claude and OpenAI-compatible APIs.
 
 Messages use the assistant's internal (Ollama-style) shape:
   {"role": "assistant", "content": str, "tool_calls": [{"id", "function": {"name", "arguments": dict}}]}
@@ -42,9 +42,9 @@ FALLBACK_MODELS = {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "clau
 
 
 def provider_key(provider: str) -> str:
-    """The app passes the Keychain key as CHATBOT_API_KEY; terminals can use the usual env vars."""
+    """The app passes the Keychain key as HELM_API_KEY; terminals can use the usual env vars."""
     env = PROVIDERS[provider]["env"]
-    return os.environ.get("CHATBOT_API_KEY") or (os.environ.get(env, "") if env else "")
+    return os.environ.get("HELM_API_KEY") or (os.environ.get(env, "") if env else "")
 
 
 def parse_json_object(text: str) -> object:
@@ -158,9 +158,9 @@ def anthropic_turn(model: str, key: str, messages: list[dict], tools: list[dict]
     try:
         response = client.beta.messages.create(**params)
     except TypeError as error:  # the SDK found no key, token or profile
-        raise RuntimeError("Add your Claude API key in Chatbot's settings.") from error
+        raise RuntimeError("Add your Claude API key in Helm's settings.") from error
     except anthropic.AuthenticationError as error:
-        raise RuntimeError("Claude rejected the API key. Update it in Chatbot's settings.") from error
+        raise RuntimeError("Claude rejected the API key. Update it in Helm's settings.") from error
     except anthropic.RateLimitError as error:
         raise RuntimeError("Claude's rate limit was reached. Try again in a moment.") from error
     except anthropic.APIStatusError as error:
@@ -182,7 +182,7 @@ def anthropic_turn(model: str, key: str, messages: list[dict], tools: list[dict]
 def openai_turn(provider: str, model: str, key: str, messages: list[dict], tools: list[dict] | None) -> dict:
     label = PROVIDERS[provider]["label"]
     if not key:
-        raise RuntimeError(f"Add your {label} API key in Chatbot's settings.")
+        raise RuntimeError(f"Add your {label} API key in Helm's settings.")
     body: dict = {"model": model, "messages": to_openai_messages(messages)}
     if tools:
         body["tools"] = tools
@@ -197,7 +197,7 @@ def openai_turn(provider: str, model: str, key: str, messages: list[dict], tools
             result = json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         if error.code in {401, 403}:
-            raise RuntimeError(f"{label} rejected the API key. Update it in Chatbot's settings.") from error
+            raise RuntimeError(f"{label} rejected the API key. Update it in Helm's settings.") from error
         detail = error.read().decode("utf-8", errors="replace").strip()[:300]
         raise RuntimeError(f"{label} returned HTTP {error.code}: {detail}") from error
     except (URLError, TimeoutError) as error:
