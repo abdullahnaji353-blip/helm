@@ -54,6 +54,8 @@ SYSTEM_PROMPT = (
     "-> read_screen; 'press 7 in Calculator' -> click_in_app; 'new document in TextEdit' -> "
     "menu_in_app(path=File > New); 'go to example.com in Safari' -> keys_in_app(command+l) then "
     "type_in_app(text=example.com, submit=true); 'install X' -> install_app; 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
+    "'how much is Spotify / what is Notion' -> answer from your private notes or app_knowledge; "
+    "'write an essay about X' -> compose the full essay yourself with proper grammar, then new_document(text=essay); "
     "'ask ChatGPT X' -> ask_chatgpt(question=X); 'write X in a new TextEdit document' -> new_document(text=X); 'work out 47 times 23 with Calculator' -> "
     "click_in_app(app=Calculator, label='4 7 × 2 3 =') then say the number shown; 'copy the word X' -> clipboard(action=copy, text=X); 'paste what you copied into X' -> "
     "paste_into_app(app=X) with no text; 'is X a bot' -> send_message dry check reports bots; 'ask ChatGPT X' -> paste_into_app(app=ChatGPT, "
@@ -167,6 +169,14 @@ CHAT_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string"}, "app": {"type": "string", "description": "Defaults to TextEdit"}},
             "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "app_knowledge",
+        "description": (
+            "Look up your private research notes about an app (what it is, how people use it, benefits, "
+            "subscription prices, tech) or list apps in a category such as music, video, AI, messaging."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "App name or category"}}, "required": ["query"]}}},
     {"type": "function", "function": {
         "name": "click_in_app",
         "description": (
@@ -444,6 +454,27 @@ def chat_title_matches(title: str, recipient: str, kind: str, server: str = "") 
 
 
 SKILLS_PATH = CHAT_HISTORY_PATH.parent / "skills.json"
+KNOWLEDGE_PATH = CHAT_HISTORY_PATH.parent / "knowledge" / "apps.json"  # private: never in the repo
+
+
+def load_knowledge() -> list[dict]:
+    try:
+        data = json.loads(KNOWLEDGE_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return data.get("apps", []) if isinstance(data, dict) else []
+
+
+def describe_app(entry: dict) -> str:
+    plans = "; ".join(f"{name}: {price}" for name, price in entry.get("plans", {}).items())
+    return (f"{entry['name']} ({entry['category']}, {entry['importance']}): {entry['what']} "
+            f"How people use it: {entry['how_people_use_it']} Benefits: {entry['benefits']} "
+            f"Plans: {plans}. Tech: {entry['tech']}" + (f" Tips: {entry['chatbot_tips']}" if entry.get("chatbot_tips") else ""))
+
+
+def apps_mentioned(text: str, knowledge: list[dict]) -> list[dict]:
+    lowered = text.lower()
+    return [e for e in knowledge if re.search(rf"\b{re.escape(e['name'].lower())}\b", lowered)]
 LESSONS_PATH = CHAT_HISTORY_PATH.parent / "lessons.json"
 
 
@@ -754,6 +785,14 @@ class DesktopAssistant:
                     return "There was no lesson to save."
                 save_lesson(lesson)
                 return "Saved. I will remember that."
+            if name == "app_knowledge":
+                query = str(args.get("query", "")).strip().lower()
+                knowledge = load_knowledge()
+                hits = [e for e in knowledge if query and (query in e["name"].lower() or e["name"].lower() in query)]
+                hits = hits or [e for e in knowledge if query and query in e["category"].lower()]
+                if not hits:
+                    return f"No notes about {query}. Known apps: " + ", ".join(e["name"] for e in knowledge)
+                return "\n".join(describe_app(e) for e in hits[:6])
             if name == "new_document":
                 app = str(args.get("app") or "TextEdit").strip()
                 error = self.focus_app(app)
@@ -811,7 +850,15 @@ class DesktopAssistant:
             return f"{name} failed: {error}"
         return f"Unknown tool {name}."
 
+    def recall_apps(self, text: str) -> None:
+        mentioned = apps_mentioned(text, load_knowledge())
+        if mentioned:
+            notes = "\n".join(f"- {describe_app(e)}" for e in mentioned[:4])
+            self.messages[0]["content"] = self.messages[0]["content"].split("\nYour private notes")[0] + (
+                "\nYour private notes about apps the user mentioned (from your research; prices may change):\n" + notes)
+
     def chat(self, text: str) -> str:
+        self.recall_apps(text)
         self.messages.append({"role": "user", "content": text})
         start = len(self.messages) - 1
         try:

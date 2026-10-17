@@ -11,6 +11,7 @@ from assistant import (
     DesktopAssistant,
     action_approved,
     names_match,
+    apps_mentioned,
     written_tool_call,
     recall_skills,
     remember_skill,
@@ -660,6 +661,25 @@ class InteractTests(unittest.TestCase):
         prompt.assert_called_once()
         focus.assert_not_called()
         self.assertIn("nothing was done", result)
+
+
+class KnowledgeTests(unittest.TestCase):
+    KNOWLEDGE = [{"name": "Spotify", "category": "music", "importance": "popular", "what": "Music streaming.",
+                  "how_people_use_it": "Playlists.", "benefits": "Any song.", "plans": {"Individual": "$12.99/month"},
+                  "tech": "Java.", "chatbot_tips": ""}]
+
+    def test_mentioned_apps_are_recalled_into_the_system_prompt(self):
+        self.assertEqual([e["name"] for e in apps_mentioned("is spotify worth it?", self.KNOWLEDGE)], ["Spotify"])
+        assistant = DesktopAssistant()
+        with patch("assistant.load_knowledge", return_value=self.KNOWLEDGE):
+            assistant.recall_apps("how much is Spotify premium")
+        self.assertIn("$12.99/month", assistant.messages[0]["content"])
+
+    def test_knowledge_tool_finds_by_name_or_category(self):
+        assistant = DesktopAssistant()
+        with patch("assistant.load_knowledge", return_value=self.KNOWLEDGE), redirect_stdout(io.StringIO()):
+            self.assertIn("Java", assistant.run_tool("app_knowledge", {"query": "spotify"}))
+            self.assertIn("Spotify", assistant.run_tool("app_knowledge", {"query": "music"}))
 
 
 if __name__ == "__main__":

@@ -12,7 +12,39 @@ import re
 import subprocess
 from operator import add, mul, sub
 
+from pathlib import Path
+
+from grader import passes
 from screen_elements import read_app
+
+KNOWLEDGE = Path.home() / "Library/Application Support/Local Desktop Assistant/knowledge/apps.json"
+
+
+def load_apps() -> list[dict]:
+    import json
+
+    try:
+        return json.loads(KNOWLEDGE.read_text(encoding="utf-8"))["apps"]
+    except (OSError, ValueError, KeyError):
+        return []
+
+
+def first_price(text: str) -> str | None:
+    match = re.search(r"\$(\d+(?:\.\d\d)?)", text)
+    return match.group(1) if match else None
+
+
+def paid_price(app: dict) -> str | None:
+    """First non-zero price in the app's plans (essays must cite a real paid price, not $0)."""
+    for text in app["plans"].values():
+        price = first_price(text)
+        if price and float(price) > 0:
+            return price
+    return None
+
+
+def essay_text() -> str:
+    return read_app("TextEdit", max_chars=20000)[0]
 
 
 def sh(*args: str) -> str:
@@ -311,11 +343,76 @@ def build() -> list[dict]:
              f"find a youtube video about {topic}, copy its link, then paste it into ChatGPT asking for a one line summary of what that video is probably about",
              "web_search", lambda out, reply: "youtube.com/" in clipboard() and "TOOL: paste_into_app" in out,
              hint="web_search youtube -> clipboard copy -> ask_chatgpt with the link and the request")
+    # ----- WRITING: essays graded by macOS spelling + grammar, facts from private memory -----
+    apps = load_apps()
+    paid = [a for a in apps if paid_price(a)]
+    for app in paid:
+        for plan, price_text in app["plans"].items():
+            price = first_price(price_text)
+            if price:
+                task("medium", f"price-{app['name']}-{plan}", f"how much does {app['name']} {plan} cost per month?",
+                     None, lambda out, reply, price=price: price in reply.replace(",", ""),
+                     hint="use your private notes or app_knowledge")
+    for app in apps:
+        task("hard", f"para-{app['name']}",
+             f"write a 150-word paragraph explaining what {app['name']} is and how people use it, "
+             "in a new TextEdit document, with perfect spelling and grammar",
+             "new_document", lambda out, reply, name=app["name"]: passes(essay_text(), 120, 1, 1, [name]),
+             hint="compose the whole paragraph yourself, then new_document(text=paragraph)", setup=fresh_textedit)
+    for app in paid:
+        price = paid_price(app)
+        task("extreme", f"essay-{app['name']}",
+             f"write a 300-word essay about {app['name']} with an introduction, a body and a conclusion: how it "
+             "works, how people use it, its benefits, and its subscription prices. Put it in a new TextEdit "
+             "document with proper grammar.",
+             "new_document", lambda out, reply, name=app["name"], price=price: passes(essay_text(), 250, 3, 2, [name, price]),
+             hint="check app_knowledge for prices, write 3+ paragraphs yourself, then new_document", setup=fresh_textedit)
+    by_category: dict[str, list[dict]] = {}
+    for app in paid:
+        by_category.setdefault(app["category"], []).append(app)
+    pairs = [(a, b) for group in by_category.values() for i, a in enumerate(group) for b in group[i + 1:]]
+    for a, b in pairs:
+        pa, pb = paid_price(a), paid_price(b)
+        task("insane", f"compare-essay-{a['name']}-{b['name']}",
+             f"write a 350-word comparison essay of {a['name']} versus {b['name']}: what each does, who should "
+             "pick which, and what their plans cost. Use at least four paragraphs and flawless grammar, in a new "
+             "TextEdit document.",
+             "new_document",
+             lambda out, reply, a=a["name"], b=b["name"], pa=pa, pb=pb: passes(essay_text(), 300, 4, 3, [a, b, pa, pb]),
+             hint="app_knowledge for both apps, then write four paragraphs yourself and new_document", setup=fresh_textedit)
+    monthly = []
+    for app in paid:
+        for plan, price_text in app["plans"].items():
+            if ("/month" in price_text and first_price(price_text) and float(first_price(price_text)) > 0
+                    and "year" not in price_text.split("/month")[0]):
+                monthly.append((app["name"], plan, float(first_price(price_text))))
+                break
+    for i in range(min(30, max(0, len(monthly) - 2))):
+        trio = [monthly[i], monthly[(i + 7) % len(monthly)], monthly[(i + 13) % len(monthly)]]
+        if len({t[0] for t in trio}) < 3:
+            continue
+        total = f"{sum(t[2] for t in trio):.2f}"
+        listed = ", ".join(f"{name} {plan}" for name, plan, _ in trio)
+        task("master", f"budget-{i}",
+             f"I pay for {listed}. Write a 400-word essay in a new TextEdit document that works out my exact total "
+             "monthly cost, explains what each subscription gives me, and advises which one I could cancel. "
+             "Use at least four paragraphs and proper grammar.",
+             "new_document", lambda out, reply, total=total: passes(essay_text(), 330, 4, 3, [total]),
+             hint="look up each price, add them carefully, state the total with cents, then write the essay",
+             setup=fresh_textedit)
+    for app in paid[:30]:
+        price = paid_price(app)
+        task("master", f"persuade-{app['name']}",
+             f"write a persuasive 400-word letter to a parent arguing whether a paid {app['name']} plan is worth "
+             "the money, with a greeting, at least four paragraphs, a sign-off and flawless grammar, in a new "
+             "TextEdit document",
+             "new_document", lambda out, reply, name=app["name"], price=price: passes(essay_text(), 330, 4, 3, [name, price, "dear"]),
+             hint="use the real price from app_knowledge; Dear ..., four paragraphs, then a sign-off", setup=fresh_textedit)
     return tasks
 
 
 TASKS = build()
-LEVELS = ("easy", "medium", "hard", "extreme", "insane")
+LEVELS = ("easy", "medium", "hard", "extreme", "insane", "master")
 
 if __name__ == "__main__":
     from collections import Counter
