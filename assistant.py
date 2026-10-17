@@ -472,6 +472,19 @@ def describe_app(entry: dict) -> str:
             f"Plans: {plans}. Tech: {entry['tech']}" + (f" Tips: {entry['chatbot_tips']}" if entry.get("chatbot_tips") else ""))
 
 
+WRITING_PATH = KNOWLEDGE_PATH.parent / "writing.json"
+WRITING_WORDS = ("write", "essay", "message", "text", "caption", "reply", "post", "letter", "grammar", "punctuation", "say ")
+
+
+def writing_guide() -> str:
+    try:
+        guide = json.loads(WRITING_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    return ("Texting tone: " + " ".join(guide.get("texting_tone", []))
+            + "\nGrammar rules: " + " ".join(guide.get("grammar_rules", [])))
+
+
 def apps_mentioned(text: str, knowledge: list[dict]) -> list[dict]:
     lowered = text.lower()
     return [e for e in knowledge if re.search(rf"\b{re.escape(e['name'].lower())}\b", lowered)]
@@ -851,11 +864,15 @@ class DesktopAssistant:
         return f"Unknown tool {name}."
 
     def recall_apps(self, text: str) -> None:
+        base = self.messages[0]["content"].split("\nYour private notes")[0]
+        extra = ""
         mentioned = apps_mentioned(text, load_knowledge())
         if mentioned:
-            notes = "\n".join(f"- {describe_app(e)}" for e in mentioned[:4])
-            self.messages[0]["content"] = self.messages[0]["content"].split("\nYour private notes")[0] + (
-                "\nYour private notes about apps the user mentioned (from your research; prices may change):\n" + notes)
+            extra += "\nYour private notes about apps the user mentioned (from your research; prices may change):\n" + "\n".join(
+                f"- {describe_app(e)}" for e in mentioned[:4])
+        if any(word in text.lower() for word in WRITING_WORDS) and writing_guide():
+            extra += "\nYour private notes on writing well:\n" + writing_guide()
+        self.messages[0]["content"] = base + extra if extra else base
 
     def chat(self, text: str) -> str:
         self.recall_apps(text)
