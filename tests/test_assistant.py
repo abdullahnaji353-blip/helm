@@ -402,5 +402,25 @@ class ChatToolTests(unittest.TestCase):
         self.assertEqual(len(assistant.messages), 1)
 
 
+class NewDesktopActionTests(unittest.TestCase):
+    def test_open_and_hotkey_actions_are_validated(self):
+        size = (1440, 900)
+        self.assertEqual(
+            validate_desktop_action({"action": "open", "app": "Safari", "reason": "r"}, size)["app"], "Safari"
+        )
+        self.assertEqual(
+            validate_desktop_action({"action": "hotkey", "keys": ["Command", "L"], "reason": "r"}, size)["keys"],
+            ["command", "l"],
+        )
+        for bad in (
+            {"action": "open", "app": "Safari; rm -rf ~", "reason": "r"},
+            {"action": "hotkey", "keys": ["l"], "reason": "r"},
+            {"action": "hotkey", "keys": ["command", "f13"], "reason": "r"},
+            {"action": "hotkey", "keys": ["fn", "q"], "reason": "r"},
+        ):
+            with self.assertRaises(ValueError):
+                validate_desktop_action(bad, size)
+
+
 if __name__ == "__main__":
     unittest.main()

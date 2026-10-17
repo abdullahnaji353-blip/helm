@@ -13,6 +13,7 @@ import platform
 import re
 import subprocess
 import sys
+import time
 from html.parser import HTMLParser
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
@@ -88,8 +89,13 @@ Return exactly one JSON object per turn, with no markdown:
 {"action":"press","key":"enter","reason":"..."}
 {"action":"scroll","direction":"down","amount":3,"reason":"..."}
 {"action":"wait","seconds":1,"reason":"..."}
+{"action":"open","app":"Safari","reason":"..."}
+{"action":"hotkey","keys":["command","l"],"reason":"..."}
 {"action":"done","message":"..."}
 Use only those actions. Keep each step small and explain what it will do.
+To launch or switch to an app, always use "open" instead of clicking around.
+Use "hotkey" for shortcuts such as command+l (address bar) or command+t (new tab).
+Click coordinates are pixels in the screenshot you are given.
 Never submit payment, send a message, delete data, or disclose secrets without
 the user explicitly requesting that exact action. Never ask the user to type
 passwords or other secrets. If a task needs such an action, stop and explain."""
@@ -98,6 +104,7 @@ ALLOWED_KEYS = {
     "enter", "tab", "escape", "space", "backspace", "delete",
     "up", "down", "left", "right", "home", "end", "pageup", "pagedown",
 }
+HOTKEY_MODIFIERS = {"command", "shift", "option", "ctrl"}
 MAX_DESKTOP_STEPS = 20
 
 
@@ -198,6 +205,25 @@ def validate_desktop_action(action: object, screen_size: tuple[int, int]) -> dic
         ):
             raise ValueError("Scroll direction or amount is invalid.")
         clean.update(direction=direction, amount=amount)
+    elif kind == "open":
+        app = action.get("app")
+        if not isinstance(app, str) or not APP_NAME_PATTERN.fullmatch(app.strip()):
+            raise ValueError("That app name is not valid.")
+        clean["app"] = app.strip()
+    elif kind == "hotkey":
+        keys = action.get("keys")
+        if (
+            not isinstance(keys, list) or not 2 <= len(keys) <= 4
+            or not all(isinstance(key, str) for key in keys)
+        ):
+            raise ValueError("A hotkey needs 2 to 4 keys.")
+        keys = [key.lower() for key in keys]
+        *modifiers, final = keys
+        if not modifiers or not set(modifiers) <= HOTKEY_MODIFIERS or not (
+            final in ALLOWED_KEYS or (len(final) == 1 and final.isalnum())
+        ):
+            raise ValueError("Hotkeys must be modifiers plus one letter, digit or safe key.")
+        clean["keys"] = keys
     elif kind == "wait":
         seconds = action.get("seconds")
         if (
@@ -588,11 +614,18 @@ class DesktopAssistant:
                     "Could not capture the screen. Grant Screen Recording "
                     "permission to the app running this script in System Settings."
                 ) from error
+            screen_size = pyautogui.size()
+            if screenshot.size != tuple(screen_size):
+                # Retina captures are 2x; clicks use points, so match them.
+                screenshot = screenshot.resize(tuple(screen_size))
             buffer = io.BytesIO()
             screenshot.save(buffer, format="PNG")
             screen_message = {
                 "role": "user",
-                "content": "Here is the current screen. Choose one safe next step.",
+                "content": (
+                    f"Here is the current screen ({screen_size[0]}x{screen_size[1]}). "
+                    "Choose one safe next step."
+                ),
                 "images": [base64.b64encode(buffer.getvalue()).decode("ascii")],
             }
             messages.append(screen_message)
@@ -614,6 +647,10 @@ class DesktopAssistant:
                 summary = f"type {action['text']!r}"
             elif action["action"] == "press":
                 summary = f"press {action['key']}"
+            elif action["action"] == "open":
+                summary = f"open {action['app']}"
+            elif action["action"] == "hotkey":
+                summary = "press " + "+".join(action["keys"])
             elif action["action"] == "scroll":
                 summary = f"scroll {action['direction']} {action['amount']} steps"
             else:
@@ -621,7 +658,6 @@ class DesktopAssistant:
             print(f"\nStep {step}: {reason}\nProposed: {summary}", flush=True)
 
             if action["action"] == "wait":
-                import time
                 time.sleep(action["seconds"])
                 result = "Wait completed."
             else:
@@ -649,11 +685,23 @@ class DesktopAssistant:
                         pyautogui.write(action["text"], interval=0.02)
                     elif action["action"] == "press":
                         pyautogui.press(action["key"])
+                    elif action["action"] == "open":
+                        subprocess.run(["open", "-a", action["app"]], check=True, capture_output=True)
+                        time.sleep(1.5)
+                    elif action["action"] == "hotkey":
+                        pyautogui.hotkey(*action["keys"])
                     else:
                         distance = action["amount"]
                         pyautogui.scroll(
                             distance if action["direction"] == "up" else -distance
                         )
+                except subprocess.CalledProcessError:
+                    result = "That app could not be opened; it may not be installed."
+                    messages.extend([
+                        {"role": "assistant", "content": raw_action},
+                        {"role": "user", "content": result},
+                    ])
+                    continue
                 except pyautogui.FailSafeException:
                     print("Emergency stop: mouse moved to a screen corner.")
                     return "Emergency stop: the user moved the mouse to a screen corner."

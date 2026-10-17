@@ -253,6 +253,13 @@ struct MacMenuAssistantApp: App {
     }
 
     var body: some Scene {
+        Window("Chatbot", id: "hud") {
+            HUDView()
+                .environmentObject(controller)
+                .environmentObject(chat)
+                .onAppear { NSApp.activate(ignoringOtherApps: true) }
+        }
+        .defaultSize(width: 1100, height: 700)
         MenuBarExtra("Chatbot", systemImage: chat.isListening ? "waveform" : "circle.hexagongrid.fill") {
             ChatRootView()
                 .environmentObject(controller)

@@ -22,8 +22,12 @@ final class ChatController: ObservableObject {
     @Published var isListening = false
     @Published var voiceStatus = "Hold ⌃⌥ to talk"
     @Published var pendingApproval: String?
-    @Published var askBeforeActing = true
-    @Published var speakReplies = true
+    @Published var askBeforeActing = UserDefaults.standard.object(forKey: "askBeforeActing") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(askBeforeActing, forKey: "askBeforeActing") }
+    }
+    @Published var speakReplies = UserDefaults.standard.object(forKey: "speakReplies") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(speakReplies, forKey: "speakReplies") }
+    }
 
     private var process: Process?
     private var inputPipe: Pipe?
@@ -227,6 +231,7 @@ struct ChatRootView: View {
 
 struct ChatPanel: View {
     @EnvironmentObject private var chat: ChatController
+    @Environment(\.openWindow) private var openWindow
     @Binding var showAdvanced: Bool
 
     private let suggestions = [
@@ -281,6 +286,10 @@ struct ChatPanel: View {
                 Toggle("Speak replies", isOn: $chat.speakReplies)
                 Divider()
                 Button("New chat") { chat.newChat() }
+                Button("Open full HUD") {
+                    openWindow(id: "hud")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
                 Button("Permissions & MCP tools…") { showAdvanced = true }
                 Divider()
                 Button("Quit Chatbot") { NSApplication.shared.terminate(nil) }
@@ -507,5 +516,358 @@ private struct TypingDots: View {
         .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 15))
         .onAppear { phase = true }
         .accessibilityLabel("Chatbot is thinking")
+    }
+}
+
+// MARK: - Full-screen HUD
+
+/// Big Jarvis-style window: reactor and status on the left, conversation on the right.
+struct HUDView: View {
+    @EnvironmentObject private var chat: ChatController
+    @State private var showAdvanced = false
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.01, green: 0.02, blue: 0.05).ignoresSafeArea()
+            RadialGradient(
+                colors: [jarvisCyan.opacity(0.10), .clear],
+                center: .init(x: 0.25, y: 0.45),
+                startRadius: 10,
+                endRadius: 520
+            )
+            .ignoresSafeArea()
+            GridBackdrop().opacity(0.35).ignoresSafeArea()
+            if showAdvanced {
+                ChatRootViewAdvanced(showAdvanced: $showAdvanced)
+            } else {
+                HStack(spacing: 0) {
+                    reactorColumn
+                        .frame(width: 340)
+                    Rectangle().fill(jarvisCyan.opacity(0.15)).frame(width: 1)
+                    conversationColumn
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .frame(minWidth: 820, minHeight: 560)
+        .onAppear { chat.configureVoice() }
+    }
+
+    private var stateText: String {
+        if chat.isListening { return "LISTENING" }
+        if chat.pendingApproval != nil { return "AWAITING AUTHORISATION" }
+        if chat.isThinking { return "PROCESSING" }
+        return "STANDING BY"
+    }
+
+    private var reactorColumn: some View {
+        VStack(spacing: 22) {
+            HStack {
+                Text("C · H · A · T · B · O · T")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .foregroundStyle(jarvisCyan)
+                Spacer()
+            }
+            Spacer()
+            Button { chat.toggleVoice() } label: {
+                Reactor(active: chat.isThinking || chat.isListening, listening: chat.isListening)
+                    .frame(width: 230, height: 230)
+            }
+            .buttonStyle(.plain)
+            .help("Click to talk, or hold Control+Option")
+            .accessibilityLabel(chat.isListening ? "Stop listening" : "Start voice input")
+            Text(stateText)
+                .font(.system(size: 13, weight: .semibold, design: .monospaced))
+                .tracking(4)
+                .foregroundStyle(chat.isListening ? .red : jarvisCyan)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                VStack(spacing: 4) {
+                    Text(context.date, format: .dateTime.hour().minute().second())
+                        .font(.system(size: 28, weight: .light, design: .monospaced))
+                    Text(context.date, format: .dateTime.weekday(.wide).day().month(.wide))
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            VStack(alignment: .leading, spacing: 6) {
+                telemetry("MODEL", "gemma4 · local")
+                telemetry("SCREEN CONTROL", chat.askBeforeActing ? "ASK FIRST" : "FULL AUTONOMY")
+                telemetry("VOICE", chat.speakReplies ? "ON" : "MUTED")
+            }
+        }
+        .padding(26)
+    }
+
+    private func telemetry(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(label).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).foregroundStyle(jarvisCyan)
+        }
+        .font(.system(size: 10, design: .monospaced))
+    }
+
+    private var conversationColumn: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("COMMS LOG")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .tracking(3)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Toggle("Full autonomy", isOn: Binding(
+                    get: { !chat.askBeforeActing },
+                    set: { chat.askBeforeActing = !$0 }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .font(.system(size: 11, design: .monospaced))
+                .help("When on, Chatbot clicks and types without asking first.")
+                Menu {
+                    Toggle("Speak replies", isOn: $chat.speakReplies)
+                    Button("New chat") { chat.newChat() }
+                    Button("Permissions & MCP tools…") { showAdvanced = true }
+                    Divider()
+                    Button("Quit Chatbot") { NSApplication.shared.terminate(nil) }
+                } label: {
+                    Image(systemName: "slider.horizontal.3").foregroundStyle(.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .padding(.leading, 12)
+                .accessibilityLabel("Settings")
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 16) {
+                        if chat.lines.isEmpty { hudWelcome }
+                        ForEach(chat.lines) { line in
+                            hudLine(line).id(line.id)
+                        }
+                        if chat.isThinking && chat.pendingApproval == nil {
+                            TypingDots().id("typing")
+                        }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.vertical, 8)
+                }
+                .onChange(of: chat.lines) { _ in
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        proxy.scrollTo(chat.isThinking ? AnyHashable("typing") : AnyHashable(chat.lines.last?.id), anchor: .bottom)
+                    }
+                }
+            }
+            if let action = chat.pendingApproval {
+                HUDApproval(action: action)
+            }
+            HUDInput()
+        }
+    }
+
+    private var hudWelcome: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Good to see you.")
+                .font(.system(size: 26, weight: .light))
+            Text("Say or type a command. I can open apps and websites, set the volume, check your battery and the time, and drive the screen with the mouse and keyboard.")
+                .font(.system(size: 13))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                ForEach(["What's my battery and the time?", "Open Spotify", "Set the volume to 30", "Open Safari and go to youtube.com"], id: \.self) { suggestion in
+                    Button {
+                        chat.draft = suggestion
+                        chat.send()
+                    } label: {
+                        Text(suggestion)
+                            .font(.system(size: 12, design: .monospaced))
+                            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                            .padding(.horizontal, 12)
+                            .background(jarvisCyan.opacity(0.06))
+                            .overlay(HUDBrackets())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.top, 8)
+        }
+        .padding(.top, 30)
+    }
+
+    @ViewBuilder
+    private func hudLine(_ line: ChatLine) -> some View {
+        switch line.role {
+        case .user:
+            VStack(alignment: .leading, spacing: 4) {
+                Text("YOU ›").font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(.secondary)
+                Text(line.text).font(.system(size: 14)).textSelection(.enabled)
+            }
+        case .bot:
+            VStack(alignment: .leading, spacing: 4) {
+                Text("CHATBOT ›").font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(jarvisCyan)
+                Text(line.text).font(.system(size: 15)).textSelection(.enabled)
+            }
+            .padding(.leading, 10)
+            .overlay(alignment: .leading) { Rectangle().fill(jarvisCyan).frame(width: 2) }
+        case .activity:
+            Text(line.text)
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundStyle(jarvisCyan.opacity(0.7))
+                .textSelection(.enabled)
+        case .error:
+            Label(line.text, systemImage: "exclamationmark.triangle.fill")
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(.orange)
+                .textSelection(.enabled)
+        }
+    }
+}
+
+/// Permissions/MCP inside the HUD window.
+private struct ChatRootViewAdvanced: View {
+    @Binding var showAdvanced: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button { showAdvanced = false } label: {
+                Label("Back", systemImage: "chevron.left")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(jarvisCyan)
+            .padding(20)
+            AssistantPanel().frame(maxWidth: 520)
+        }
+    }
+}
+
+private struct HUDApproval: View {
+    @EnvironmentObject private var chat: ChatController
+    let action: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "hand.raised.fill").foregroundStyle(.orange)
+            Text("Authorise: \(action)?")
+                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            Spacer()
+            Button("Stop") { chat.reject() }
+            Button("Allow all") { chat.approve(all: true) }
+            Button("Allow") { chat.approve() }
+                .buttonStyle(.borderedProminent)
+                .tint(jarvisCyan)
+                .keyboardShortcut(.return, modifiers: [.command])
+        }
+        .controlSize(.small)
+        .padding(12)
+        .background(Color.orange.opacity(0.10))
+        .overlay(HUDBrackets(color: .orange))
+        .padding(.horizontal, 24)
+        .padding(.bottom, 8)
+    }
+}
+
+private struct HUDInput: View {
+    @EnvironmentObject private var chat: ChatController
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("›").font(.system(size: 16, weight: .bold, design: .monospaced)).foregroundStyle(jarvisCyan)
+            TextField("Enter a command…", text: $chat.draft, axis: .vertical)
+                .textFieldStyle(.plain)
+                .font(.system(size: 14, design: .monospaced))
+                .lineLimit(1...4)
+                .onSubmit { chat.send() }
+                .disabled(chat.isThinking)
+            if chat.isThinking {
+                Button("ABORT") { chat.stop() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.red)
+            } else {
+                Button("SEND") { chat.send() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(jarvisCyan)
+                    .disabled(chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 13)
+        .background(jarvisCyan.opacity(0.05))
+        .overlay(HUDBrackets())
+        .padding(24)
+    }
+}
+
+/// Corner brackets that give panels the HUD frame look.
+private struct HUDBrackets: View {
+    var color: Color = jarvisCyan
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width, h = geo.size.height, l: CGFloat = 10
+            Path { p in
+                p.move(to: .init(x: 0, y: l)); p.addLine(to: .zero); p.addLine(to: .init(x: l, y: 0))
+                p.move(to: .init(x: w - l, y: 0)); p.addLine(to: .init(x: w, y: 0)); p.addLine(to: .init(x: w, y: l))
+                p.move(to: .init(x: w, y: h - l)); p.addLine(to: .init(x: w, y: h)); p.addLine(to: .init(x: w - l, y: h))
+                p.move(to: .init(x: l, y: h)); p.addLine(to: .init(x: 0, y: h)); p.addLine(to: .init(x: 0, y: h - l))
+            }
+            .stroke(color.opacity(0.8), lineWidth: 1.5)
+            Rectangle().strokeBorder(color.opacity(0.15), lineWidth: 1)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct GridBackdrop: View {
+    var body: some View {
+        Canvas { context, size in
+            var path = Path()
+            stride(from: 0, through: size.width, by: 32).forEach { x in
+                path.move(to: .init(x: x, y: 0)); path.addLine(to: .init(x: x, y: size.height))
+            }
+            stride(from: 0, through: size.height, by: 32).forEach { y in
+                path.move(to: .init(x: 0, y: y)); path.addLine(to: .init(x: size.width, y: y))
+            }
+            context.stroke(path, with: .color(jarvisCyan.opacity(0.06)), lineWidth: 0.5)
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+/// Arc-reactor: counter-rotating segmented rings around a glowing core.
+private struct Reactor: View {
+    let active: Bool
+    let listening: Bool
+
+    var body: some View {
+        TimelineView(.animation) { context in
+            let t = context.date.timeIntervalSinceReferenceDate
+            let speed = active ? 2.5 : 0.6
+            let tint = listening ? Color.red : jarvisCyan
+            ZStack {
+                Circle().fill(tint.opacity(0.18)).blur(radius: 40)
+                ring(dash: [2, 6], width: 10, inset: 0, angle: t * 12 * speed, color: tint.opacity(0.5))
+                ring(dash: [60, 18], width: 3, inset: 22, angle: -t * 30 * speed, color: tint)
+                ring(dash: [8, 4], width: 6, inset: 40, angle: t * 45 * speed, color: tint.opacity(0.7))
+                ring(dash: [120, 30, 20, 30], width: 2, inset: 62, angle: -t * 20 * speed, color: tint.opacity(0.9))
+                Circle()
+                    .fill(RadialGradient(colors: [.white, tint, tint.opacity(0.2)], center: .center, startRadius: 2, endRadius: 46))
+                    .padding(78)
+                    .scaleEffect(1 + 0.05 * sin(t * (active ? 6 : 2)))
+                    .shadow(color: tint, radius: 24)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+
+    private func ring(dash: [CGFloat], width: CGFloat, inset: CGFloat, angle: Double, color: Color) -> some View {
+        Circle()
+            .stroke(color, style: StrokeStyle(lineWidth: width, dash: dash))
+            .padding(inset + width / 2)
+            .rotationEffect(.degrees(angle))
     }
 }
