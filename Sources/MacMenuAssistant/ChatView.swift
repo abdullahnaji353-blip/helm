@@ -109,6 +109,8 @@ final class ChatController: NSObject, ObservableObject {
     @Published var draft = ""
     @Published var isThinking = false
     @Published var isListening = false
+    @Published var dictating = false
+    private var dictationBase = ""
     @Published var voiceStatus = "Hold ⌃⌥ to talk"
     @Published var pendingApproval: String?
     @Published var askBeforeActing = UserDefaults.standard.object(forKey: "askBeforeActing") as? Bool ?? true {
@@ -278,6 +280,11 @@ final class ChatController: NSObject, ObservableObject {
         appShortcuts = [UInt32(kVK_ISO_Section), UInt32(kVK_ANSI_Grave)].enumerated().map { index, key in
             GlobalHotKey(keyCode: key, modifiers: modifiers, id: UInt32(index + 1)) { [weak self] in self?.showHUD() }
         }
+        // Control+Shift+D: start/stop dictation into Helm's command box.
+        appShortcuts.append(GlobalHotKey(keyCode: UInt32(kVK_ANSI_D), modifiers: modifiers, id: 3) { [weak self] in
+            self?.showHUD()
+            self?.toggleDictation()
+        })
     }
 
     func showHUD() {
@@ -366,17 +373,37 @@ final class ChatController: NSObject, ObservableObject {
             self?.lines.append(ChatLine(role: .error, text: message))
         }
         voice.onPartialTranscript = { [weak self] transcript in
-            self?.draft = transcript
+            guard let self else { return }
+            self.draft = self.dictating
+                ? [self.dictationBase, transcript].filter { !$0.isEmpty }.joined(separator: " ")
+                : transcript
         }
         voice.onTranscript = { [weak self] transcript, _ in
-            self?.draft = transcript
-            self?.send()
+            guard let self else { return }
+            if self.dictating {
+                // Dictation fills the command box so you can edit before sending.
+                self.draft = [self.dictationBase, transcript].filter { !$0.isEmpty }.joined(separator: " ")
+                self.dictating = false
+            } else {
+                self.draft = transcript
+                self.send()
+            }
         }
         if voiceHotkey { voice.installHotkey() }
     }
 
     func toggleVoice() {
         configureVoice()
+        voice.toggleCapture()
+    }
+
+    /// Talk, and the words appear in the command box (not sent) — Control+Shift+D or the mic button.
+    func toggleDictation() {
+        configureVoice()
+        if !isListening {
+            dictating = true
+            dictationBase = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         voice.toggleCapture()
     }
 
@@ -1237,6 +1264,16 @@ private struct HUDInput: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            Button { chat.toggleDictation() } label: {
+                Image(systemName: chat.isListening && chat.dictating ? "waveform" : "mic.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(chat.isListening && chat.dictating ? .white : jarvisCyan)
+                    .frame(width: 28, height: 28)
+                    .background(chat.isListening && chat.dictating ? Color.red : jarvisCyan.opacity(0.12), in: Circle())
+            }
+            .buttonStyle(.plain)
+            .help("Dictate into the box (Control+Shift+D)")
+            .accessibilityLabel(chat.isListening && chat.dictating ? "Stop dictation" : "Dictate")
             Text("›").font(.system(size: 16, weight: .bold, design: .monospaced)).foregroundStyle(jarvisCyan)
             TextField("Enter a command…", text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
