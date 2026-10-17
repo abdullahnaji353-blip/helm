@@ -147,6 +147,27 @@ Chat prompts and desktop screenshots go only to Ollama on this Mac
 (`localhost`). No API key is required. Desktop-control Python packages are
 installed into the project virtual environment.
 
+## AI providers and API keys
+
+Chatbot runs on local Ollama by default. To use a cloud model instead, open
+**AI model & API keys…** in the settings menu (or the first-launch setup) and
+pick Claude, ChatGPT, Gemini or OpenRouter, then paste your key. Keys are
+stored in the macOS Keychain (service "Chatbot API Keys"), never in this
+folder, and are handed to the Python backend only through the
+`CHATBOT_API_KEY` environment variable of each request.
+
+From Terminal you can use the usual variables instead:
+
+```sh
+ANTHROPIC_API_KEY=... python assistant.py --chat "hello" --provider anthropic
+OPENAI_API_KEY=... python assistant.py --chat "hello" --provider openai --model gpt-5-mini
+```
+
+`--cloud-vision` sends screen-control screenshots to the chosen cloud model
+(much more accurate than the small local model). `--no-web` turns off the
+web search tool, which queries DuckDuckGo (optionally limited to YouTube or
+TikTok) and returns links.
+
 ## Commands
 
 - Type a message to chat with the local model. Replies are spoken by default.

@@ -1,9 +1,62 @@
 import AVFoundation
 import AppKit
+import ApplicationServices
+import Security
 import SwiftUI
 
 private let jarvisCyan = Color(red: 0.30, green: 0.85, blue: 1.0)
 private let jarvisBlue = Color(red: 0.16, green: 0.42, blue: 1.0)
+
+/// Mirrors PROVIDERS in providers.py.
+struct ProviderOption: Identifiable {
+    let id: String
+    let label: String
+    let symbol: String
+    let defaultModel: String
+    let keyURL: String?
+
+    static let all = [
+        ProviderOption(id: "ollama", label: "Local (Ollama)", symbol: "lock.laptopcomputer", defaultModel: "gemma4:e2b", keyURL: nil),
+        ProviderOption(id: "anthropic", label: "Claude", symbol: "sparkle", defaultModel: "claude-opus-5-5", keyURL: "https://console.anthropic.com/settings/keys"),
+        ProviderOption(id: "openai", label: "ChatGPT", symbol: "bubble.left.and.text.bubble.right", defaultModel: "gpt-5-mini", keyURL: "https://platform.openai.com/api-keys"),
+        ProviderOption(id: "gemini", label: "Gemini", symbol: "diamond", defaultModel: "gemini-2.5-flash", keyURL: "https://aistudio.google.com/apikey"),
+        ProviderOption(id: "openrouter", label: "OpenRouter", symbol: "arrow.triangle.branch", defaultModel: "openai/gpt-5-mini", keyURL: "https://openrouter.ai/keys"),
+    ]
+
+    static func find(_ id: String) -> ProviderOption { all.first { $0.id == id } ?? all[0] }
+}
+
+/// API keys live in the login Keychain, never in files; the backend gets one via env.
+enum KeyStore {
+    private static let service = "Chatbot API Keys"
+
+    private static func query(_ provider: String) -> [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: provider]
+    }
+
+    static func save(_ key: String, for provider: String) -> Bool {
+        delete(provider)
+        var item = query(provider)
+        item[kSecValueData as String] = Data(key.utf8)
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+
+    static func read(_ provider: String) -> String? {
+        var request = query(provider)
+        request[kSecReturnData as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess,
+              let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func delete(_ provider: String) {
+        SecItemDelete(query(provider) as CFDictionary)
+    }
+}
 
 struct ChatLine: Identifiable, Equatable {
     enum Role { case user, bot, activity, error }
@@ -27,6 +80,48 @@ final class ChatController: ObservableObject {
     }
     @Published var speakReplies = UserDefaults.standard.object(forKey: "speakReplies") as? Bool ?? true {
         didSet { UserDefaults.standard.set(speakReplies, forKey: "speakReplies") }
+    }
+    @Published var provider = UserDefaults.standard.string(forKey: "provider") ?? "ollama" {
+        didSet { UserDefaults.standard.set(provider, forKey: "provider") }
+    }
+    @Published var webAccess = UserDefaults.standard.object(forKey: "webAccess") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(webAccess, forKey: "webAccess") }
+    }
+    @Published var cloudVision = UserDefaults.standard.bool(forKey: "cloudVision") {
+        didSet { UserDefaults.standard.set(cloudVision, forKey: "cloudVision") }
+    }
+    @Published var onboarded = UserDefaults.standard.bool(forKey: "onboarded") {
+        didSet { UserDefaults.standard.set(onboarded, forKey: "onboarded") }
+    }
+    @Published var showProviderSettings = false
+    @Published var savedKeys = Set(ProviderOption.all.compactMap { KeyStore.read($0.id) == nil ? nil : $0.id })
+
+    /// Model per provider; empty means the provider's default.
+    func model(for provider: String) -> String {
+        UserDefaults.standard.string(forKey: "model.\(provider)") ?? ""
+    }
+
+    func setModel(_ model: String, for provider: String) {
+        UserDefaults.standard.set(model.trimmingCharacters(in: .whitespaces), forKey: "model.\(provider)")
+        objectWillChange.send()
+    }
+
+    func saveKey(_ key: String, for provider: String) -> Bool {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, KeyStore.save(trimmed, for: provider) else { return false }
+        savedKeys.insert(provider)
+        return true
+    }
+
+    func removeKey(for provider: String) {
+        KeyStore.delete(provider)
+        savedKeys.remove(provider)
+    }
+
+    var brainLabel: String {
+        let option = ProviderOption.find(provider)
+        let chosen = model(for: provider)
+        return "\(option.label) · \(chosen.isEmpty ? option.defaultModel : chosen)"
     }
 
     private var process: Process?
@@ -78,7 +173,11 @@ final class ChatController: ObservableObject {
         guard !text.isEmpty, process == nil else { return }
         draft = ""
         lines.append(ChatLine(role: .user, text: text))
-        launch(["--chat", text, "--autonomy", askBeforeActing ? "approval" : "autonomous"])
+        var arguments = ["--chat", text, "--autonomy", askBeforeActing ? "approval" : "autonomous", "--provider", provider]
+        if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
+        if !webAccess { arguments.append("--no-web") }
+        if cloudVision { arguments.append("--cloud-vision") }
+        launch(arguments)
     }
 
     func newChat() {
@@ -118,6 +217,11 @@ final class ChatController: ObservableObject {
         child.standardOutput = output
         child.standardError = output
         child.standardInput = input
+        var environment = ProcessInfo.processInfo.environment
+        if provider != "ollama", let key = KeyStore.read(provider) {
+            environment["CHATBOT_API_KEY"] = key
+        }
+        child.environment = environment
         child.terminationHandler = { [weak self] finished in
             DispatchQueue.main.async { self?.finish(status: finished.terminationStatus) }
         }
@@ -171,6 +275,8 @@ final class ChatController: ObservableObject {
         "set_volume": "Adjusting volume",
         "system_status": "Checking system status",
         "control_screen": "Taking control of the screen",
+        "web_search": "Searching the web",
+        "media_control": "Controlling music",
     ]
 
     private func addActivity(_ text: String) {
@@ -286,6 +392,11 @@ struct ChatPanel: View {
                 Toggle("Speak replies", isOn: $chat.speakReplies)
                 Divider()
                 Button("New chat") { chat.newChat() }
+                Button("AI model & API keys…") {
+                    chat.showProviderSettings = true
+                    openWindow(id: "hud")
+                    NSApp.activate(ignoringOtherApps: true)
+                }
                 Button("Open full HUD") {
                     openWindow(id: "hud")
                     NSApp.activate(ignoringOtherApps: true)
@@ -537,7 +648,9 @@ struct HUDView: View {
             )
             .ignoresSafeArea()
             GridBackdrop().opacity(0.35).ignoresSafeArea()
-            if showAdvanced {
+            if !chat.onboarded {
+                OnboardingView()
+            } else if showAdvanced {
                 ChatRootViewAdvanced(showAdvanced: $showAdvanced)
             } else {
                 HStack(spacing: 0) {
@@ -550,6 +663,19 @@ struct HUDView: View {
         }
         .preferredColorScheme(.dark)
         .frame(minWidth: 820, minHeight: 560)
+        .sheet(isPresented: $chat.showProviderSettings) {
+            VStack(alignment: .leading, spacing: 16) {
+                ProviderSettingsView()
+                HStack {
+                    Spacer()
+                    Button("Done") { chat.showProviderSettings = false }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(24)
+            .frame(width: 520)
+            .preferredColorScheme(.dark)
+        }
         .onAppear { chat.configureVoice() }
     }
 
@@ -591,7 +717,8 @@ struct HUDView: View {
             }
             Spacer()
             VStack(alignment: .leading, spacing: 6) {
-                telemetry("MODEL", "gemma4 · local")
+                telemetry("BRAIN", chat.brainLabel)
+                telemetry("WEB ACCESS", chat.webAccess ? "ON" : "OFF")
                 telemetry("SCREEN CONTROL", chat.askBeforeActing ? "ASK FIRST" : "FULL AUTONOMY")
                 telemetry("VOICE", chat.speakReplies ? "ON" : "MUTED")
             }
@@ -625,6 +752,7 @@ struct HUDView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .help("When on, Chatbot clicks and types without asking first.")
                 Menu {
+                    Button("AI model & API keys…") { chat.showProviderSettings = true }
                     Toggle("Speak replies", isOn: $chat.speakReplies)
                     Button("New chat") { chat.newChat() }
                     Button("Permissions & MCP tools…") { showAdvanced = true }
@@ -668,16 +796,24 @@ struct HUDView: View {
         }
     }
 
+    private var greeting: String {
+        switch Calendar.current.component(.hour, from: Date()) {
+        case 5..<12: return "Good morning."
+        case 12..<18: return "Good afternoon."
+        default: return "Good evening."
+        }
+    }
+
     private var hudWelcome: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Good to see you.")
+            Text(greeting)
                 .font(.system(size: 26, weight: .light))
-            Text("Say or type a command. I can open apps and websites, set the volume, check your battery and the time, and drive the screen with the mouse and keyboard.")
+            Text("Say or type a command. I can open apps and websites, search the web, YouTube and TikTok, control your music and volume, and drive the screen with the mouse and keyboard.")
                 .font(.system(size: 13))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                ForEach(["What's my battery and the time?", "Open Spotify", "Set the volume to 30", "Open Safari and go to youtube.com"], id: \.self) { suggestion in
+                ForEach(["What's my battery and the time?", "Find TikTok videos about latte art", "Play some music", "Search YouTube for SwiftUI tutorials"], id: \.self) { suggestion in
                     Button {
                         chat.draft = suggestion
                         chat.send()
@@ -869,5 +1005,234 @@ private struct Reactor: View {
             .stroke(color, style: StrokeStyle(lineWidth: width, dash: dash))
             .padding(inset + width / 2)
             .rotationEffect(.degrees(angle))
+    }
+}
+
+// MARK: - AI provider settings
+
+struct ProviderSettingsView: View {
+    @EnvironmentObject private var chat: ChatController
+    @State private var keyDraft = ""
+    @State private var keyStatus: String?
+
+    var body: some View {
+        let option = ProviderOption.find(chat.provider)
+        VStack(alignment: .leading, spacing: 14) {
+            Text("CHOOSE CHATBOT'S BRAIN")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                ForEach(ProviderOption.all) { item in
+                    Button {
+                        chat.provider = item.id
+                        keyDraft = ""
+                        keyStatus = nil
+                    } label: {
+                        VStack(spacing: 6) {
+                            Image(systemName: item.symbol).font(.system(size: 18))
+                            Text(item.label).font(.system(size: 11, weight: .medium))
+                            if item.id != "ollama" {
+                                Text(chat.savedKeys.contains(item.id) ? "key saved" : "needs key")
+                                    .font(.system(size: 9, design: .monospaced))
+                                    .foregroundStyle(chat.savedKeys.contains(item.id) ? .green : .secondary)
+                            } else {
+                                Text("free · private").font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 74)
+                        .background(chat.provider == item.id ? jarvisCyan.opacity(0.14) : Color.white.opacity(0.04))
+                        .overlay(HUDBrackets(color: chat.provider == item.id ? jarvisCyan : .gray.opacity(0.5)))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityAddTraits(chat.provider == item.id ? .isSelected : [])
+                }
+            }
+
+            HStack {
+                Text("Model").font(.system(size: 12)).frame(width: 60, alignment: .leading)
+                TextField(option.defaultModel, text: Binding(
+                    get: { chat.model(for: option.id) },
+                    set: { chat.setModel($0, for: option.id) }
+                ))
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 12, design: .monospaced))
+            }
+
+            if let keyURL = option.keyURL, let url = URL(string: keyURL) {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("API key").font(.system(size: 12)).frame(width: 60, alignment: .leading)
+                        SecureField(chat.savedKeys.contains(option.id) ? "•••••••• (saved — paste to replace)" : "Paste your \(option.label) key", text: $keyDraft)
+                            .textFieldStyle(.roundedBorder)
+                            .onSubmit { save(option) }
+                        Button("Save") { save(option) }
+                            .disabled(keyDraft.trimmingCharacters(in: .whitespaces).isEmpty)
+                    }
+                    HStack {
+                        Link("Get a \(option.label) key ↗", destination: url).font(.system(size: 11))
+                        Spacer()
+                        if let keyStatus {
+                            Text(keyStatus).font(.system(size: 11)).foregroundStyle(.green)
+                        }
+                        if chat.savedKeys.contains(option.id) {
+                            Button("Remove key", role: .destructive) {
+                                chat.removeKey(for: option.id)
+                                keyStatus = nil
+                            }
+                            .font(.system(size: 11))
+                        }
+                    }
+                    Text("Stored in your Mac's Keychain. Chats go to \(option.label) when this brain is selected.")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Text("Runs entirely on this Mac with Ollama. Nothing leaves your computer.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+            Toggle("Web access (search the web, YouTube and TikTok via DuckDuckGo)", isOn: $chat.webAccess)
+                .font(.system(size: 12))
+            Toggle("Use this brain for screen control (sends screenshots to it)", isOn: $chat.cloudVision)
+                .font(.system(size: 12))
+                .disabled(chat.provider == "ollama")
+                .help("Cloud models are far better at clicking the right spot than the local model.")
+        }
+    }
+
+    private func save(_ option: ProviderOption) {
+        if chat.saveKey(keyDraft, for: option.id) {
+            keyDraft = ""
+            keyStatus = "Saved to Keychain ✓"
+        } else {
+            keyStatus = nil
+        }
+    }
+}
+
+// MARK: - First launch
+
+/// Shown once: what Chatbot is, which brain to use, and the macOS permissions it needs.
+struct OnboardingView: View {
+    @EnvironmentObject private var chat: ChatController
+    @State private var step = 0
+    @State private var micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+    @State private var screenGranted = CGPreflightScreenCaptureAccess()
+    @State private var axGranted = AXIsProcessTrusted()
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                ForEach(0..<3) { index in
+                    Capsule()
+                        .fill(index <= step ? jarvisCyan : Color.white.opacity(0.15))
+                        .frame(width: index == step ? 28 : 10, height: 4)
+                }
+            }
+            .padding(.top, 24)
+            .animation(.easeInOut, value: step)
+
+            Group {
+                switch step {
+                case 0: welcome
+                case 1: ProviderSettingsView().frame(maxWidth: 560)
+                default: permissions
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .padding(.horizontal, 40)
+
+            HStack {
+                if step > 0 {
+                    Button("Back") { step -= 1 }
+                }
+                Spacer()
+                Button(step == 2 ? "Launch Chatbot" : "Continue") {
+                    if step == 2 { chat.onboarded = true } else { step += 1 }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(jarvisCyan)
+                .keyboardShortcut(.defaultAction)
+            }
+            .padding(28)
+        }
+    }
+
+    private var welcome: some View {
+        VStack(spacing: 18) {
+            Reactor(active: false, listening: false).frame(width: 170, height: 170)
+            Text("Meet Chatbot")
+                .font(.system(size: 34, weight: .light))
+            Text("Your Jarvis-style assistant for this Mac.")
+                .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 10) {
+                feature("waveform", "Talk to it — hold Control+Option or click the reactor")
+                feature("cursorarrow.click.2", "Opens apps and websites, and drives the mouse and keyboard")
+                feature("magnifyingglass", "Searches the web, YouTube and TikTok for examples")
+                feature("music.note", "Controls your music, volume, and tells you the time and battery")
+                feature("key", "Runs free on your Mac, or plug in Claude, ChatGPT, Gemini or OpenRouter")
+            }
+            .padding(.top, 8)
+        }
+    }
+
+    private func feature(_ symbol: String, _ text: String) -> some View {
+        Label {
+            Text(text).font(.system(size: 13))
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(jarvisCyan).frame(width: 22)
+        }
+    }
+
+    private var permissions: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Give Chatbot its powers")
+                .font(.system(size: 26, weight: .light))
+            Text("macOS asks you to approve each one. You can change them later in System Settings → Privacy & Security.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            permissionRow("mic.fill", "Microphone", "So you can talk to it", micGranted) {
+                AVCaptureDevice.requestAccess(for: .audio) { granted in
+                    DispatchQueue.main.async { micGranted = granted }
+                }
+            }
+            permissionRow("rectangle.dashed.badge.record", "Screen Recording", "So it can see the screen it controls", screenGranted) {
+                screenGranted = CGRequestScreenCaptureAccess()
+            }
+            permissionRow("hand.point.up.left.fill", "Accessibility", "So it can click and type for you", axGranted) {
+                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                axGranted = AXIsProcessTrustedWithOptions(options)
+            }
+            Button("Refresh status") {
+                micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+                screenGranted = CGPreflightScreenCaptureAccess()
+                axGranted = AXIsProcessTrusted()
+            }
+            .font(.system(size: 11))
+        }
+        .frame(maxWidth: 560)
+    }
+
+    private func permissionRow(_ symbol: String, _ title: String, _ detail: String, _ granted: Bool, request: @escaping () -> Void) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: symbol).font(.system(size: 18)).foregroundStyle(jarvisCyan).frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if granted {
+                Label("Allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.system(size: 12))
+            } else {
+                Button("Allow", action: request)
+            }
+        }
+        .padding(12)
+        .background(Color.white.opacity(0.04))
+        .overlay(HUDBrackets(color: granted ? .green : jarvisCyan))
     }
 }

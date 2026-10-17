@@ -19,6 +19,7 @@ from assistant import (
     validate_url,
 )
 from mcp_client import MCPConnector, MCPError
+from providers import openai_turn, parse_json_object, to_anthropic_messages, to_openai_messages
 
 
 class ValidateOllamaHostTests(unittest.TestCase):
@@ -379,13 +380,15 @@ class ChatToolTests(unittest.TestCase):
                 {"function": {"name": "set_volume", "arguments": {"level": 20}}}]},
             {"content": "Volume is at 20%."},
         ]
-        with patch.object(assistant, "ollama_chat", side_effect=replies), \
+        with patch.object(assistant, "model_turn", side_effect=replies), \
                 patch("assistant.subprocess.run") as run, redirect_stdout(io.StringIO()):
             self.assertEqual(assistant.chat("volume to 20"), "Volume is at 20%.")
         run.assert_called_once_with(
             ["osascript", "-e", "set volume output volume 20"], check=True
         )
-        self.assertEqual(assistant.messages[-2], {"role": "tool", "content": "Volume set to 20%.", "tool_name": "set_volume"})
+        tool_message = assistant.messages[-2]
+        self.assertEqual(tool_message["content"], "Volume set to 20%.")
+        self.assertEqual(tool_message["tool_call_id"], assistant.messages[-3]["tool_calls"][0]["id"])
 
     def test_tools_reject_bad_arguments_without_running_anything(self):
         assistant = DesktopAssistant()
@@ -396,7 +399,7 @@ class ChatToolTests(unittest.TestCase):
 
     def test_failed_chat_leaves_history_unchanged(self):
         assistant = DesktopAssistant()
-        with patch.object(assistant, "ollama_chat", side_effect=RuntimeError("down")):
+        with patch.object(assistant, "model_turn", side_effect=RuntimeError("down")):
             with self.assertRaises(RuntimeError):
                 assistant.chat("hello")
         self.assertEqual(len(assistant.messages), 1)
@@ -420,6 +423,59 @@ class NewDesktopActionTests(unittest.TestCase):
         ):
             with self.assertRaises(ValueError):
                 validate_desktop_action(bad, size)
+
+
+class ProviderTests(unittest.TestCase):
+    HISTORY = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "volume 20 and open notes"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "a", "function": {"name": "set_volume", "arguments": {"level": 20}}},
+            {"id": "b", "function": {"name": "open_app", "arguments": {"name": "Notes"}}},
+        ]},
+        {"role": "tool", "content": "ok1", "tool_name": "set_volume", "tool_call_id": "a"},
+        {"role": "tool", "content": "ok2", "tool_name": "open_app", "tool_call_id": "b"},
+        {"role": "user", "content": "look", "images": ["QUJD"]},
+    ]
+
+    def test_anthropic_groups_tool_results_and_converts_images(self):
+        system, messages = to_anthropic_messages(self.HISTORY)
+        self.assertEqual(system, "sys")
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant", "user", "user"])
+        self.assertEqual([b["id"] for b in messages[1]["content"]], ["a", "b"])
+        self.assertEqual([b["tool_use_id"] for b in messages[2]["content"]], ["a", "b"])
+        self.assertEqual(messages[3]["content"][0]["source"]["data"], "QUJD")
+
+    def test_openai_serializes_arguments_and_images(self):
+        messages = to_openai_messages(self.HISTORY)
+        self.assertEqual(json.loads(messages[2]["tool_calls"][0]["function"]["arguments"]), {"level": 20})
+        self.assertEqual(messages[3], {"role": "tool", "tool_call_id": "a", "content": "ok1"})
+        self.assertTrue(messages[5]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,"))
+
+    def test_old_history_without_ids_becomes_plain_text(self):
+        old = [{"role": "system", "content": "s"}, {"role": "user", "content": "hi"},
+               {"role": "assistant", "content": "", "tool_calls": [{"function": {"name": "system_status"}}]},
+               {"role": "tool", "content": "It is noon."}]
+        _, messages = to_anthropic_messages(old)
+        self.assertEqual(messages[1], {"role": "assistant", "content": [{"type": "text", "text": "(used system_status)"}]})
+        self.assertEqual(messages[2]["content"], "[tool result] It is noon.")
+
+    def test_openai_turn_parses_tool_calls_and_needs_a_key(self):
+        with self.assertRaises(RuntimeError):
+            openai_turn("openai", "m", "", [{"role": "user", "content": "x"}], None)
+        body = json.dumps({"choices": [{"message": {"content": None, "tool_calls": [
+            {"id": "c1", "function": {"name": "open_app", "arguments": json.dumps({"name": "Notes"})}}]}}]})
+        response = MagicMock()
+        response.__enter__.return_value.read.return_value = body.encode()
+        with patch("providers.urlopen", return_value=response) as urlopen:
+            result = openai_turn("gemini", "gemini-2.5-flash", "k", [{"role": "user", "content": "x"}], None)
+        request = urlopen.call_args[0][0]
+        self.assertIn("generativelanguage.googleapis.com", request.full_url)
+        self.assertEqual(request.get_header("Authorization"), "Bearer k")
+        self.assertEqual(result["tool_calls"][0]["function"]["arguments"], {"name": "Notes"})
+
+    def test_parse_json_object_tolerates_prose_around_json(self):
+        self.assertEqual(parse_json_object('Sure! ```json\n{"action": "done"}\n```'), {"action": "done"})
 
 
 if __name__ == "__main__":
