@@ -460,6 +460,14 @@ final class ChatController: NSObject, ObservableObject {
                     lines.append(ChatLine(role: .bot, text: reply))
                     speak(reply)
                 }
+            } else if line.hasPrefix("CURSOR: ") {
+                // {"x":402,"y":722,"action":"click 7","click":true}; x/y omitted = stay put
+                if let data = line.dropFirst("CURSOR: ".count).data(using: .utf8),
+                   let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    let point = (info["x"] as? Double).flatMap { x in (info["y"] as? Double).map { CGPoint(x: x, y: $0) } }
+                    AgentCursor.shared.move(to: point, action: info["action"] as? String ?? "",
+                                            click: info["click"] as? Bool ?? false)
+                }
             } else if line.hasPrefix("TOOL: ") {
                 let tool = line.dropFirst("TOOL: ".count).split(separator: " ").first.map(String.init) ?? ""
                 if Self.actingTools.contains(tool) { stepAside() }
@@ -1836,5 +1844,104 @@ struct SettingsView: View {
             .padding(20)
         }
         .frame(width: 660, height: 640)
+    }
+}
+
+// MARK: - Helm's own cursor
+
+/// A visible cursor of Helm's own, separate from the user's mouse (like Codex's agent cursor).
+/// It floats above everything, ignores clicks, and slides to whatever Helm is about to touch.
+@MainActor
+final class AgentCursor: ObservableObject {
+    static let shared = AgentCursor()
+
+    @Published var position = CGPoint(x: -100, y: -100)
+    @Published var action = ""
+    @Published var visible = false
+    @Published var clicks = 0
+    private var panel: NSPanel?
+    private var hideTask: DispatchWorkItem?
+
+    /// `point` is in screen points with a top-left origin (what Accessibility and pyautogui use).
+    func move(to point: CGPoint?, action: String, click: Bool) {
+        ensurePanel()
+        if let point { position = point }
+        self.action = action
+        visible = true
+        if click { clicks += 1 }
+        hideTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in self?.visible = false }
+        hideTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4, execute: task)
+    }
+
+    private func ensurePanel() {
+        guard panel == nil, let screen = NSScreen.screens.first else { return }
+        let overlay = NSPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
+                              backing: .buffered, defer: false)
+        overlay.isOpaque = false
+        overlay.backgroundColor = .clear
+        overlay.hasShadow = false
+        overlay.ignoresMouseEvents = true  // never blocks the user's own clicks
+        overlay.level = .screenSaver
+        overlay.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        overlay.contentView = NSHostingView(rootView: AgentCursorView().environmentObject(self))
+        overlay.orderFrontRegardless()
+        panel = overlay
+    }
+}
+
+private struct AgentCursorView: View {
+    @EnvironmentObject private var cursor: AgentCursor
+    @State private var ripple = false
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            Color.clear
+            Circle()
+                .stroke(jarvisCyan, lineWidth: 3)
+                .frame(width: ripple ? 54 : 6, height: ripple ? 54 : 6)
+                .opacity(ripple ? 0 : 0.9)
+                .position(cursor.position)
+            HStack(alignment: .top, spacing: 4) {
+                CursorArrow()
+                    .fill(jarvisCyan)
+                    .overlay(CursorArrow().stroke(Color.white, lineWidth: 1.5))
+                    .frame(width: 20, height: 26)
+                    .shadow(color: jarvisCyan.opacity(0.9), radius: 8)
+                Text(cursor.action.isEmpty ? "Helm" : "Helm · \(cursor.action)")
+                    .font(.system(size: 11, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(jarvisBlue.opacity(0.92), in: Capsule())
+                    .offset(y: 16)
+            }
+            .offset(x: cursor.position.x - 2, y: cursor.position.y - 2)
+            .animation(.easeInOut(duration: 0.45), value: cursor.position)
+        }
+        .opacity(cursor.visible ? 1 : 0)
+        .animation(.easeOut(duration: 0.3), value: cursor.visible)
+        .onChange(of: cursor.clicks) { _ in
+            ripple = false
+            withAnimation(.easeOut(duration: 0.5)) { ripple = true }
+        }
+        .allowsHitTesting(false)
+    }
+}
+
+private struct CursorArrow: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = rect.width, h = rect.height
+        path.move(to: CGPoint(x: 0, y: 0))
+        path.addLine(to: CGPoint(x: 0, y: h * 0.82))
+        path.addLine(to: CGPoint(x: w * 0.28, y: h * 0.62))
+        path.addLine(to: CGPoint(x: w * 0.45, y: h))
+        path.addLine(to: CGPoint(x: w * 0.62, y: h * 0.92))
+        path.addLine(to: CGPoint(x: w * 0.45, y: h * 0.56))
+        path.addLine(to: CGPoint(x: w * 0.8, y: h * 0.56))
+        path.closeSubpath()
+        return path
     }
 }

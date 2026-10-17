@@ -99,7 +99,7 @@ def window_title(app_name: str) -> str:
     return ""
 
 
-def press_matching(app_name: str, matches) -> str:
+def press_matching(app_name: str, matches, before_press=None) -> str:
     """Press the first control of the app whose label satisfies `matches`; return its label.
 
     Direct-message links are preferred, so a person's DM wins over a same-named channel.
@@ -122,11 +122,15 @@ def press_matching(app_name: str, matches) -> str:
             label = str(_attribute(element, "AXTitle") or _attribute(element, "AXDescription") or "")
             if label and matches(label.replace("(direct message)", "")):
                 if "direct message" in label.lower():
+                    if before_press:
+                        before_press(element_center(element), label)
                     AS.AXUIElementPerformAction(element, "AXPress")
                     return label
                 fallback = fallback or (element, label)
         stack.extend(reversed(list(_attribute(element, "AXChildren") or [])))
     if fallback:
+        if before_press:
+            before_press(element_center(fallback[0]), fallback[1])
         AS.AXUIElementPerformAction(fallback[0], "AXPress")
         return fallback[1]
     return ""

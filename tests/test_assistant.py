@@ -707,7 +707,7 @@ class FocusDuringTypingTests(unittest.TestCase):
 
 
 class CoordinateClickTests(unittest.TestCase):
-    def test_click_uses_the_buttons_screen_coordinates(self):
+    def test_click_shows_helms_cursor_and_leaves_the_users_mouse_alone(self):
         assistant = DesktopAssistant(autonomous=True)
         fake = MagicMock()
         fake.size.return_value = (1440, 900)
@@ -719,8 +719,8 @@ class CoordinateClickTests(unittest.TestCase):
                 patch("assistant.press") as press, patch("assistant.time.sleep"), \
                 patch("assistant.read_app", return_value=("7", [])):
             assistant.interact("click_in_app", {"app": "Calculator", "label": "7"})
-        fake.click.assert_called_once_with(402, 722)
-        press.assert_not_called()
+        press.assert_called_once_with("button")  # pressed via Accessibility: the user's mouse stays put
+        fake.click.assert_not_called()
 
 
 if __name__ == "__main__":

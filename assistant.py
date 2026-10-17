@@ -561,6 +561,23 @@ TYPOGRAPHY = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'", "\u201
               "\u2026": "...", "\u00a0": " ", "\u2022": "-"}
 
 
+def show_cursor(point=None, action: str = "", click: bool = False) -> None:
+    """Move Helm's own on-screen cursor (drawn by the app) and give it time to glide there."""
+    info = {"action": action, "click": click}
+    if point:
+        info.update(x=float(point[0]), y=float(point[1]))
+    print("CURSOR: " + json.dumps(info), flush=True)
+    if point:
+        time.sleep(0.45)
+
+
+def real_click(pyautogui, x: int, y: int) -> None:
+    """Click with the real pointer, then hand the user's pointer straight back."""
+    home = pyautogui.position()
+    pyautogui.click(x, y)
+    pyautogui.moveTo(*home)
+
+
 class FocusLost(RuntimeError):
     """The target app stopped being frontmost while typing."""
 
@@ -874,6 +891,7 @@ class DesktopAssistant:
                 if not text.strip():
                     return "There was no text to write."
                 print(f"Typing {len(text.split())} words into {app}…", flush=True)
+                show_cursor(None, f"typing {len(text.split())} words")
                 try:
                     type_out(pyautogui, text, app=app)
                 except FocusLost as error:
@@ -1262,7 +1280,8 @@ class DesktopAssistant:
                     continue
                 try:
                     if action["action"] == "click":
-                        pyautogui.click(action["x"], action["y"])
+                        show_cursor((action["x"], action["y"]), "click", click=True)
+                        real_click(pyautogui, action["x"], action["y"])
                     elif action["action"] == "type":
                         pyautogui.write(action["text"], interval=0.02)
                     elif action["action"] == "press":
@@ -1359,7 +1378,8 @@ class DesktopAssistant:
         print(f"Looking for {where} in {app_name}…", flush=True)
         exact = recipient
         if kind == "person":
-            pressed = press_matching(app_name, lambda label: names_match(recipient, label))
+            pressed = press_matching(app_name, lambda label: names_match(recipient, label),
+                                     before_press=lambda point, label: show_cursor(point, f"open {label.split(' (')[0]}", click=True))
             if pressed:
                 exact = pressed.split(" (direct message)")[0].strip()  # the real spelling, for the switcher
                 time.sleep(1.5)
@@ -1470,20 +1490,21 @@ class DesktopAssistant:
             if target is None:
                 return f"No '{label}' to press in {app}. Use read_screen to see what is there."
             center = element_center(target)
-            on_screen = center is not None and 0 <= center[0] < pyautogui.size()[0] and 0 <= center[1] < pyautogui.size()[1]
-            if on_screen and frontmost_app_name() == app:
-                pyautogui.click(*center)  # a real, visible mouse click at the button's coordinates
-            else:
-                press(target)  # off-screen or covered: press it through Accessibility instead
+            show_cursor(center, f"click {found}", click=True)
+            # Press at the cursor's spot through Accessibility so the user's own mouse never moves.
+            if not press(target) and center and frontmost_app_name() == app:
+                real_click(pyautogui, *center)
             time.sleep(0.5)
             shown = " ".join(read_app(app, max_chars=600)[0].replace("\u200e", "").replace("\u2212", "-").split())[:300]
             return f"Pressed '{found}' in {app}. The window now shows: {shown}"
         if name == "menu_in_app":
+            show_cursor(None, f"menu {args.get('path', '')}")
             path = [part.strip() for part in re.split(r">|/|→", str(args.get("path", ""))) if part.strip()]
             chosen = choose_menu(app, path, lambda want, have: have.lower().rstrip("…. ") == want.lower().rstrip("…. ")
                                  or names_match(want, have))
             return f"Chose {chosen} in {app}." if chosen else f"Could not find the menu {' > '.join(path)} in {app}."
         if name == "keys_in_app":
+            show_cursor(None, f"pressing {args.get('keys', '')}")
             keys = [k.strip().lower().replace("cmd", "command") for k in re.split(r"[+ ]", str(args.get("keys", ""))) if k.strip()]
             try:
                 validate_desktop_action({"action": "hotkey", "keys": keys, "reason": "r"} if len(keys) > 1
@@ -1495,6 +1516,7 @@ class DesktopAssistant:
             return f"Pressed {'+'.join(keys)} in {app}."
         text = str(args.get("text", ""))
         field = str(args.get("field") or "").strip()
+        show_cursor(None, "typing…")
         if field and not focus_field(app, lambda label: names_match(field, label)):
             return f"No '{field}' field in {app}."
         if frontmost_app_name() != app:
