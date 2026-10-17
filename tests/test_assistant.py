@@ -648,9 +648,10 @@ class InteractTests(unittest.TestCase):
                 patch.object(DesktopAssistant, "desktop_tools", return_value=MagicMock()), \
                 patch("assistant.find_in_app", return_value=("button", "7")), \
                 patch("assistant.press") as press, patch("assistant.time.sleep"), \
+                patch("assistant.element_center", return_value=None), \
                 patch("assistant.read_app", return_value=("7", [])):
             result = assistant.interact("click_in_app", {"app": "Calculator", "label": "7"})
-        press.assert_called_once_with("button")
+        press.assert_called_once_with("button")  # no on-screen position: falls back to Accessibility
         self.assertIn("Pressed '7'", result)
 
     def test_risky_clicks_ask_even_in_full_autonomy(self):
@@ -703,6 +704,23 @@ class FocusDuringTypingTests(unittest.TestCase):
                 type_out(fake, "Netflix has changed how people watch entertainment at home today.", app="TextEdit")
         typed = "".join(call.args[0] for call in fake.write.call_args_list)
         self.assertLess(len(typed), 40)  # stopped after the first few words
+
+
+class CoordinateClickTests(unittest.TestCase):
+    def test_click_uses_the_buttons_screen_coordinates(self):
+        assistant = DesktopAssistant(autonomous=True)
+        fake = MagicMock()
+        fake.size.return_value = (1440, 900)
+        with patch.object(assistant, "focus_app", return_value=""), \
+                patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
+                patch("assistant.find_in_app", return_value=("button", "7")), \
+                patch("assistant.element_center", return_value=(402, 722)), \
+                patch("assistant.frontmost_app_name", return_value="Calculator"), \
+                patch("assistant.press") as press, patch("assistant.time.sleep"), \
+                patch("assistant.read_app", return_value=("7", [])):
+            assistant.interact("click_in_app", {"app": "Calculator", "label": "7"})
+        fake.click.assert_called_once_with(402, 722)
+        press.assert_not_called()
 
 
 if __name__ == "__main__":

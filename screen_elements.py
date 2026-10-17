@@ -216,6 +216,14 @@ def find_in_app(app_name: str, matches, roles=PRESSABLE_ROLES):
     return loose or (None, "")
 
 
+def element_center(element) -> tuple[int, int] | None:
+    """On-screen centre of an element in screen points (what mouse clicks use)."""
+    frame = _frame(element)
+    if not frame or frame[2] <= 2 or frame[3] <= 2:
+        return None
+    return int(frame[0] + frame[2] / 2), int(frame[1] + frame[3] / 2)
+
+
 def press(element) -> bool:
     import ApplicationServices as AS
 

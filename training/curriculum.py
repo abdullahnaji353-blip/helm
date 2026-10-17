@@ -425,7 +425,16 @@ def build() -> list[dict]:
     return tasks
 
 
-TASKS = build()
+def _no_outsourcing(tasks: list[dict]) -> list[dict]:
+    """Writing tasks fail if Chatbot had ChatGPT write the text instead of writing it itself."""
+    for task in tasks:
+        if task["expect"] == "new_document":
+            task["check"] = (lambda out, reply, original=task["check"]:
+                             "TOOL: ask_chatgpt" not in out and original(out, reply))
+    return tasks
+
+
+TASKS = _no_outsourcing(build())
 LEVELS = ("easy", "medium", "hard", "extreme", "insane", "master")
 
 if __name__ == "__main__":

@@ -265,10 +265,12 @@ struct MacMenuAssistantApp: App {
                 .onAppear { NSApp.activate(ignoringOtherApps: true) }
         }
         .defaultSize(width: 1100, height: 700)
-        MenuBarExtra("Chatbot", systemImage: chat.isListening ? "waveform" : "circle.hexagongrid.fill") {
+        MenuBarExtra {
             ChatRootView()
                 .environmentObject(controller)
                 .environmentObject(chat)
+        } label: {
+            MenuBarIcon().environmentObject(chat)
         }
         .menuBarExtraStyle(.window)
     }

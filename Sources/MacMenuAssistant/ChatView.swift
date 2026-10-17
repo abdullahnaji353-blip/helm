@@ -1,5 +1,6 @@
 import AVFoundation
 import AppKit
+import Carbon.HIToolbox
 import ApplicationServices
 import Security
 import Speech
@@ -7,6 +8,31 @@ import SwiftUI
 
 private let jarvisCyan = Color(red: 0.30, green: 0.85, blue: 1.0)
 private let jarvisBlue = Color(red: 0.16, green: 0.42, blue: 1.0)
+
+/// System-wide hotkey through Carbon: works from any app and needs no permission.
+final class GlobalHotKey {
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
+    fileprivate let action: () -> Void
+
+    init(keyCode: UInt32, modifiers: UInt32, id: UInt32, action: @escaping () -> Void) {
+        self.action = action
+        var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, userData in
+            guard let userData else { return noErr }
+            let hotKey = Unmanaged<GlobalHotKey>.fromOpaque(userData).takeUnretainedValue()
+            DispatchQueue.main.async { hotKey.action() }
+            return noErr
+        }, 1, &spec, Unmanaged.passUnretained(self).toOpaque(), &handlerRef)
+        let hotKeyID = EventHotKeyID(signature: OSType(0x4348_4254), id: id)  // 'CHBT'
+        RegisterEventHotKey(keyCode, modifiers, hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    deinit {
+        if let hotKeyRef { UnregisterEventHotKey(hotKeyRef) }
+        if let handlerRef { RemoveEventHandler(handlerRef) }
+    }
+}
 
 /// Mirrors PROVIDERS in providers.py.
 struct ProviderOption: Identifiable {
@@ -52,6 +78,15 @@ enum KeyStore {
         guard SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess,
               let data = result as? Data else { return nil }
         return String(data: data, encoding: .utf8)
+    }
+
+    /// Whether a key is saved, without reading the secret (so macOS shows no access prompt).
+    static func exists(_ provider: String) -> Bool {
+        var request = query(provider)
+        request[kSecReturnAttributes as String] = true
+        request[kSecMatchLimit as String] = kSecMatchLimitOne
+        var result: CFTypeRef?
+        return SecItemCopyMatching(request as CFDictionary, &result) == errSecSuccess
     }
 
     static func delete(_ provider: String) {
@@ -117,7 +152,7 @@ final class ChatController: ObservableObject {
         if defaults.bool(forKey: "onboarded") { return false }
         let returning = FileManager.default.fileExists(atPath: supportDirectory.appendingPathComponent("setup-complete.json").path)
             || FileManager.default.fileExists(atPath: supportDirectory.appendingPathComponent("chat_history.json").path)
-            || ProviderOption.all.contains { KeyStore.read($0.id) != nil }
+            || ProviderOption.all.contains { KeyStore.exists($0.id) }
         if returning { defaults.set(true, forKey: "onboarded") }
         return !returning
     }
@@ -178,6 +213,33 @@ final class ChatController: ObservableObject {
         }
     }
     @Published var showProviderSettings = false
+    /// Bumped by the Control+Shift+§ shortcut; the menu bar label opens the HUD when it changes.
+    @Published var hudRequests = 0
+    private var appShortcuts: [GlobalHotKey] = []
+
+    init() {
+        installAppShortcut()  // ready as soon as Chatbot launches
+    }
+
+    /// Control+Shift+§ opens Chatbot from anywhere (§ is the ISO key left of 1; ` on US keyboards).
+    func installAppShortcut() {
+        guard appShortcuts.isEmpty else { return }
+        let modifiers = UInt32(controlKey | shiftKey)
+        appShortcuts = [UInt32(kVK_ISO_Section), UInt32(kVK_ANSI_Grave)].enumerated().map { index, key in
+            GlobalHotKey(keyCode: key, modifiers: modifiers, id: UInt32(index + 1)) { [weak self] in self?.showHUD() }
+        }
+    }
+
+    func showHUD() {
+        if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
+        if let window = NSApp.windows.first(where: { $0.title == "Chatbot" && !($0 is NSPanel) }) {
+            // macOS may refuse to switch apps for a background hotkey; show the window on top anyway.
+            window.orderFrontRegardless()
+            window.makeKeyAndOrderFront(nil)
+        } else {
+            hudRequests += 1  // window was closed: ask SwiftUI to reopen it
+        }
+    }
     /// "hud" = full window, "menubar" = compact popup from the menu bar icon.
     @Published var interfaceStyle = UserDefaults.standard.string(forKey: "interfaceStyle") ?? "hud" {
         didSet { UserDefaults.standard.set(interfaceStyle, forKey: "interfaceStyle") }
@@ -191,7 +253,7 @@ final class ChatController: ObservableObject {
             DispatchQueue.main.async { NSApp.terminate(nil) }
         }
     }
-    @Published var savedKeys = Set(ProviderOption.all.compactMap { KeyStore.read($0.id) == nil ? nil : $0.id })
+    @Published var savedKeys = Set(ProviderOption.all.compactMap { KeyStore.exists($0.id) ? $0.id : nil })
 
     /// Model per provider; empty means the provider's default.
     func model(for provider: String) -> String {
@@ -406,6 +468,20 @@ final class ChatController: ObservableObject {
             ?? AVSpeechSynthesisVoice(language: "en-GB")
         speech.stopSpeaking(at: .immediate)
         speech.speak(utterance)
+    }
+}
+
+/// The menu bar icon. It is always alive, so it is where the global shortcut reopens the HUD.
+struct MenuBarIcon: View {
+    @EnvironmentObject private var chat: ChatController
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Image(systemName: chat.isListening ? "waveform" : "circle.hexagongrid.fill")
+            .onChange(of: chat.hudRequests) { _ in
+                openWindow(id: "hud")
+                NSApp.activate(ignoringOtherApps: true)
+            }
     }
 }
 
@@ -819,7 +895,8 @@ struct HUDView: View {
         }
         .onAppear {
             chat.configureVoice()
-            if chat.onboarded && chat.interfaceStyle == "menubar" { closeHUDWindow() }
+            // Menu bar style hides the big window at launch, but not when the shortcut asked for it.
+            if chat.onboarded && chat.interfaceStyle == "menubar" && chat.hudRequests == 0 { closeHUDWindow() }
         }
         .onChange(of: chat.interfaceStyle) { style in
             if style == "menubar" && chat.onboarded && !chat.showProviderSettings { closeHUDWindow() }

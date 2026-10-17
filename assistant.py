@@ -24,7 +24,7 @@ from mcp_client import MCPConnector, MCPError
 from writing_check import grade
 from screen_elements import (
     bring_to_front, describe_elements, frontmost_app_name, frontmost_elements, mark_elements,
-    choose_menu, find_in_app, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
+    choose_menu, element_center, find_in_app, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
 )
 from providers import PROVIDERS, anthropic_turn, check_provider, openai_turn, parse_json_object, provider_key
 
@@ -56,7 +56,7 @@ SYSTEM_PROMPT = (
     "menu_in_app(path=File > New); 'go to example.com in Safari' -> keys_in_app(command+l) then "
     "type_in_app(text=example.com, submit=true); 'install X' -> install_app; 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
     "'how much is Spotify / what is Notion' -> answer from your private notes or app_knowledge; "
-    "'write an essay about X' -> compose the full essay yourself with proper grammar (aim about 20% above any "
+    "'write an essay about X' -> compose the full essay yourself (never ask ChatGPT to write it) with proper grammar (aim about 20% above any "
     "word target, blank lines between paragraphs), then new_document(text=essay), which types it out; "
     "'ask ChatGPT X' -> ask_chatgpt(question=X); 'write X in a new TextEdit document' -> new_document(text=X); 'work out 47 times 23 with Calculator' -> "
     "click_in_app(app=Calculator, label='AC 4 7 × 2 3 =') (AC clears it first) then say the number shown; 'copy the word X' -> clipboard(action=copy, text=X); 'paste what you copied into X' -> "
@@ -273,6 +273,7 @@ ALLOWED_KEYS = {
 }
 HOTKEY_MODIFIERS = {"command", "shift", "option", "ctrl"}
 MAX_DESKTOP_STEPS = 20
+MAX_TOOL_ROUNDS = 12  # 4 was too few: "3 × 5 =" alone is four presses
 MAX_INVALID_ACTIONS = 3
 MAX_REPEATED_ACTIONS = 3
 DESKTOP_ACTION_SCHEMA = {
@@ -932,7 +933,7 @@ class DesktopAssistant:
         self.messages.append({"role": "user", "content": text})
         start = len(self.messages) - 1
         try:
-            for _ in range(4):  # cap tool round-trips per message
+            for _ in range(MAX_TOOL_ROUNDS):  # cap tool round-trips per message
                 message = self.model_turn()
                 calls = message.get("tool_calls") or written_tool_call(message.get("content"), self.tools)
                 reply = message.get("content") if not calls or message.get("tool_calls") else ""
@@ -958,8 +959,10 @@ class DesktopAssistant:
                     self.messages.append({
                         "role": "tool", "content": result, "tool_name": name, "tool_call_id": call["id"],
                     })
-            self.messages.append({"role": "assistant", "content": "Done."})
-            return "Done."
+            # Out of rounds: report what the last action actually produced instead of a bare "Done."
+            summary = "I ran out of steps. Last result: " + self.messages[-1]["content"][:600]
+            self.messages.append({"role": "assistant", "content": summary})
+            return summary
         except RuntimeError:
             del self.messages[start:]
             raise
@@ -1431,7 +1434,12 @@ class DesktopAssistant:
                 target, found = find_in_app(app, lambda text: names_match(label, text))
             if target is None:
                 return f"No '{label}' to press in {app}. Use read_screen to see what is there."
-            press(target)
+            center = element_center(target)
+            on_screen = center is not None and 0 <= center[0] < pyautogui.size()[0] and 0 <= center[1] < pyautogui.size()[1]
+            if on_screen and frontmost_app_name() == app:
+                pyautogui.click(*center)  # a real, visible mouse click at the button's coordinates
+            else:
+                press(target)  # off-screen or covered: press it through Accessibility instead
             time.sleep(0.5)
             shown = " ".join(read_app(app, max_chars=600)[0].replace("\u200e", "").replace("\u2212", "-").split())[:300]
             return f"Pressed '{found}' in {app}. The window now shows: {shown}"
