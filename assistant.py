@@ -840,10 +840,16 @@ class DesktopAssistant:
                 type_out(pyautogui, text)
                 report = grade(text)
                 problems = report["spelling"][:5] + report["grammar"][:3]
+                target = re.search(r"(\d{2,4})[- ]word", getattr(self, "current_request", ""))
+                if target and report["words"] < int(target.group(1)):
+                    problems.append("too short")
+                    print(f"Only {report['words']} of {target.group(1)} words; asking for a longer version.", flush=True)
                 return (f"Typed a new {app} document: {report['words']} words, {report['paragraphs']} paragraphs. "
                         f"Spelling issues: {report['spelling'][:5] or 'none'}. Grammar issues: {report['grammar'][:3] or 'none'}."
-                        + (" If the task asked for more words or perfect grammar, write an improved full version "
-                           "and call new_document again." if problems else ""))
+                        + (f" The task asked for {target.group(1)} words, so this is too short." if target and
+                           report["words"] < int(target.group(1)) else "")
+                        + (" Write an improved, complete, longer version (more detail in every paragraph) and call "
+                           "new_document again." if problems else ""))
             if name == "ask_chatgpt":
                 return self.ask_chatgpt(str(args.get("question", "")))
             if name in {"click_in_app", "menu_in_app", "type_in_app", "keys_in_app"}:
@@ -904,6 +910,7 @@ class DesktopAssistant:
         self.messages[0]["content"] = base + extra if extra else base
 
     def chat(self, text: str) -> str:
+        self.current_request = text
         self.recall_apps(text)
         self.messages.append({"role": "user", "content": text})
         start = len(self.messages) - 1
@@ -954,6 +961,8 @@ class DesktopAssistant:
             data=json.dumps({
                 "model": self.model, "messages": messages, "stream": False,
                 "tools": self.tools, "think": False,
+                # The default 4096-token window truncates our prompt + tools + long essays.
+                "options": {"num_ctx": 8192},
             }).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",

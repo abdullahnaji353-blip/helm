@@ -43,6 +43,10 @@ def paid_price(app: dict) -> str | None:
     return None
 
 
+def paid_prices(app: dict) -> list[str]:
+    return [p for p in (first_price(t) for t in app["plans"].values()) if p and float(p) > 0]
+
+
 def essay_text() -> str:
     return read_app("TextEdit", max_chars=20000)[0]
 
@@ -360,19 +364,19 @@ def build() -> list[dict]:
              "new_document", lambda out, reply, name=app["name"]: passes(essay_text(), 120, 1, 1, [name]),
              hint="compose the whole paragraph yourself, then new_document(text=paragraph)", setup=fresh_textedit)
     for app in paid:
-        price = paid_price(app)
+        price, prices = paid_price(app), paid_prices(app)
         task("extreme", f"essay-{app['name']}",
              f"write a 300-word essay about {app['name']} with an introduction, a body and a conclusion: how it "
              "works, how people use it, its benefits, and its subscription prices. Put it in a new TextEdit "
              "document with proper grammar.",
-             "new_document", lambda out, reply, name=app["name"], price=price: passes(essay_text(), 250, 3, 2, [name, price]),
+             "new_document", lambda out, reply, name=app["name"], prices=prices: passes(essay_text(), 250, 3, 2, [name, prices]),
              hint="check app_knowledge for prices, write 3+ paragraphs yourself, then new_document", setup=fresh_textedit)
     by_category: dict[str, list[dict]] = {}
     for app in paid:
         by_category.setdefault(app["category"], []).append(app)
     pairs = [(a, b) for group in by_category.values() for i, a in enumerate(group) for b in group[i + 1:]]
     for a, b in pairs:
-        pa, pb = paid_price(a), paid_price(b)
+        pa, pb = paid_prices(a), paid_prices(b)
         task("insane", f"compare-essay-{a['name']}-{b['name']}",
              f"write a 350-word comparison essay of {a['name']} versus {b['name']}: what each does, who should "
              "pick which, and what their plans cost. Use at least four paragraphs and flawless grammar, in a new "
@@ -401,7 +405,7 @@ def build() -> list[dict]:
              hint="look up each price, add them carefully, state the total with cents, then write the essay",
              setup=fresh_textedit)
     for app in paid[:30]:
-        price = paid_price(app)
+        price = paid_prices(app)
         task("master", f"persuade-{app['name']}",
              f"write a persuasive 400-word letter to a parent arguing whether a paid {app['name']} plan is worth "
              "the money, with a greeting, at least four paragraphs, a sign-off and flawless grammar, in a new "
