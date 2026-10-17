@@ -1,0 +1,3 @@
+PyAutoGUI>=0.9.54,<1
+pyobjc-framework-Cocoa==11.1; sys_platform == "darwin"
+pyobjc-framework-quartz==11.1; sys_platform == "darwin"
