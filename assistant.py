@@ -1352,8 +1352,9 @@ class DesktopAssistant:
         kind = "channel" if kind == "channel" else "person"
         if app_name is None:
             return "send_message supports Discord and Slack; use control_screen for other apps."
-        if not recipient or (not text and not read_only) or len(text) > 500 or not (recipient + text + server).isascii():
-            return "A recipient and a short plain-text message are required."
+        if not recipient or (not text and not read_only) or len(text) > 2000:
+            return "A recipient and a message (up to 2000 characters) are required."
+        server = re.sub(r"[\u2122\u00ae\u00a9]", "", server).strip()  # "RX Esports™" -> "RX Esports"
         where = f"#{recipient}" + (f" in {server}" if server else "") if kind == "channel" else recipient
         summary = f'send "{text}" to {where} in {app_name}'
         dry_run = os.environ.get("HELM_DRY_RUN") == "1"
