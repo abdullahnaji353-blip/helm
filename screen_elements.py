@@ -178,6 +178,87 @@ def read_app(app_name: str, max_chars: int = 6000) -> tuple[str, list[dict[str, 
     return "\n".join(texts)[:max_chars], links
 
 
+PRESSABLE_ROLES = {
+    "AXButton", "AXLink", "AXMenuItem", "AXMenuButton", "AXCheckBox", "AXRadioButton",
+    "AXPopUpButton", "AXTab", "AXCell", "AXRow", "AXDisclosureTriangle", "AXStaticText",
+}
+
+
+def _label(element) -> str:
+    for name in ("AXTitle", "AXDescription", "AXValue", "AXHelp"):
+        value = _attribute(element, name)
+        if value not in (None, "") and not isinstance(value, (list, tuple)):
+            return " ".join(str(value).split())
+    return ""
+
+
+def find_in_app(app_name: str, matches, roles=PRESSABLE_ROLES):
+    """First element (in reading order) of the app's front window whose label matches."""
+    element = _app_element(app_name)
+    if element is None:
+        return None, ""
+    window = _attribute(element, "AXFocusedWindow") or (_attribute(element, "AXWindows") or [None])[0]
+    stack, visited, loose = [window] if window is not None else [], 0, None
+    while stack and visited < 20000:
+        node = stack.pop()
+        visited += 1
+        if _attribute(node, "AXRole") in roles:
+            label = _label(node)
+            if label and matches(label):
+                if _attribute(node, "AXRole") != "AXStaticText":
+                    return node, label
+                loose = loose or (node, label)  # plain text only if nothing pressable matches
+        stack.extend(reversed(list(_attribute(node, "AXChildren") or [])))
+    return loose or (None, "")
+
+
+def press(element) -> bool:
+    import ApplicationServices as AS
+
+    return AS.AXUIElementPerformAction(element, "AXPress") == 0
+
+
+def choose_menu(app_name: str, path: list[str], matches) -> str:
+    """Walk the menu bar, e.g. ["File", "New"], pressing each matching item."""
+    element = _app_element(app_name)
+    if element is None:
+        return ""
+    current = _attribute(element, "AXMenuBar")
+    chosen = []
+    for step in path:
+        if current is None:
+            return ""
+        candidates = list(_attribute(current, "AXChildren") or [])
+        # Menu bar items hold an AXMenu child whose children are the items.
+        expanded = []
+        for candidate in candidates:
+            if _attribute(candidate, "AXRole") == "AXMenu":
+                expanded += list(_attribute(candidate, "AXChildren") or [])
+            else:
+                expanded.append(candidate)
+        hit = next((c for c in expanded if matches(step, _label(c))), None)
+        if hit is None:
+            return ""
+        chosen.append(_label(hit))
+        if step is path[-1]:
+            press(hit)
+        else:
+            current = hit
+    return " > ".join(chosen)
+
+
+def focus_field(app_name: str, matches) -> str:
+    """Focus the text field whose label/placeholder matches (or the first one)."""
+    import ApplicationServices as AS
+
+    roles = {"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"}
+    field, label = find_in_app(app_name, matches, roles)
+    if field is None:
+        return ""
+    AS.AXUIElementSetAttributeValue(field, "AXFocused", True)
+    return label or "text field"
+
+
 def frontmost_elements(screen_size: tuple[int, int]) -> tuple[str, list[dict]]:
     """Return (app name, controls) for the frontmost app, in reading order.
 

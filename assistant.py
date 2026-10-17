@@ -23,7 +23,7 @@ from urllib.request import Request, urlopen
 from mcp_client import MCPConnector, MCPError
 from screen_elements import (
     bring_to_front, describe_elements, frontmost_app_name, frontmost_elements, mark_elements,
-    press_matching, read_app, wait_for_frontmost, window_title,
+    choose_menu, find_in_app, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
 )
 from providers import PROVIDERS, anthropic_turn, check_provider, openai_turn, parse_json_object, provider_key
 
@@ -51,7 +51,9 @@ SYSTEM_PROMPT = (
     "Examples: 'go to discord then Sam then say hi' -> send_message(app=Discord, "
     "recipient=Sam, kind=person, text=hi); 'say hello in #general in the Gamers server' -> "
     "send_message(kind=channel, recipient=general, server=Gamers); 'what does this page say' "
-    "-> read_screen; 'install X' -> install_app; 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
+    "-> read_screen; 'press 7 in Calculator' -> click_in_app; 'new document in TextEdit' -> "
+    "menu_in_app(path=File > New); 'go to example.com in Safari' -> keys_in_app(command+l) then "
+    "type_in_app(text=example.com, submit=true); 'install X' -> install_app; 'delete/uninstall X' -> uninstall_app; 'watch this video' -> watch_video then save_lesson for each key point; "
     "'copy the word X' -> clipboard(action=copy, text=X); 'ask ChatGPT X' -> paste_into_app(app=ChatGPT, "
     "text=X, submit=true) then read_screen(app=ChatGPT); 'open Spotify' -> open_app; 'find YouTube videos about X' "
     "-> web_search(site=youtube); 'pause the music' -> media_control; anything that needs "
@@ -152,6 +154,30 @@ CHAT_TOOLS = [
         "description": "Remember a useful lesson or fact for the future, e.g. after watching a video.",
         "parameters": {"type": "object", "properties": {
             "lesson": {"type": "string"}}, "required": ["lesson"]}}},
+    {"type": "function", "function": {
+        "name": "click_in_app",
+        "description": "Press a button, link, tab or list item in an app by its visible name, e.g. '7' in Calculator.",
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string"}, "label": {"type": "string"}}, "required": ["app", "label"]}}},
+    {"type": "function", "function": {
+        "name": "menu_in_app",
+        "description": "Choose a menu bar item in an app, e.g. path 'File > New' in TextEdit.",
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string"}, "path": {"type": "string"}}, "required": ["app", "path"]}}},
+    {"type": "function", "function": {
+        "name": "type_in_app",
+        "description": (
+            "Type text into an app. Optionally name the field (e.g. 'Search'); otherwise it types where "
+            "the cursor is. Set submit to press enter afterwards."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string"}, "text": {"type": "string"},
+            "field": {"type": "string"}, "submit": {"type": "boolean"}}, "required": ["app", "text"]}}},
+    {"type": "function", "function": {
+        "name": "keys_in_app",
+        "description": "Press a keyboard shortcut in an app, e.g. keys 'command+l' in Safari or 'command+n'.",
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string"}, "keys": {"type": "string"}}, "required": ["app", "keys"]}}},
     {"type": "function", "function": {
         "name": "install_app",
         "description": "Find an app in the Mac App Store so it can be installed.",
@@ -708,6 +734,8 @@ class DesktopAssistant:
                     return "There was no lesson to save."
                 save_lesson(lesson)
                 return "Saved. I will remember that."
+            if name in {"click_in_app", "menu_in_app", "type_in_app", "keys_in_app"}:
+                return self.interact(name, args)
             if name == "install_app":
                 app = str(args.get("name", "")).strip()
                 if not APP_NAME_PATTERN.fullmatch(app):
@@ -1179,6 +1207,71 @@ class DesktopAssistant:
         pyautogui.write(text, interval=0.03)
         pyautogui.press("enter")
         return f"Sent \"{text}\" to {where} in {app_name} ({title})."
+
+    def focus_app(self, app: str) -> str:
+        """Bring the app forward; returns an error message, or "" when ready."""
+        if not APP_NAME_PATTERN.fullmatch(app):
+            return "That is not a valid app name."
+        try:
+            subprocess.run(["open", "-a", app], check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            return f"{app} is not installed."
+        if not (wait_for_frontmost(app) or bring_to_front(app)):
+            return f"macOS kept {frontmost_app_name() or 'another app'} in front, so {app} could not be used."
+        return ""
+
+    def interact(self, name: str, args: dict) -> str:
+        app = str(args.get("app", "")).strip()
+        risky_words = ("delete", "erase", "remove", "buy", "pay", "purchase", "format", "empty trash")
+        described = json.dumps({k: v for k, v in args.items() if k != "app"})
+        risky = any(word in described.lower() for word in risky_words)
+        if (risky or not self.autonomous) and os.environ.get("CHATBOT_DRY_RUN") != "1":
+            print(f"APPROVAL_REQUIRED: {name.replace('_in_app', '')} {described} in {app}", flush=True)
+            if not action_approved(input("Allow this action? [y/yes/N] ")):
+                return "The user declined, so nothing was done."
+        error = self.focus_app(app)
+        if error:
+            return error
+        pyautogui = self.desktop_tools()
+        if name == "click_in_app":
+            label = str(args.get("label", "")).strip()
+            target, found = find_in_app(app, lambda text: text.lower() == label.lower())
+            if target is None:
+                target, found = find_in_app(app, lambda text: names_match(label, text))
+            if target is None:
+                return f"No '{label}' to press in {app}. Use read_screen to see what is there."
+            press(target)
+            time.sleep(0.5)
+            return f"Pressed '{found}' in {app}."
+        if name == "menu_in_app":
+            path = [part.strip() for part in re.split(r">|/|→", str(args.get("path", ""))) if part.strip()]
+            chosen = choose_menu(app, path, lambda want, have: have.lower().rstrip("…. ") == want.lower().rstrip("…. ")
+                                 or names_match(want, have))
+            return f"Chose {chosen} in {app}." if chosen else f"Could not find the menu {' > '.join(path)} in {app}."
+        if name == "keys_in_app":
+            keys = [k.strip().lower().replace("cmd", "command") for k in re.split(r"[+ ]", str(args.get("keys", ""))) if k.strip()]
+            try:
+                validate_desktop_action({"action": "hotkey", "keys": keys, "reason": "r"} if len(keys) > 1
+                                        else {"action": "press", "key": keys[0] if keys else "", "reason": "r"}, (1, 1))
+            except ValueError as error:
+                return str(error)
+            pyautogui.hotkey(*keys) if len(keys) > 1 else pyautogui.press(keys[0])
+            time.sleep(0.5)
+            return f"Pressed {'+'.join(keys)} in {app}."
+        text = str(args.get("text", ""))
+        field = str(args.get("field") or "").strip()
+        if field and not focus_field(app, lambda label: names_match(field, label)):
+            return f"No '{field}' field in {app}."
+        if frontmost_app_name() != app:
+            return f"Focus moved away from {app}; nothing was typed."
+        if text.isascii():
+            pyautogui.write(text, interval=0.02)
+        else:  # pyautogui cannot type non-ASCII; paste it instead
+            subprocess.run(["pbcopy"], input=text, text=True, check=True)
+            pyautogui.hotkey("command", "v")
+        if args.get("submit"):
+            pyautogui.press("enter")
+        return f"Typed {len(text)} characters into {app}" + (" and pressed enter." if args.get("submit") else ".")
 
     def uninstall_app(self, name: str) -> str:
         name = name.strip().removesuffix(".app") if hasattr(str, "removesuffix") else name.strip()

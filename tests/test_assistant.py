@@ -628,5 +628,26 @@ class WrittenToolCallTests(unittest.TestCase):
         self.assertEqual(written_tool_call("rm_rf(path=/)", CHAT_TOOLS), [])
 
 
+class InteractTests(unittest.TestCase):
+    def test_click_presses_the_named_control(self):
+        assistant = DesktopAssistant(autonomous=True)
+        with patch.object(assistant, "focus_app", return_value=""), \
+                patch.object(DesktopAssistant, "desktop_tools", return_value=MagicMock()), \
+                patch("assistant.find_in_app", return_value=("button", "7")), \
+                patch("assistant.press") as press, patch("assistant.time.sleep"):
+            result = assistant.interact("click_in_app", {"app": "Calculator", "label": "7"})
+        press.assert_called_once_with("button")
+        self.assertIn("Pressed '7'", result)
+
+    def test_risky_clicks_ask_even_in_full_autonomy(self):
+        assistant = DesktopAssistant(autonomous=True)
+        with patch("builtins.input", return_value="n") as prompt, \
+                patch.object(assistant, "focus_app") as focus, redirect_stdout(io.StringIO()):
+            result = assistant.interact("click_in_app", {"app": "Finder", "label": "Empty Trash"})
+        prompt.assert_called_once()
+        focus.assert_not_called()
+        self.assertIn("nothing was done", result)
+
+
 if __name__ == "__main__":
     unittest.main()
