@@ -11,6 +11,10 @@ from assistant import (
     DesktopAssistant,
     action_approved,
     names_match,
+    written_tool_call,
+    recall_skills,
+    remember_skill,
+    chat_title_matches,
     simple_open_app_intent,
     search_web,
     test_screen_capture,
@@ -268,7 +272,8 @@ class BrowserSearchTests(unittest.TestCase):
 
     def test_unreadable_page_still_reports_the_open_results(self):
         replies = [MagicMock(returncode=0), MagicMock(returncode=1, stdout="")]
-        with patch("assistant.subprocess.run", side_effect=replies), patch("assistant.time.sleep"):
+        with patch("assistant.subprocess.run", side_effect=replies), patch("assistant.time.sleep"), \
+                patch("assistant.read_app", return_value=("", [])):
             url, results, note = search_web("latte art", "tiktok", "safari")
         self.assertEqual(results, [])
         self.assertIn("Allow JavaScript from Apple Events", note)
@@ -545,6 +550,13 @@ class RepeatGuardTests(unittest.TestCase):
 
 
 class SendMessageTests(unittest.TestCase):
+    def test_dm_and_channel_titles_are_never_confused(self):
+        self.assertTrue(chat_title_matches("@Tizi aziz - Discord", "tizi aziz", "person"))
+        self.assertFalse(chat_title_matches("#tizi-aziz | Fans - Discord", "tizi aziz", "person"))
+        self.assertTrue(chat_title_matches("#📊┃polls | KeyMau Esports - Discord", "polls", "channel", "keymau esports"))
+        self.assertFalse(chat_title_matches("#polls | Other Server - Discord", "polls", "channel", "keymau esports"))
+        self.assertFalse(chat_title_matches("@polls - Discord", "polls", "channel"))
+
     def test_names_match_tolerates_typos_but_not_other_people(self):
         self.assertTrue(names_match("tiziz aziz", "@Tizi Aziz - Discord"))
         self.assertTrue(names_match("Tizi Aziz", "Discord | @tizi aziz"))
@@ -563,7 +575,7 @@ class SendMessageTests(unittest.TestCase):
             return assistant.send_message("Discord", "tiziz aziz", "hi"), fake
 
     def test_sends_only_after_the_right_chat_opens(self):
-        result, fake = self._run("@Tizi Aziz - Discord")
+        result, fake = self._run("@Tizi aziz - Discord")
         self.assertIn("Sent", result)
         fake.write.assert_called_with("hi", interval=0.03)
 
@@ -571,6 +583,49 @@ class SendMessageTests(unittest.TestCase):
         result, fake = self._run("#polls | KeyMau Esports - Discord")
         self.assertIn("Nothing was sent", result)
         self.assertNotIn(unittest.mock.call("hi", interval=0.03), fake.write.call_args_list)
+
+
+class SkillMemoryTests(unittest.TestCase):
+    def test_remembers_and_recalls_similar_tasks_only(self):
+        with tempfile.TemporaryDirectory() as folder, patch("assistant.SKILLS_PATH", Path(folder) / "skills.json"):
+            remember_skill("open youtube in safari", ["open Safari", "press command+l", "type 'youtube.com'"])
+            self.assertIn("press command+l", recall_skills("open youtube.com in Safari please"))
+            self.assertEqual(recall_skills("set the volume to 30"), "")
+
+
+class ClipboardToolTests(unittest.TestCase):
+    def test_copy_then_read(self):
+        assistant = DesktopAssistant()
+        with patch("assistant.subprocess.run") as run, redirect_stdout(io.StringIO()):
+            run.return_value = MagicMock(stdout="hello")
+            self.assertIn("Copied 5", assistant.run_tool("clipboard", {"action": "copy", "text": "hello"}))
+            self.assertIn("hello", assistant.run_tool("clipboard", {"action": "read"}))
+        self.assertEqual(run.call_args_list[0][0][0], ["pbcopy"])
+
+
+class AppManagementTests(unittest.TestCase):
+    def test_uninstall_always_asks_even_when_autonomous(self):
+        assistant = DesktopAssistant(autonomous=True)
+        with patch("assistant.Path.exists", return_value=True), \
+                patch("builtins.input", return_value="n") as prompt, \
+                patch("assistant.subprocess.run") as run, redirect_stdout(io.StringIO()):
+            result = assistant.uninstall_app("Chess")
+        prompt.assert_called_once()
+        run.assert_not_called()
+        self.assertIn("nothing was removed", result)
+
+    def test_refuses_to_remove_itself(self):
+        with patch("assistant.Path.exists", return_value=True), redirect_stdout(io.StringIO()):
+            self.assertIn("cannot be uninstalled", DesktopAssistant().uninstall_app("Finder"))
+
+
+class WrittenToolCallTests(unittest.TestCase):
+    def test_parses_a_tool_call_written_as_text(self):
+        from assistant import CHAT_TOOLS
+        calls = written_tool_call("clipboard(action=copy, text=banana)", CHAT_TOOLS)
+        self.assertEqual(calls[0]["function"], {"name": "clipboard", "arguments": {"action": "copy", "text": "banana"}})
+        self.assertEqual(written_tool_call("I think clipboard(x) is neat", CHAT_TOOLS), [])
+        self.assertEqual(written_tool_call("rm_rf(path=/)", CHAT_TOOLS), [])
 
 
 if __name__ == "__main__":

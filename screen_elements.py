@@ -131,6 +131,53 @@ def press_matching(app_name: str, matches) -> str:
     return ""
 
 
+def _app_element(app_name: str):
+    import ApplicationServices as AS
+    from AppKit import NSWorkspace
+
+    for app in NSWorkspace.sharedWorkspace().runningApplications():
+        if (app.localizedName() or "").lower() == app_name.lower():
+            element = AS.AXUIElementCreateApplication(app.processIdentifier())
+            # Chromium/Electron apps (Chrome, Discord, ChatGPT) only expose page content
+            # to Accessibility once a client asks for it.
+            AS.AXUIElementSetAttributeValue(element, "AXManualAccessibility", True)
+            return element
+    return None
+
+
+def read_app(app_name: str, max_chars: int = 6000) -> tuple[str, list[dict[str, str]]]:
+    """Visible text and links of an app's front window, in reading order."""
+    try:
+        element = _app_element(app_name)
+    except ImportError:
+        return "", []
+    if element is None:
+        return "", []
+    window = _attribute(element, "AXFocusedWindow") or (_attribute(element, "AXWindows") or [None])[0]
+    if window is None:
+        return "", []
+    texts: list[str] = []
+    links: list[dict[str, str]] = []
+    size, visited, stack = 0, 0, [window]
+    while stack and size < max_chars and visited < 20000:
+        node = stack.pop()
+        visited += 1
+        role = _attribute(node, "AXRole")
+        if role == "AXLink":
+            url = _attribute(node, "AXURL")
+            label = " ".join(str(_attribute(node, "AXTitle") or _attribute(node, "AXDescription") or "").split())
+            if url is not None and label:
+                links.append({"title": label[:150], "url": str(url)})
+        elif role in {"AXStaticText", "AXHeading", "AXTextArea", "AXTextField"}:
+            value = _attribute(node, "AXValue") or _attribute(node, "AXTitle") or _attribute(node, "AXDescription")
+            text = " ".join(str(value or "").split())
+            if text and (not texts or texts[-1] != text):
+                texts.append(text)
+                size += len(text) + 1
+        stack.extend(reversed(list(_attribute(node, "AXChildren") or [])))
+    return "\n".join(texts)[:max_chars], links
+
+
 def frontmost_elements(screen_size: tuple[int, int]) -> tuple[str, list[dict]]:
     """Return (app name, controls) for the frontmost app, in reading order.
 
