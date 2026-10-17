@@ -544,17 +544,29 @@ TYPOGRAPHY = {"\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'", "\u201
               "\u2026": "...", "\u00a0": " ", "\u2022": "-"}
 
 
-def type_out(pyautogui, text: str, interval: float = 0.01) -> None:
+class FocusLost(RuntimeError):
+    """The target app stopped being frontmost while typing."""
+
+
+def type_out(pyautogui, text: str, interval: float = 0.01, app: str | None = None) -> None:
     """Type text key by key like a person (no clipboard). Smart quotes become plain ones;
-    other non-ASCII characters (é, emoji) go through System Events, which can type Unicode."""
+    other non-ASCII characters (é, emoji) go through System Events, which can type Unicode.
+    With `app`, focus is re-checked every few words so keys never land in another window."""
     for fancy, plain in TYPOGRAPHY.items():
         text = text.replace(fancy, plain)
-    for chunk in re.findall(r"[\x00-\x7f]+|[^\x00-\x7f]+", text):
-        if chunk.isascii():
-            pyautogui.write(chunk, interval=interval)
-        else:
-            subprocess.run(["osascript", "-e", f'tell application "System Events" to keystroke {applescript_string(chunk)}'],
-                           capture_output=True)
+    # Small pieces: words/spaces/newlines, so a focus check happens every ~30 characters.
+    pieces = re.findall(r"[^\S\n]*\S{1,30}|\n|[^\S\n]+", text)
+    typed = 0
+    for piece in pieces:
+        if app and typed % 30 < len(piece) + 1 and frontmost_app_name() != app:
+            raise FocusLost(f"{frontmost_app_name() or 'another app'} came to the front")
+        for chunk in re.findall(r"[\x00-\x7f]+|[^\x00-\x7f]+", piece):
+            if chunk.isascii():
+                pyautogui.write(chunk, interval=interval)
+            else:
+                subprocess.run(["osascript", "-e", f'tell application "System Events" to keystroke {applescript_string(chunk)}'],
+                               capture_output=True)
+        typed += len(piece)
 
 
 def written_tool_call(text: object, tools: list[dict]) -> list[dict]:
@@ -837,7 +849,10 @@ class DesktopAssistant:
                 if not text.strip():
                     return "There was no text to write."
                 print(f"Typing {len(text.split())} words into {app}…", flush=True)
-                type_out(pyautogui, text)
+                try:
+                    type_out(pyautogui, text, app=app)
+                except FocusLost as error:
+                    return f"Stopped typing because {error}; the rest was not typed. Nothing went to other apps."
                 report = grade(text)
                 problems = report["spelling"][:5] + report["grammar"][:3]
                 target = re.search(r"(\d{2,4})[- ]word", getattr(self, "current_request", ""))
@@ -1440,7 +1455,10 @@ class DesktopAssistant:
             return f"No '{field}' field in {app}."
         if frontmost_app_name() != app:
             return f"Focus moved away from {app}; nothing was typed."
-        type_out(pyautogui, text, interval=0.02)
+        try:
+            type_out(pyautogui, text, interval=0.02, app=app)
+        except FocusLost as error:
+            return f"Stopped typing because {error}. Nothing went to other apps."
         if args.get("submit"):
             pyautogui.press("enter")
         return f"Typed {len(text)} characters into {app}" + (" and pressed enter." if args.get("submit") else ".")

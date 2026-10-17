@@ -688,9 +688,21 @@ class TypingTests(unittest.TestCase):
         fake = MagicMock()
         with patch("assistant.subprocess.run") as run:
             type_out(fake, "\u201cHi\u201d \u2014 it\u2019s fine")
-        fake.write.assert_called_once_with('"Hi"  -  it\'s fine', interval=0.01)
+        self.assertEqual("".join(c.args[0] for c in fake.write.call_args_list), '"Hi"  -  it\'s fine')
         run.assert_not_called()  # no pbcopy, no Cmd+V
         fake.hotkey.assert_not_called()
+
+
+class FocusDuringTypingTests(unittest.TestCase):
+    def test_typing_stops_the_moment_focus_moves(self):
+        from assistant import FocusLost, type_out
+        fake = MagicMock()
+        fronts = iter(["TextEdit"] + ["Claude"] * 50)
+        with patch("assistant.frontmost_app_name", side_effect=lambda: next(fronts)):
+            with self.assertRaises(FocusLost):
+                type_out(fake, "Netflix has changed how people watch entertainment at home today.", app="TextEdit")
+        typed = "".join(call.args[0] for call in fake.write.call_args_list)
+        self.assertLess(len(typed), 40)  # stopped after the first few words
 
 
 if __name__ == "__main__":
