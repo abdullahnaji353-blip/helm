@@ -163,8 +163,8 @@ ANTHROPIC_API_KEY=... python assistant.py --chat "hello" --provider anthropic
 OPENAI_API_KEY=... python assistant.py --chat "hello" --provider openai --model gpt-5-mini
 ```
 
-`--cloud-vision` sends screen-control screenshots to the chosen cloud model
-(much more accurate than the small local model). `--no-web` turns off the
+`--check-key` verifies a key without chatting. `--cloud-vision` sends screen-control screenshots to the chosen cloud model
+(much more accurate than the small local model). `--disable-tools web_search` turns off the
 web search tool, which queries DuckDuckGo (optionally limited to YouTube or
 TikTok) and returns links.
 

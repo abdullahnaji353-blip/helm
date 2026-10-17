@@ -157,6 +157,8 @@ def anthropic_turn(model: str, key: str, messages: list[dict], tools: list[dict]
         params["fallbacks"] = "default"
     try:
         response = client.beta.messages.create(**params)
+    except TypeError as error:  # the SDK found no key, token or profile
+        raise RuntimeError("Add your Claude API key in Chatbot's settings.") from error
     except anthropic.AuthenticationError as error:
         raise RuntimeError("Claude rejected the API key. Update it in Chatbot's settings.") from error
     except anthropic.RateLimitError as error:
@@ -214,3 +216,50 @@ def openai_turn(provider: str, model: str, key: str, messages: list[dict], tools
             arguments = {}
         calls.append({"id": call["id"], "function": {"name": call["function"]["name"], "arguments": arguments}})
     return {"content": message.get("content") or "", "tool_calls": calls}
+
+
+def check_provider(provider: str, model: str, key: str, ollama_host: str) -> str:
+    """Cheap request that proves the key (and, where possible, the model) works. Raises RuntimeError."""
+    label = PROVIDERS[provider]["label"]
+    if provider == "ollama":
+        try:
+            with urlopen(f"{ollama_host}/api/tags", timeout=5) as response:
+                names = {m.get("name") for m in json.loads(response.read().decode("utf-8")).get("models", [])}
+        except (URLError, TimeoutError, ValueError) as error:
+            raise RuntimeError("Ollama is not running. Install it from ollama.com and open it.") from error
+        if model not in names and f"{model}:latest" not in names:
+            raise RuntimeError(f"Ollama is running but '{model}' is not installed. Run: ollama pull {model}")
+        return f"Ollama is running and {model} is installed."
+    if provider == "anthropic":
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=key) if key else anthropic.Anthropic()
+        try:
+            client.models.retrieve(model)
+        except TypeError as error:
+            raise RuntimeError("Paste your Claude API key first.") from error
+        except anthropic.AuthenticationError as error:
+            raise RuntimeError("Claude rejected this API key.") from error
+        except anthropic.NotFoundError as error:
+            raise RuntimeError(f"The key works, but Claude has no model named '{model}'.") from error
+        except anthropic.APIConnectionError as error:
+            raise RuntimeError("Could not reach Claude. Check your internet connection.") from error
+        except anthropic.APIStatusError as error:
+            raise RuntimeError(f"Claude API error {error.status_code}: {error.message}") from error
+        return f"Key works. Claude {model} is ready."
+    if not key:
+        raise RuntimeError(f"Paste your {label} API key first.")
+    request = Request(
+        PROVIDERS[provider]["url"].rsplit("/chat/completions", 1)[0] + "/models",
+        headers={"Authorization": f"Bearer {key}"},
+    )
+    try:
+        with urlopen(request, timeout=20):
+            pass
+    except HTTPError as error:
+        if error.code in {401, 403}:
+            raise RuntimeError(f"{label} rejected this API key.") from error
+        raise RuntimeError(f"{label} returned HTTP {error.code}.") from error
+    except (URLError, TimeoutError) as error:
+        raise RuntimeError(f"Could not reach {label}. Check your internet connection.") from error
+    return f"Key works. {label} is ready."

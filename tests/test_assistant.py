@@ -132,6 +132,13 @@ class DesktopTaskModeTests(unittest.TestCase):
         )
         self.screen_access_patch.start()
         self.addCleanup(self.screen_access_patch.stop)
+        for target, value in (
+            ("assistant.frontmost_elements", ("Test", [])), ("assistant.time.sleep", None),
+            ("assistant.frontmost_app_name", "Test"),
+        ):
+            patcher = patch(target, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         self.pyautogui = MagicMock()
         self.pyautogui.size.return_value = (100, 100)
         self.pyautogui.FailSafeException = Exception
@@ -476,6 +483,61 @@ class ProviderTests(unittest.TestCase):
 
     def test_parse_json_object_tolerates_prose_around_json(self):
         self.assertEqual(parse_json_object('Sure! ```json\n{"action": "done"}\n```'), {"action": "done"})
+
+
+class ElementClickTests(unittest.TestCase):
+    ELEMENTS = [{"id": 1, "role": "Button", "label": "7", "x": 402, "y": 722}]
+
+    def test_click_element_resolves_to_the_controls_centre(self):
+        action = validate_desktop_action(
+            {"action": "click_element", "id": 1, "reason": "press 7"}, (1440, 900), self.ELEMENTS
+        )
+        self.assertEqual((action["action"], action["x"], action["y"]), ("click", 402, 722))
+
+    def test_unknown_element_number_is_rejected(self):
+        with self.assertRaises(ValueError):
+            validate_desktop_action({"action": "click_element", "id": 9, "reason": "r"}, (1440, 900), self.ELEMENTS)
+        with self.assertRaises(ValueError):
+            validate_desktop_action({"action": "click_element", "id": True, "reason": "r"}, (1440, 900), self.ELEMENTS)
+
+
+class FocusGuardTests(unittest.TestCase):
+    def test_keys_are_not_sent_when_focus_moved_to_another_app(self):
+        assistant = DesktopAssistant(autonomous=True)
+        fake = MagicMock()
+        fake.size.return_value = (1440, 900)
+        actions = [
+            json.dumps({"action": "type", "text": "hello", "reason": "r"}),
+            json.dumps({"action": "done", "message": "stopped"}),
+        ]
+        with patch("assistant.screen_capture_access_available", return_value=True), \
+                patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
+                patch.object(assistant, "vision_chat", side_effect=actions), \
+                patch("assistant.frontmost_elements", return_value=("Calculator", [])), \
+                patch("assistant.frontmost_app_name", return_value="Code"), \
+                patch("assistant.mark_elements", side_effect=lambda image, _: image), \
+                redirect_stdout(io.StringIO()) as output:
+            assistant.desktop_task("Type hello in Calculator")
+        fake.write.assert_not_called()
+        self.assertIn("Code is in front now", output.getvalue())
+
+
+class RepeatGuardTests(unittest.TestCase):
+    def test_same_action_three_times_stops_the_task(self):
+        assistant = DesktopAssistant(autonomous=True)
+        fake = MagicMock()
+        fake.size.return_value = (1440, 900)
+        scroll = json.dumps({"action": "scroll", "direction": "down", "amount": 3, "reason": "look"})
+        with patch("assistant.screen_capture_access_available", return_value=True), \
+                patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
+                patch.object(assistant, "vision_chat", side_effect=[scroll] * 5), \
+                patch("assistant.frontmost_elements", return_value=("Safari", [])), \
+                patch("assistant.frontmost_app_name", return_value="Safari"), \
+                patch("assistant.mark_elements", side_effect=lambda image, _: image), \
+                patch("assistant.time.sleep"), redirect_stdout(io.StringIO()):
+            result = assistant.desktop_task("Scroll forever")
+        self.assertIn("kept repeating", result)
+        self.assertEqual(fake.scroll.call_count, 2)
 
 
 if __name__ == "__main__":

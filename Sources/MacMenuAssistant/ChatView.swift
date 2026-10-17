@@ -2,6 +2,7 @@ import AVFoundation
 import AppKit
 import ApplicationServices
 import Security
+import Speech
 import SwiftUI
 
 private let jarvisCyan = Color(red: 0.30, green: 0.85, blue: 1.0)
@@ -84,14 +85,93 @@ final class ChatController: ObservableObject {
     @Published var provider = UserDefaults.standard.string(forKey: "provider") ?? "ollama" {
         didSet { UserDefaults.standard.set(provider, forKey: "provider") }
     }
-    @Published var webAccess = UserDefaults.standard.object(forKey: "webAccess") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(webAccess, forKey: "webAccess") }
+    /// Chat tools the user switched off (names match CHAT_TOOLS in assistant.py).
+    @Published var disabledTools = Set(UserDefaults.standard.stringArray(forKey: "disabledTools") ?? []) {
+        didSet { UserDefaults.standard.set(Array(disabledTools), forKey: "disabledTools") }
     }
+    @Published var voiceHotkey = UserDefaults.standard.object(forKey: "voiceHotkey") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(voiceHotkey, forKey: "voiceHotkey") }
+    }
+    @Published var keyCheck: (ok: Bool, message: String)?
+    @Published var isCheckingKey = false
     @Published var cloudVision = UserDefaults.standard.bool(forKey: "cloudVision") {
         didSet { UserDefaults.standard.set(cloudVision, forKey: "cloudVision") }
     }
-    @Published var onboarded = UserDefaults.standard.bool(forKey: "onboarded") {
+    @Published var onboarded = !ChatController.isFirstRun() {
         didSet { UserDefaults.standard.set(onboarded, forKey: "onboarded") }
+    }
+
+    private static var supportDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Local Desktop Assistant", isDirectory: true)
+    }
+
+    /// First run only if nothing of Chatbot exists on this Mac yet: no setup flag, no
+    /// setup marker (survives preference resets), no saved keys and no chat history.
+    static func isFirstRun() -> Bool {
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: "onboarded") { return false }
+        let returning = FileManager.default.fileExists(atPath: supportDirectory.appendingPathComponent("setup-complete.json").path)
+            || FileManager.default.fileExists(atPath: supportDirectory.appendingPathComponent("chat_history.json").path)
+            || ProviderOption.all.contains { KeyStore.read($0.id) != nil }
+        if returning { defaults.set(true, forKey: "onboarded") }
+        return !returning
+    }
+
+    func completeSetup() {
+        let info: [String: Any] = [
+            "completedAt": ISO8601DateFormatter().string(from: Date()),
+            "version": Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev",
+        ]
+        try? FileManager.default.createDirectory(at: Self.supportDirectory, withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: info) {
+            try? data.write(to: Self.supportDirectory.appendingPathComponent("setup-complete.json"))
+        }
+        onboarded = true
+        configureVoice()
+        let greeting = "All systems online. How can I help?"
+        lines.append(ChatLine(role: .bot, text: greeting))
+        speak(greeting)
+    }
+
+    func isEnabled(_ tools: [String]) -> Bool { !tools.contains { disabledTools.contains($0) } }
+
+    func setEnabled(_ tools: [String], _ enabled: Bool) {
+        if enabled { disabledTools.subtract(tools) } else { disabledTools.formUnion(tools) }
+    }
+
+    /// Runs `assistant.py --check-key` for the selected brain.
+    func checkKey() {
+        isCheckingKey = true
+        keyCheck = nil
+        var arguments = ["--check-key", "--provider", provider]
+        if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
+        let child = Process()
+        let output = Pipe()
+        child.executableURL = projectRoot.appendingPathComponent(".venv/bin/python")
+        child.arguments = ["-u", projectRoot.appendingPathComponent("assistant.py").path] + arguments
+        child.currentDirectoryURL = projectRoot
+        child.standardOutput = output
+        child.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        if provider != "ollama", let key = KeyStore.read(provider) { environment["CHATBOT_API_KEY"] = key }
+        child.environment = environment
+        child.terminationHandler = { [weak self] _ in
+            let text = String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let line = text.components(separatedBy: .newlines).last { $0.hasPrefix("KEY_OK:") || $0.hasPrefix("KEY_ERROR:") }
+            DispatchQueue.main.async {
+                self?.isCheckingKey = false
+                if let line, line.hasPrefix("KEY_OK:") {
+                    self?.keyCheck = (true, String(line.dropFirst("KEY_OK:".count)))
+                } else {
+                    self?.keyCheck = (false, line.map { String($0.dropFirst("KEY_ERROR:".count)) } ?? "The check failed. See Console for details.")
+                }
+            }
+        }
+        do { try child.run() } catch {
+            isCheckingKey = false
+            keyCheck = (false, "Could not start the check: \(error.localizedDescription)")
+        }
     }
     @Published var showProviderSettings = false
     @Published var savedKeys = Set(ProviderOption.all.compactMap { KeyStore.read($0.id) == nil ? nil : $0.id })
@@ -147,7 +227,7 @@ final class ChatController: ObservableObject {
     }
 
     func configureVoice() {
-        guard !voiceConfigured else { return }
+        guard onboarded, !voiceConfigured else { return }  // no permission prompts before setup
         voiceConfigured = true
         voice.onStatusChange = { [weak self] listening, status in
             self?.isListening = listening
@@ -163,10 +243,13 @@ final class ChatController: ObservableObject {
             self?.draft = transcript
             self?.send()
         }
-        voice.installHotkey()
+        if voiceHotkey { voice.installHotkey() }
     }
 
-    func toggleVoice() { voice.toggleCapture() }
+    func toggleVoice() {
+        configureVoice()
+        voice.toggleCapture()
+    }
 
     func send() {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -175,7 +258,7 @@ final class ChatController: ObservableObject {
         lines.append(ChatLine(role: .user, text: text))
         var arguments = ["--chat", text, "--autonomy", askBeforeActing ? "approval" : "autonomous", "--provider", provider]
         if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
-        if !webAccess { arguments.append("--no-web") }
+        if !disabledTools.isEmpty { arguments += ["--disable-tools", disabledTools.sorted().joined(separator: ",")] }
         if cloudVision { arguments.append("--cloud-vision") }
         launch(arguments)
     }
@@ -298,7 +381,7 @@ final class ChatController: ObservableObject {
         isThinking = false
     }
 
-    private func speak(_ text: String) {
+    func speak(_ text: String) {
         guard speakReplies else { return }
         let utterance = AVSpeechUtterance(string: text)
         utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
@@ -664,17 +747,7 @@ struct HUDView: View {
         .preferredColorScheme(.dark)
         .frame(minWidth: 820, minHeight: 560)
         .sheet(isPresented: $chat.showProviderSettings) {
-            VStack(alignment: .leading, spacing: 16) {
-                ProviderSettingsView()
-                HStack {
-                    Spacer()
-                    Button("Done") { chat.showProviderSettings = false }
-                        .keyboardShortcut(.defaultAction)
-                }
-            }
-            .padding(24)
-            .frame(width: 520)
-            .preferredColorScheme(.dark)
+            SettingsView().preferredColorScheme(.dark)
         }
         .onAppear { chat.configureVoice() }
     }
@@ -718,7 +791,7 @@ struct HUDView: View {
             Spacer()
             VStack(alignment: .leading, spacing: 6) {
                 telemetry("BRAIN", chat.brainLabel)
-                telemetry("WEB ACCESS", chat.webAccess ? "ON" : "OFF")
+                telemetry("WEB ACCESS", chat.isEnabled(["web_search"]) ? "ON" : "OFF")
                 telemetry("SCREEN CONTROL", chat.askBeforeActing ? "ASK FIRST" : "FULL AUTONOMY")
                 telemetry("VOICE", chat.speakReplies ? "ON" : "MUTED")
             }
@@ -752,7 +825,7 @@ struct HUDView: View {
                 .font(.system(size: 11, design: .monospaced))
                 .help("When on, Chatbot clicks and types without asking first.")
                 Menu {
-                    Button("AI model & API keys…") { chat.showProviderSettings = true }
+                    Button("Settings (brain, abilities, permissions)…") { chat.showProviderSettings = true }
                     Toggle("Speak replies", isOn: $chat.speakReplies)
                     Button("New chat") { chat.newChat() }
                     Button("Permissions & MCP tools…") { showAdvanced = true }
@@ -1094,14 +1167,24 @@ struct ProviderSettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Divider()
-            Toggle("Web access (search the web, YouTube and TikTok via DuckDuckGo)", isOn: $chat.webAccess)
-                .font(.system(size: 12))
-            Toggle("Use this brain for screen control (sends screenshots to it)", isOn: $chat.cloudVision)
-                .font(.system(size: 12))
-                .disabled(chat.provider == "ollama")
-                .help("Cloud models are far better at clicking the right spot than the local model.")
+            HStack(spacing: 10) {
+                Button {
+                    chat.checkKey()
+                } label: {
+                    Label(option.id == "ollama" ? "Check Ollama" : "Test key", systemImage: "bolt.horizontal.circle")
+                }
+                .disabled(chat.isCheckingKey || (option.id != "ollama" && !chat.savedKeys.contains(option.id)))
+                if chat.isCheckingKey {
+                    ProgressView().controlSize(.small)
+                } else if let result = chat.keyCheck {
+                    Label(result.message, systemImage: result.ok ? "checkmark.seal.fill" : "xmark.octagon.fill")
+                        .font(.system(size: 11))
+                        .foregroundStyle(result.ok ? .green : .orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
+        .onChange(of: chat.provider) { _ in chat.keyCheck = nil }
     }
 
     private func save(_ option: ProviderOption) {
@@ -1114,125 +1197,377 @@ struct ProviderSettingsView: View {
     }
 }
 
-// MARK: - First launch
+// MARK: - Abilities
 
-/// Shown once: what Chatbot is, which brain to use, and the macOS permissions it needs.
-struct OnboardingView: View {
+private struct Ability: Identifiable {
+    let id: String
+    let title: String
+    let detail: String
+    let symbol: String
+    let tools: [String]
+
+    static let all = [
+        Ability(id: "screen", title: "Screen control", detail: "Clicks, types and finds its way around apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen"]),
+        Ability(id: "web", title: "Web, YouTube & TikTok", detail: "Searches the web and finds video examples", symbol: "magnifyingglass", tools: ["web_search"]),
+        Ability(id: "apps", title: "Apps & websites", detail: "Opens any app or website you name", symbol: "square.grid.2x2", tools: ["open_app", "open_url"]),
+        Ability(id: "media", title: "Music & volume", detail: "Plays, pauses and skips in Spotify or Music", symbol: "music.note", tools: ["media_control", "set_volume"]),
+        Ability(id: "status", title: "Time & battery", detail: "Tells you the date, time and battery level", symbol: "battery.75percent", tools: ["system_status"]),
+    ]
+}
+
+struct AbilitiesView: View {
     @EnvironmentObject private var chat: ChatController
-    @State private var step = 0
-    @State private var micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-    @State private var screenGranted = CGPreflightScreenCaptureAccess()
-    @State private var axGranted = AXIsProcessTrusted()
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                ForEach(0..<3) { index in
-                    Capsule()
-                        .fill(index <= step ? jarvisCyan : Color.white.opacity(0.15))
-                        .frame(width: index == step ? 28 : 10, height: 4)
+        VStack(alignment: .leading, spacing: 18) {
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+                ForEach(Ability.all) { ability in
+                    let enabled = chat.isEnabled(ability.tools)
+                    Button {
+                        chat.setEnabled(ability.tools, !enabled)
+                    } label: {
+                        HStack(alignment: .top, spacing: 12) {
+                            Image(systemName: ability.symbol)
+                                .font(.system(size: 18))
+                                .foregroundStyle(enabled ? jarvisCyan : .secondary)
+                                .frame(width: 26)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(ability.title).font(.system(size: 13, weight: .semibold))
+                                Text(ability.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            Spacer(minLength: 0)
+                            Image(systemName: enabled ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle(enabled ? jarvisCyan : .secondary)
+                        }
+                        .padding(12)
+                        .frame(maxWidth: .infinity, minHeight: 70, alignment: .topLeading)
+                        .background(enabled ? jarvisCyan.opacity(0.08) : Color.white.opacity(0.03))
+                        .overlay(HUDBrackets(color: enabled ? jarvisCyan : .gray.opacity(0.4)))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(ability.title), \(enabled ? "on" : "off")")
                 }
             }
-            .padding(.top, 24)
-            .animation(.easeInOut, value: step)
-
-            Group {
-                switch step {
-                case 0: welcome
-                case 1: ProviderSettingsView().frame(maxWidth: 560)
-                default: permissions
-                }
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .padding(.horizontal, 40)
-
-            HStack {
-                if step > 0 {
-                    Button("Back") { step -= 1 }
-                }
-                Spacer()
-                Button(step == 2 ? "Launch Chatbot" : "Continue") {
-                    if step == 2 { chat.onboarded = true } else { step += 1 }
-                }
-                .buttonStyle(.borderedProminent)
-                .tint(jarvisCyan)
-                .keyboardShortcut(.defaultAction)
-            }
-            .padding(28)
-        }
-    }
-
-    private var welcome: some View {
-        VStack(spacing: 18) {
-            Reactor(active: false, listening: false).frame(width: 170, height: 170)
-            Text("Meet Chatbot")
-                .font(.system(size: 34, weight: .light))
-            Text("Your Jarvis-style assistant for this Mac.")
-                .foregroundStyle(.secondary)
             VStack(alignment: .leading, spacing: 10) {
-                feature("waveform", "Talk to it — hold Control+Option or click the reactor")
-                feature("cursorarrow.click.2", "Opens apps and websites, and drives the mouse and keyboard")
-                feature("magnifyingglass", "Searches the web, YouTube and TikTok for examples")
-                feature("music.note", "Controls your music, volume, and tells you the time and battery")
-                feature("key", "Runs free on your Mac, or plug in Claude, ChatGPT, Gemini or OpenRouter")
+                Text("BEHAVIOUR")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .tracking(2)
+                    .foregroundStyle(.secondary)
+                Toggle("Voice shortcut — hold Control+Option to talk", isOn: $chat.voiceHotkey)
+                Toggle("Speak replies out loud", isOn: $chat.speakReplies)
+                Toggle("Full autonomy — act on the screen without asking first", isOn: Binding(
+                    get: { !chat.askBeforeActing }, set: { chat.askBeforeActing = !$0 }
+                ))
+                Toggle("Let the cloud brain drive the screen (sends screenshots to it; much more accurate)", isOn: $chat.cloudVision)
+                    .disabled(chat.provider == "ollama")
             }
-            .padding(.top, 8)
+            .font(.system(size: 12))
         }
     }
+}
 
-    private func feature(_ symbol: String, _ text: String) -> some View {
-        Label {
-            Text(text).font(.system(size: 13))
-        } icon: {
-            Image(systemName: symbol).foregroundStyle(jarvisCyan).frame(width: 22)
-        }
-    }
+// MARK: - Permissions
 
-    private var permissions: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Give Chatbot its powers")
-                .font(.system(size: 26, weight: .light))
-            Text("macOS asks you to approve each one. You can change them later in System Settings → Privacy & Security.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            permissionRow("mic.fill", "Microphone", "So you can talk to it", micGranted) {
-                AVCaptureDevice.requestAccess(for: .audio) { granted in
-                    DispatchQueue.main.async { micGranted = granted }
+struct PermissionsView: View {
+    @EnvironmentObject private var chat: ChatController
+
+    var body: some View {
+        // Re-read every second so rows turn green as soon as the user flips a switch.
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            VStack(alignment: .leading, spacing: 10) {
+                row("mic.fill", "Microphone", "Hear you when you talk to it",
+                    AVCaptureDevice.authorizationStatus(for: .audio) == .authorized) {
+                    AVCaptureDevice.requestAccess(for: .audio) { _ in }
                 }
+                row("text.bubble", "Speech Recognition", "Turn your voice into text, on this Mac",
+                    SFSpeechRecognizer.authorizationStatus() == .authorized) {
+                    SFSpeechRecognizer.requestAuthorization { _ in }
+                }
+                if chat.voiceHotkey {
+                    row("keyboard", "Input Monitoring", "Notice when you hold Control+Option",
+                        CGPreflightListenEventAccess()) {
+                        _ = CGRequestListenEventAccess()
+                    }
+                }
+                if chat.isEnabled(["control_screen"]) {
+                    row("rectangle.dashed.badge.record", "Screen Recording", "See the screen it is controlling",
+                        CGPreflightScreenCaptureAccess()) {
+                        _ = CGRequestScreenCaptureAccess()
+                    }
+                    row("hand.point.up.left.fill", "Accessibility", "Click, type and read buttons for you",
+                        AXIsProcessTrusted()) {
+                        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
+                        _ = AXIsProcessTrustedWithOptions(options)
+                    }
+                }
+                if chat.isEnabled(["media_control"]) {
+                    Label("Music control: macOS asks once, the first time you ask Chatbot to play something.", systemImage: "info.circle")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .padding(.top, 4)
+                }
+                Button("Open Privacy & Security settings") {
+                    if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+                .font(.system(size: 11))
+                .padding(.top, 4)
             }
-            permissionRow("rectangle.dashed.badge.record", "Screen Recording", "So it can see the screen it controls", screenGranted) {
-                screenGranted = CGRequestScreenCaptureAccess()
-            }
-            permissionRow("hand.point.up.left.fill", "Accessibility", "So it can click and type for you", axGranted) {
-                let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-                axGranted = AXIsProcessTrustedWithOptions(options)
-            }
-            Button("Refresh status") {
-                micGranted = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
-                screenGranted = CGPreflightScreenCaptureAccess()
-                axGranted = AXIsProcessTrusted()
-            }
-            .font(.system(size: 11))
         }
-        .frame(maxWidth: 560)
     }
 
-    private func permissionRow(_ symbol: String, _ title: String, _ detail: String, _ granted: Bool, request: @escaping () -> Void) -> some View {
+    private func row(_ symbol: String, _ title: String, _ detail: String, _ granted: Bool, request: @escaping () -> Void) -> some View {
         HStack(spacing: 14) {
-            Image(systemName: symbol).font(.system(size: 18)).foregroundStyle(jarvisCyan).frame(width: 28)
+            Image(systemName: symbol).font(.system(size: 17)).foregroundStyle(granted ? .green : jarvisCyan).frame(width: 26)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 13, weight: .semibold))
                 Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
             if granted {
-                Label("Allowed", systemImage: "checkmark.circle.fill").foregroundStyle(.green).font(.system(size: 12))
+                Label("Allowed", systemImage: "checkmark.circle.fill").font(.system(size: 12)).foregroundStyle(.green)
             } else {
                 Button("Allow", action: request)
             }
         }
+        .padding(11)
+        .background(Color.white.opacity(0.03))
+        .overlay(HUDBrackets(color: granted ? .green.opacity(0.7) : jarvisCyan))
+    }
+}
+
+// MARK: - First launch
+
+/// Shown only on a genuine first run (see ChatController.isFirstRun) or via "Run setup again".
+struct OnboardingView: View {
+    @EnvironmentObject private var chat: ChatController
+    @State private var step = 0
+
+    private let steps = [
+        ("Welcome", "Meet Chatbot"),
+        ("Brain", "AI model & API key"),
+        ("Abilities", "What it can do"),
+        ("Permissions", "What macOS allows"),
+        ("Launch", "All systems go"),
+    ]
+
+    var body: some View {
+        HStack(spacing: 0) {
+            rail.frame(width: 260)
+            Rectangle().fill(jarvisCyan.opacity(0.15)).frame(width: 1)
+            VStack(spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        Text(title).font(.system(size: 30, weight: .light))
+                        Text(subtitle).font(.system(size: 13)).foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        content.padding(.top, 6)
+                    }
+                    .frame(maxWidth: 640, alignment: .leading)
+                    .padding(40)
+                    .frame(maxWidth: .infinity)
+                }
+                .id(step)
+                .transition(.asymmetric(insertion: .move(edge: .trailing).combined(with: .opacity), removal: .opacity))
+                navigation
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: step)
+    }
+
+    private var rail: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                Orb(active: false, size: 26)
+                Text("CHATBOT")
+                    .font(.system(size: 12, weight: .bold, design: .monospaced))
+                    .tracking(3)
+                    .foregroundStyle(jarvisCyan)
+                    .fixedSize()
+            }
+            .padding(.bottom, 34)
+            ForEach(Array(steps.enumerated()), id: \.offset) { index, item in
+                HStack(spacing: 12) {
+                    ZStack {
+                        Circle()
+                            .strokeBorder(index <= step ? jarvisCyan : Color.white.opacity(0.2), lineWidth: 1.5)
+                            .background(Circle().fill(index < step ? jarvisCyan : .clear))
+                        if index < step {
+                            Image(systemName: "checkmark").font(.system(size: 10, weight: .bold)).foregroundStyle(.black)
+                        } else {
+                            Text("\(index + 1)").font(.system(size: 11, weight: .semibold, design: .monospaced))
+                                .foregroundStyle(index == step ? jarvisCyan : .secondary)
+                        }
+                    }
+                    .frame(width: 24, height: 24)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(item.0).font(.system(size: 13, weight: index == step ? .semibold : .regular))
+                            .foregroundStyle(index <= step ? .primary : .secondary)
+                        Text(item.1).font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 10)
+                .contentShape(Rectangle())
+                .onTapGesture { if index < step { step = index } }
+            }
+            Spacer()
+            Text("You can change all of this later in Settings.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .padding(28)
+        .background(Color.black.opacity(0.25))
+    }
+
+    private var title: String {
+        ["Meet Chatbot", "Choose its brain", "Pick its abilities", "Give it permission", "All systems online"][step]
+    }
+
+    private var subtitle: String {
+        [
+            "A Jarvis-style assistant that talks, listens, searches and works your Mac for you.",
+            "Run free and private on this Mac with Ollama, or plug in a cloud AI with your own API key. Cloud models are smarter and much better at controlling the screen.",
+            "Turn on only what you want. Anything off is never offered to the AI.",
+            "macOS asks you to approve each one. Rows turn green as soon as you allow them.",
+            "Here's how Chatbot is set up. Hold Control+Option and say something, or type below.",
+        ][step]
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        switch step {
+        case 0: welcome
+        case 1: ProviderSettingsView()
+        case 2: AbilitiesView()
+        case 3: PermissionsView()
+        default: summary
+        }
+    }
+
+    private var welcome: some View {
+        HStack(alignment: .center, spacing: 34) {
+            Reactor(active: true, listening: false).frame(width: 200, height: 200)
+            VStack(alignment: .leading, spacing: 12) {
+                feature("waveform", "Talk to it", "Hold Control+Option, or click the reactor")
+                feature("cursorarrow.click.2", "Works your Mac", "Opens apps, clicks and types for you")
+                feature("magnifyingglass", "Searches for you", "The web, YouTube and TikTok")
+                feature("music.note", "Runs the room", "Music, volume, time and battery")
+                feature("key", "Your choice of brain", "Local, Claude, ChatGPT, Gemini or OpenRouter")
+            }
+        }
+    }
+
+    private func feature(_ symbol: String, _ title: String, _ detail: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: symbol).foregroundStyle(jarvisCyan).frame(width: 22)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 13, weight: .semibold))
+                Text(detail).font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var summary: some View {
+        let enabled = Ability.all.filter { chat.isEnabled($0.tools) }
+        return VStack(alignment: .leading, spacing: 12) {
+            summaryRow("cpu", "Brain", chat.brainLabel)
+            summaryRow("square.stack.3d.up", "Abilities", enabled.isEmpty ? "Chat only" : enabled.map(\.title).joined(separator: ", "))
+            summaryRow("hand.raised", "Screen actions", chat.askBeforeActing ? "Asks before each step" : "Full autonomy")
+            summaryRow("waveform", "Voice", chat.voiceHotkey ? "Hold Control+Option" : "Mic button only")
+            Text("TRY SAYING")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
+                .padding(.top, 10)
+            ForEach(["“Find TikTok videos about latte art”", "“Open Safari and go to youtube.com”", "“Play some music and set the volume to 30”"], id: \.self) {
+                Text($0).font(.system(size: 13, design: .monospaced)).foregroundStyle(jarvisCyan)
+            }
+        }
+    }
+
+    private func summaryRow(_ symbol: String, _ title: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: symbol).foregroundStyle(jarvisCyan).frame(width: 22)
+            Text(title).font(.system(size: 13, weight: .semibold)).frame(width: 110, alignment: .leading)
+            Text(value).font(.system(size: 13)).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
         .padding(12)
-        .background(Color.white.opacity(0.04))
-        .overlay(HUDBrackets(color: granted ? .green : jarvisCyan))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.03))
+        .overlay(HUDBrackets())
+    }
+
+    private var needsKey: Bool { chat.provider != "ollama" && !chat.savedKeys.contains(chat.provider) }
+
+    private var navigation: some View {
+        HStack {
+            if step > 0 {
+                Button("Back") { step -= 1 }
+            }
+            Spacer()
+            if step == 1 && needsKey {
+                Text("Save a key, or pick Local to continue.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.orange)
+            }
+            Button(step == steps.count - 1 ? "Launch Chatbot" : "Continue") {
+                if step == steps.count - 1 { chat.completeSetup() } else { step += 1 }
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(jarvisCyan)
+            .keyboardShortcut(.defaultAction)
+            .disabled(step == 1 && needsKey)
+        }
+        .padding(.horizontal, 32)
+        .padding(.vertical, 18)
+        .background(Color.black.opacity(0.2))
+    }
+}
+
+// MARK: - Settings
+
+struct SettingsView: View {
+    @EnvironmentObject private var chat: ChatController
+    @State private var tab = 0
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $tab) {
+                Text("Brain").tag(0)
+                Text("Abilities").tag(1)
+                Text("Permissions").tag(2)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .padding(20)
+            ScrollView {
+                Group {
+                    switch tab {
+                    case 0: ProviderSettingsView()
+                    case 1: AbilitiesView()
+                    default: PermissionsView()
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 20)
+            }
+            HStack {
+                Button("Run setup again") {
+                    chat.showProviderSettings = false
+                    chat.onboarded = false
+                }
+                Spacer()
+                Button("Done") { chat.showProviderSettings = false }
+                    .buttonStyle(.borderedProminent)
+                    .tint(jarvisCyan)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(20)
+        }
+        .frame(width: 660, height: 640)
     }
 }
