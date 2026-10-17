@@ -1535,6 +1535,9 @@ struct AbilitiesView: View {
                 .frame(maxWidth: 420)
                 Toggle("Voice shortcut — hold Control+Option to talk", isOn: $chat.voiceHotkey)
                 Toggle("Speak replies out loud", isOn: $chat.speakReplies)
+                Toggle("Cursor buddy — a little Helm next to your mouse that shows what's happening", isOn: Binding(
+                    get: { AgentCursor.shared.buddyEnabled }, set: { AgentCursor.shared.buddyEnabled = $0 }
+                ))
                 Toggle("Full autonomy — act on the screen without asking first", isOn: Binding(
                     get: { !chat.askBeforeActing }, set: { chat.askBeforeActing = !$0 }
                 ))
