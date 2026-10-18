@@ -717,6 +717,18 @@ final class ChatController: NSObject, ObservableObject {
         super.init()
         installAppShortcut()  // ready as soon as Helm launches
         DispatchQueue.main.async { AgentCursor.shared.start() }
+        DispatchQueue.main.async { [weak self] in self?.autoStartConfiguredBridges() }
+    }
+
+    /// Starts any bridge whose "start automatically" toggle is on. Each start method already
+    /// no-ops safely (just sets a status string) if its token/IDs aren't actually saved yet, so
+    /// a stale toggle from before a bridge was configured can't do anything harmful.
+    private func autoStartConfiguredBridges() {
+        let defaults = UserDefaults.standard
+        if defaults.bool(forKey: "whatsapp.auto-start") { startWhatsAppBridge() }
+        if defaults.bool(forKey: "telegram.auto-start") { startTelegramBridge() }
+        if defaults.bool(forKey: "discord.auto-start") { startDiscordBridge() }
+        if defaults.bool(forKey: "slack.auto-start") { startSlackBridge() }
     }
 
     /// helm://ask?q=... runs a command as if it were typed into Helm. Off unless the user enables
@@ -2661,6 +2673,7 @@ struct WhatsAppSettingsView: View {
     @AppStorage("whatsapp.owner-number") private var ownerNumber = ""
     @AppStorage("whatsapp.api-version") private var apiVersion = "v23.0"
     @AppStorage("whatsapp.notify-local-tasks") private var notifyLocalTasks = false
+    @AppStorage("whatsapp.auto-start") private var autoStart = false
     @State private var accessTokenDraft = ""
     @State private var appSecretDraft = ""
     @State private var verifyTokenDraft = ""
@@ -2720,6 +2733,8 @@ struct WhatsAppSettingsView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Toggle("Start automatically when Helm launches", isOn: $autoStart)
+                .font(.system(size: 12))
 
             HStack(spacing: 12) {
                 Button {
@@ -2778,6 +2793,7 @@ struct WhatsAppSettingsView: View {
 struct TelegramSettingsView: View {
     @EnvironmentObject private var chat: ChatController
     @AppStorage("telegram.owner-chat-id") private var ownerChatID = ""
+    @AppStorage("telegram.auto-start") private var autoStart = false
     @State private var tokenDraft = ""
     @State private var proxyDraft = ""
     @State private var saveStatus: String?
@@ -2821,6 +2837,8 @@ struct TelegramSettingsView: View {
                 .font(.system(size: 10))
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Toggle("Start automatically when Helm launches", isOn: $autoStart)
+                .font(.system(size: 12))
 
             HStack(spacing: 12) {
                 Button {
@@ -2883,6 +2901,7 @@ struct DiscordSettingsView: View {
     @EnvironmentObject private var chat: ChatController
     @AppStorage("discord.channel-id") private var channelID = ""
     @AppStorage("discord.owner-user-id") private var ownerUserID = ""
+    @AppStorage("discord.auto-start") private var autoStart = false
     @State private var tokenDraft = ""
     @State private var saveStatus: String?
 
@@ -2929,6 +2948,8 @@ struct DiscordSettingsView: View {
                     .foregroundStyle(chat.discordBridgeStatus.hasPrefix("Running") ? .green : .secondary)
                     .lineLimit(2)
             }
+            Toggle("Start automatically when Helm launches", isOn: $autoStart)
+                .font(.system(size: 12))
 
             GroupBox("Setup") {
                 VStack(alignment: .leading, spacing: 8) {
@@ -2962,6 +2983,7 @@ struct SlackSettingsView: View {
     @EnvironmentObject private var chat: ChatController
     @AppStorage("slack.channel-id") private var channelID = ""
     @AppStorage("slack.owner-user-id") private var ownerUserID = ""
+    @AppStorage("slack.auto-start") private var autoStart = false
     @State private var tokenDraft = ""
     @State private var saveStatus: String?
 
@@ -3008,6 +3030,8 @@ struct SlackSettingsView: View {
                     .foregroundStyle(chat.slackBridgeStatus.hasPrefix("Running") ? .green : .secondary)
                     .lineLimit(2)
             }
+            Toggle("Start automatically when Helm launches", isOn: $autoStart)
+                .font(.system(size: 12))
 
             GroupBox("Setup") {
                 VStack(alignment: .leading, spacing: 8) {
