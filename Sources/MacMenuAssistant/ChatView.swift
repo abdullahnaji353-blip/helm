@@ -1006,7 +1006,7 @@ final class ChatController: NSObject, ObservableObject {
     }
 
     /// Tools that must bring another app to the front.
-    private static let actingTools: Set<String> = [
+    fileprivate static let actingTools: Set<String> = [
         "open_app", "open_url", "send_message", "read_chat", "control_screen", "resume_task", "click_in_app", "menu_in_app",
         "type_in_app", "keys_in_app", "new_document", "paste_into_app", "web_search", "ask_chatgpt", "media_control",
     ]
@@ -1152,7 +1152,7 @@ final class ChatController: NSObject, ObservableObject {
         }
     }
 
-    private static let toolLabels = [
+    fileprivate static let toolLabels = [
         "open_app": "Opening app",
         "open_url": "Opening website",
         "set_volume": "Adjusting volume",
@@ -3521,8 +3521,11 @@ final class AgentRun: ObservableObject, Identifiable {
                 AgentCursor.shared.say("\(id): \(reply)")
             } else if line.hasPrefix("TOOL: ") {
                 let tool = line.dropFirst("TOOL: ".count).split(separator: " ").first.map(String.init) ?? ""
-                note(tool.replacingOccurrences(of: "_", with: " "))
-                NSApp.deactivate()
+                // Only step aside for tools that actually need another app frontmost — matching
+                // the main chat's behavior, instead of deactivating Helm on every tool call,
+                // which was needlessly yanking focus while agents ran "in the background."
+                if ChatController.actingTools.contains(tool) { NSApp.deactivate() }
+                note(ChatController.toolLabels[tool] ?? tool.replacingOccurrences(of: "_", with: " "))
             } else if line.hasPrefix("Error:") {
                 note(line)
                 failed = true
