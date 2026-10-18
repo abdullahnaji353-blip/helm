@@ -160,6 +160,9 @@ final class ChatController: NSObject, ObservableObject {
     @Published var dictating = false
     private var dictationBase = ""
     @Published var voiceStatus = "Hold ⌃⌥ to talk"
+    /// Set when a voice message was sent while the HUD window wasn't open, so the reply should
+    /// also go to the floating top-right toast, not just the (unseen) chat transcript.
+    private var pendingVoiceToast = false
     @Published var emergencyStopShortcutAvailable = false
     @Published var pendingApproval: String?
     @Published var askBeforeActing = UserDefaults.standard.object(forKey: "askBeforeActing") as? Bool ?? true {
@@ -815,6 +818,11 @@ final class ChatController: NSObject, ObservableObject {
         }
     }
 
+    /// Whether the main chat window is currently on screen — not just running in the menu bar.
+    var isHUDVisible: Bool {
+        NSApp.windows.first(where: { $0.title == "Helm" && !($0 is NSPanel) })?.isVisible == true
+    }
+
     func showHUD() {
         if #available(macOS 14.0, *) { NSApp.activate() } else { NSApp.activate(ignoringOtherApps: true) }
         if let window = NSApp.windows.first(where: { $0.title == "Helm" && !($0 is NSPanel) }) {
@@ -918,6 +926,10 @@ final class ChatController: NSObject, ObservableObject {
                 self.dictating = false
             } else {
                 self.draft = transcript
+                if !self.isHUDVisible {
+                    self.pendingVoiceToast = true
+                    VoiceToast.shared.show(you: transcript)
+                }
                 self.send()
             }
         }
@@ -1131,12 +1143,17 @@ final class ChatController: NSObject, ObservableObject {
         for line in parts.dropLast() where !line.trimmingCharacters(in: .whitespaces).isEmpty {
             if line.hasPrefix("APPROVAL_REQUIRED: ") {
                 pendingApproval = String(line.dropFirst("APPROVAL_REQUIRED: ".count))
+                if pendingVoiceToast { VoiceToast.shared.answer("Needs your OK — open Helm to approve.") }
             } else if line.hasPrefix("CHAT_REPLY_JSON:") {
                 let json = Data(line.dropFirst("CHAT_REPLY_JSON:".count).utf8)
                 if let reply = try? JSONDecoder().decode(String.self, from: json) {
                     lines.append(ChatLine(role: .bot, text: reply))
                     AgentCursor.shared.say(reply)
                     speak(reply)
+                    if pendingVoiceToast {
+                        pendingVoiceToast = false
+                        VoiceToast.shared.answer(reply)
+                    }
                 }
             } else if line.hasPrefix("CURSOR: ") {
                 // {"x":402,"y":722,"action":"click 7","click":true}; x/y omitted = stay put
@@ -1184,6 +1201,12 @@ final class ChatController: NSObject, ObservableObject {
         if !buffer.isEmpty { receive("\n") }
         if status != 0, lines.last?.role != .error {
             lines.append(ChatLine(role: .error, text: "Stopped (exit code \(status))."))
+        }
+        if pendingVoiceToast {
+            // No CHAT_REPLY_JSON ever arrived (error/approval-declined/stop) — say so instead of
+            // leaving the toast stuck on "Thinking…".
+            pendingVoiceToast = false
+            VoiceToast.shared.answer(status == 0 ? "Done." : "That didn't finish — check Helm.")
         }
         process = nil
         inputPipe = nil
@@ -3428,6 +3451,102 @@ private struct CursorArrow: Shape {
     }
 }
 
+
+// MARK: - Voice toast
+
+/// A small card at the top-right of the screen showing what you said and Helm's answer, for when
+/// you talk (Control+Option) while the HUD window isn't open — otherwise the reply only ever
+/// landed in a chat transcript nobody was looking at.
+final class VoiceToast: ObservableObject {
+    static let shared = VoiceToast()
+
+    @Published fileprivate var you = ""
+    @Published fileprivate var helm = ""
+    @Published fileprivate var visible = false
+    private var panel: NSPanel?
+    private var hideTask: DispatchWorkItem?
+
+    func show(you text: String) {
+        ensurePanel()
+        you = text
+        helm = ""
+        visible = true
+        scheduleHide(after: 20)  // long enough to read, in case the answer takes a moment
+    }
+
+    func answer(_ text: String) {
+        guard visible else { return }  // the HUD was opened (or the toast dismissed) meanwhile
+        helm = text
+        scheduleHide(after: 12)
+    }
+
+    func dismiss() {
+        hideTask?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) { visible = false }
+    }
+
+    private func scheduleHide(after seconds: TimeInterval) {
+        hideTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            withAnimation(.easeOut(duration: 0.3)) { self?.visible = false }
+        }
+        hideTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds, execute: task)
+    }
+
+    private func ensurePanel() {
+        guard panel == nil, let screen = NSScreen.screens.first else { return }
+        let overlay = NSPanel(contentRect: screen.frame, styleMask: [.borderless, .nonactivatingPanel],
+                              backing: .buffered, defer: false)
+        overlay.isOpaque = false
+        overlay.backgroundColor = .clear
+        overlay.hasShadow = false
+        overlay.ignoresMouseEvents = true  // never blocks the user's own clicks; it only auto-dismisses
+        overlay.level = .screenSaver
+        overlay.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
+        overlay.contentView = NSHostingView(rootView: VoiceToastView().environmentObject(self))
+        overlay.orderFrontRegardless()
+        panel = overlay
+    }
+}
+
+private struct VoiceToastView: View {
+    @EnvironmentObject private var toast: VoiceToast
+
+    var body: some View {
+        VStack(alignment: .trailing, spacing: 0) {
+            if toast.visible {
+                VStack(alignment: .leading, spacing: 8) {
+                    if !toast.you.isEmpty {
+                        Text(toast.you)
+                            .font(.system(size: 12, weight: .medium, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.75))
+                    }
+                    if !toast.helm.isEmpty {
+                        Text(toast.helm)
+                            .font(.system(size: 13, weight: .semibold, design: .rounded))
+                            .foregroundStyle(.white)
+                    } else {
+                        HStack(spacing: 5) {
+                            ProgressView().controlSize(.small).tint(jarvisCyan)
+                            Text("Thinking…").font(.system(size: 12)).foregroundStyle(.white.opacity(0.6))
+                        }
+                    }
+                }
+                .frame(maxWidth: 280, alignment: .leading)
+                .padding(14)
+                .background(Color.black.opacity(0.88), in: RoundedRectangle(cornerRadius: 14))
+                .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(jarvisCyan.opacity(0.5)))
+                .shadow(color: .black.opacity(0.4), radius: 12, y: 4)
+                .padding(.top, 44)
+                .padding(.trailing, 18)
+                .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+        .allowsHitTesting(false)
+    }
+}
 
 // MARK: - Background agents
 
