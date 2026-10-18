@@ -5,6 +5,7 @@ import ApplicationServices
 import Security
 import Speech
 import SwiftUI
+import UserNotifications
 
 private let jarvisCyan = Color(red: 0.30, green: 0.85, blue: 1.0)
 private let jarvisBlue = Color(red: 0.16, green: 0.42, blue: 1.0)
@@ -372,9 +373,12 @@ final class ChatController: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 guard self?.whatsappBridgeProcess === process else { return }
                 self?.whatsappBridgeProcess = nil
-                self?.whatsappBridgeStatus = process.terminationStatus == 0
-                    ? "Stopped"
-                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+                if process.terminationStatus == 0 {
+                    self?.whatsappBridgeStatus = "Stopped"
+                } else {
+                    self?.whatsappBridgeStatus = "Bridge exited (code \(process.terminationStatus)). Check its log."
+                    self?.notifyBridgeStopped(platform: "WhatsApp", code: process.terminationStatus)
+                }
             }
         }
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -466,9 +470,12 @@ final class ChatController: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 guard self?.telegramBridgeProcess === process else { return }
                 self?.telegramBridgeProcess = nil
-                self?.telegramBridgeStatus = process.terminationStatus == 0
-                    ? "Stopped"
-                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+                if process.terminationStatus == 0 {
+                    self?.telegramBridgeStatus = "Stopped"
+                } else {
+                    self?.telegramBridgeStatus = "Bridge exited (code \(process.terminationStatus)). Check its log."
+                    self?.notifyBridgeStopped(platform: "Telegram", code: process.terminationStatus)
+                }
             }
         }
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -564,9 +571,12 @@ final class ChatController: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 guard self?.discordBridgeProcess === process else { return }
                 self?.discordBridgeProcess = nil
-                self?.discordBridgeStatus = process.terminationStatus == 0
-                    ? "Stopped"
-                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+                if process.terminationStatus == 0 {
+                    self?.discordBridgeStatus = "Stopped"
+                } else {
+                    self?.discordBridgeStatus = "Bridge exited (code \(process.terminationStatus)). Check its log."
+                    self?.notifyBridgeStopped(platform: "Discord", code: process.terminationStatus)
+                }
             }
         }
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -662,9 +672,12 @@ final class ChatController: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 guard self?.slackBridgeProcess === process else { return }
                 self?.slackBridgeProcess = nil
-                self?.slackBridgeStatus = process.terminationStatus == 0
-                    ? "Stopped"
-                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+                if process.terminationStatus == 0 {
+                    self?.slackBridgeStatus = "Stopped"
+                } else {
+                    self?.slackBridgeStatus = "Bridge exited (code \(process.terminationStatus)). Check its log."
+                    self?.notifyBridgeStopped(platform: "Slack", code: process.terminationStatus)
+                }
             }
         }
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -718,6 +731,19 @@ final class ChatController: NSObject, ObservableObject {
         installAppShortcut()  // ready as soon as Helm launches
         DispatchQueue.main.async { AgentCursor.shared.start() }
         DispatchQueue.main.async { [weak self] in self?.autoStartConfiguredBridges() }
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    /// A bridge can now be left running unattended (see "start automatically"), so an
+    /// unexpected exit — not a manual Stop, which exits 0 — needs to reach the user even if
+    /// Settings isn't open. The bridge's own log already has the detail; this just flags it.
+    func notifyBridgeStopped(platform: String, code: Int32) {
+        let content = UNMutableNotificationContent()
+        content.title = "Helm: \(platform) bridge stopped"
+        content.body = "It exited unexpectedly (code \(code)). Open Settings to check its log and restart it."
+        content.sound = .default
+        let request = UNNotificationRequest(identifier: "helm.bridge-stopped.\(platform)", content: content, trigger: nil)
+        UNUserNotificationCenter.current().add(request)
     }
 
     /// Starts any bridge whose "start automatically" toggle is on. Each start method already
