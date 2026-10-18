@@ -631,8 +631,12 @@ final class ChatController: NSObject, ObservableObject {
         guard onboarded, !voiceConfigured else { return }  // no permission prompts before setup
         voiceConfigured = true
         voice.onStatusChange = { [weak self] listening, status in
-            self?.isListening = listening
-            self?.voiceStatus = listening ? "Listening…" : status
+            guard let self else { return }
+            if listening, self.speech.isSpeaking {
+                self.speech.stopSpeaking(at: .immediate)  // barge-in: talking over Helm interrupts it
+            }
+            self.isListening = listening
+            self.voiceStatus = listening ? "Listening…" : status
         }
         voice.onError = { [weak self] message in
             self?.lines.append(ChatLine(role: .error, text: message))
