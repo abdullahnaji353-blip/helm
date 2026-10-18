@@ -443,6 +443,9 @@ final class ChatController: NSObject, ObservableObject {
         environment["HELM_TELEGRAM_BOT_TOKEN"] = botToken
         environment["HELM_TELEGRAM_OWNER_CHAT_ID"] =
             UserDefaults.standard.string(forKey: "telegram.owner-chat-id") ?? ""
+        if let proxy = KeyStore.readSecret("telegram.proxy-url"), !proxy.isEmpty {
+            environment["HELM_TELEGRAM_PROXY_URL"] = proxy
+        }
         environment["HELM_TELEGRAM_PYTHON"] = python.path
         environment["HELM_TELEGRAM_PROVIDER"] = provider
         if !model(for: provider).isEmpty {
@@ -2499,6 +2502,7 @@ struct TelegramSettingsView: View {
     @EnvironmentObject private var chat: ChatController
     @AppStorage("telegram.owner-chat-id") private var ownerChatID = ""
     @State private var tokenDraft = ""
+    @State private var proxyDraft = ""
     @State private var saveStatus: String?
 
     var body: some View {
@@ -2527,6 +2531,19 @@ struct TelegramSettingsView: View {
                         .foregroundStyle(saveStatus.hasPrefix("Could") ? .orange : .green)
                 }
             }
+            HStack(spacing: 10) {
+                SecureField(KeyStore.hasSecret("telegram.proxy-url") ? "Proxy saved (enter to replace)" : "HTTP(S) proxy URL — only if Telegram is blocked here", text: $proxyDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") { saveProxy() }
+                    .disabled(proxyDraft.isEmpty)
+                if KeyStore.hasSecret("telegram.proxy-url") {
+                    Button("Clear", role: .destructive) { clearProxy() }
+                }
+            }
+            Text("Leave this empty unless api.telegram.org is unreachable on this network. Point it at a VPN app's local HTTP proxy, or any HTTP(S) CONNECT proxy, e.g. http://host:port or http://user:pass@host:port.")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 12) {
                 Button {
@@ -2568,6 +2585,20 @@ struct TelegramSettingsView: View {
         } else {
             saveStatus = "Could not save the bot token to Keychain."
         }
+    }
+
+    private func saveProxy() {
+        if KeyStore.saveSecret(proxyDraft.trimmingCharacters(in: .whitespacesAndNewlines), key: "telegram.proxy-url") {
+            saveStatus = "Proxy saved in Keychain."
+            proxyDraft = ""
+        } else {
+            saveStatus = "Could not save the proxy to Keychain."
+        }
+    }
+
+    private func clearProxy() {
+        KeyStore.deleteSecret("telegram.proxy-url")
+        saveStatus = "Proxy removed."
     }
 }
 

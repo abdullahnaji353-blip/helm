@@ -36,6 +36,22 @@ class TelegramBotAPITests(unittest.TestCase):
         with self.assertRaises(ValueError):
             TelegramBotAPI("not-a-real-token")
 
+    def test_no_proxy_uses_plain_urlopen(self):
+        from urllib.request import urlopen
+
+        api = TelegramBotAPI("123456789:AAFakeTokenFakeTokenFakeToken123")
+        self.assertIs(api.opener, urlopen)
+
+    def test_proxy_url_is_wired_into_the_opener(self):
+        api = TelegramBotAPI("123456789:AAFakeTokenFakeTokenFakeToken123", proxy_url="http://127.0.0.1:8080")
+        self.assertIsNotNone(api.opener)
+        from urllib.request import urlopen
+        self.assertIsNot(api.opener, urlopen)  # a distinct, proxy-aware opener was built
+
+    def test_rejects_malformed_proxy_url(self):
+        with self.assertRaises(ValueError):
+            TelegramBotAPI("123456789:AAFakeTokenFakeTokenFakeToken123", proxy_url="not a url")
+
     def test_send_text_surfaces_api_failure(self):
         opener = MagicMock(side_effect=HTTPError("url", 401, "unauthorized", {}, None))
         api = TelegramBotAPI("123456789:AAFakeTokenFakeTokenFakeToken123", opener=opener)

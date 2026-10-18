@@ -23,7 +23,8 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
 
 API_ROOT = "https://api.telegram.org"
@@ -36,12 +37,24 @@ class TelegramError(RuntimeError):
     pass
 
 
+def _build_opener(proxy_url: str | None):
+    """An HTTP(S) CONNECT proxy opener (e.g. a VPN app's local proxy, or a reachable relay) for
+    networks that block Telegram's IP ranges outright. SOCKS proxies aren't supported (would need
+    an extra dependency) — point a VPN/proxy app's HTTP(S) listener here instead."""
+    if not proxy_url:
+        return urlopen
+    parsed = urlparse(proxy_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Proxy URL must look like http://host:port or https://user:pass@host:port.")
+    return build_opener(ProxyHandler({"http": proxy_url, "https": proxy_url})).open
+
+
 class TelegramBotAPI:
-    def __init__(self, bot_token: str, opener=urlopen) -> None:
+    def __init__(self, bot_token: str, opener=None, proxy_url: str | None = None) -> None:
         if not TOKEN_PATTERN.fullmatch(bot_token.strip()):
             raise ValueError("Telegram bot token does not look like one from @BotFather.")
         self.bot_token = bot_token.strip()
-        self.opener = opener
+        self.opener = opener if opener is not None else _build_opener(proxy_url)
 
     def _call(self, method: str, payload: dict, timeout: float) -> dict:
         request = Request(
@@ -97,8 +110,9 @@ class TelegramBridge:
         owner_chat_id: int | None,
         project_root: Path,
         python: str = sys.executable,
+        proxy_url: str | None = None,
     ) -> None:
-        self.api = TelegramBotAPI(bot_token)
+        self.api = TelegramBotAPI(bot_token, proxy_url=proxy_url)
         self.owner_chat_id = owner_chat_id
         self.project_root = project_root.resolve()
         self.python = python
@@ -324,6 +338,7 @@ def bridge_from_environment() -> TelegramBridge:
         owner_chat_id=owner_chat_id,
         project_root=project_root,
         python=os.environ.get("HELM_TELEGRAM_PYTHON", sys.executable),
+        proxy_url=os.environ.get("HELM_TELEGRAM_PROXY_URL") or None,
     )
 
 
@@ -336,6 +351,8 @@ def run_bridge() -> int:
         print(f"TELEGRAM_BRIDGE_ERROR:{error}", flush=True)
         return 1
     mode = "pairing (no owner set yet)" if bridge.owner_chat_id is None else f"owner={bridge.owner_chat_id}"
+    if os.environ.get("HELM_TELEGRAM_PROXY_URL"):
+        mode += ", via proxy"
     LOGGER.info("Telegram bridge polling started, %s", mode)
     print(f"TELEGRAM_BRIDGE_READY:{mode}", flush=True)
 
