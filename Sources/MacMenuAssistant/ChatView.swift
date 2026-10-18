@@ -733,7 +733,7 @@ final class ChatController: NSObject, ObservableObject {
 
     /// Tools that must bring another app to the front.
     private static let actingTools: Set<String> = [
-        "open_app", "open_url", "send_message", "read_chat", "control_screen", "click_in_app", "menu_in_app",
+        "open_app", "open_url", "send_message", "read_chat", "control_screen", "resume_task", "click_in_app", "menu_in_app",
         "type_in_app", "keys_in_app", "new_document", "paste_into_app", "web_search", "ask_chatgpt", "media_control",
     ]
 
@@ -884,6 +884,7 @@ final class ChatController: NSObject, ObservableObject {
         "set_volume": "Adjusting volume",
         "system_status": "Checking system status",
         "control_screen": "Taking control of the screen",
+        "resume_task": "Resuming the paused task",
         "web_search": "Searching in your browser",
         "media_control": "Controlling music",
     ]
@@ -1845,7 +1846,7 @@ private struct Ability: Identifiable {
     let tools: [String]
 
     static let all = [
-        Ability(id: "screen", title: "Screen control", detail: "Clicks, types, reads and navigates apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard", "window_control", "drag_in_app"]),
+        Ability(id: "screen", title: "Screen control", detail: "Clicks, types, reads and navigates apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen", "resume_task", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard", "window_control", "drag_in_app"]),
         Ability(id: "web", title: "Web, YouTube & TikTok", detail: "Opens websites, searches the web and finds video examples", symbol: "magnifyingglass", tools: ["open_url", "web_search", "ask_chatgpt", "watch_video"]),
         Ability(id: "apps", title: "Applications", detail: "Opens apps and manages installs with confirmation", symbol: "square.grid.2x2", tools: ["open_app", "install_app", "uninstall_app"]),
         Ability(id: "files", title: "Files & folders", detail: "List, read, copy, move and delete files in your home folder — deletes and moves always ask first", symbol: "folder", tools: ["file_operations"]),
@@ -1996,7 +1997,7 @@ private struct PermissionItem: Identifiable {
 
 private enum PermissionManager {
     private static let desktopTools: Set<String> = [
-        "control_screen", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app",
+        "control_screen", "resume_task", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app",
         "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard",
     ]
 

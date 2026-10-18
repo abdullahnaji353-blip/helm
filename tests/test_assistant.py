@@ -744,6 +744,28 @@ class SkillMemoryTests(unittest.TestCase):
             self.assertEqual(recall_skills("set the volume to 30"), "")
 
 
+class PausedTaskTests(unittest.TestCase):
+    def test_save_load_round_trip_drops_images(self):
+        from assistant import save_paused_task, load_paused_task, clear_paused_task
+        with tempfile.TemporaryDirectory() as folder, patch("assistant.PAUSED_TASK_PATH", Path(folder) / "paused_task.json"):
+            messages = [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "shot", "images": ["base64..."]},
+            ]
+            save_paused_task("open settings", messages, ["click Settings"])
+            saved = load_paused_task()
+            self.assertEqual(saved["task"], "open settings")
+            self.assertEqual(saved["completed_steps"], ["click Settings"])
+            self.assertTrue(all("images" not in m for m in saved["messages"]))
+            clear_paused_task()
+            self.assertIsNone(load_paused_task())
+
+    def test_resume_with_no_paused_task(self):
+        assistant = DesktopAssistant()
+        with tempfile.TemporaryDirectory() as folder, patch("assistant.PAUSED_TASK_PATH", Path(folder) / "paused_task.json"):
+            self.assertEqual(assistant.resume_task(), "There is no paused task to resume.")
+
+
 class ClipboardToolTests(unittest.TestCase):
     def test_copy_then_read(self):
         assistant = DesktopAssistant()
