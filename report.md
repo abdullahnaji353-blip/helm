@@ -208,5 +208,10 @@ via Discord's REST API with the same APPROVE/DENY/STOP flow, owner-only
 allowlist, and remote-task pattern as the Telegram and WhatsApp bridges.
 Bots can't discover new DMs without a persistent Gateway websocket
 connection, so this watches a server channel instead of a DM — set up via
-the new Discord tab in Settings. Slack bridge is the one remaining item from
-the original "fix Telegram, then Discord, Slack, WhatsApp" request.
+the new Discord tab in Settings.
+
+**Slack bridge added** (`slack_bridge.py`): same polling pattern via
+`conversations.history`, same APPROVE/DENY/STOP flow, new Slack tab in
+Settings. This completes the original "fix Telegram, then Discord, Slack,
+WhatsApp" request — all four bridges exist with the same owner-only,
+confirmation-gated design.
