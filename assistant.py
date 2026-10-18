@@ -11,6 +11,7 @@ import logging
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -270,6 +271,18 @@ CHAT_TOOLS = [
             "width": {"type": "integer", "description": "For resize"}, "height": {"type": "integer", "description": "For resize"},
             "position": {"type": "string", "description": "For snap: left, right, top, bottom, top-left, top-right, bottom-left, bottom-right, full, or center"},
         }, "required": ["app", "action"]}}},
+    {"type": "function", "function": {
+        "name": "file_operations",
+        "description": (
+            "List a folder, read a small text file, create a folder, or copy/move/rename/delete a "
+            "file or folder. Only works inside the user's home folder. Deleting moves to the Trash "
+            "(recoverable) and always asks first, like moving/renaming."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["list", "read_text", "make_folder", "copy", "move", "rename", "delete"]},
+            "path": {"type": "string", "description": "e.g. ~/Documents/notes.txt"},
+            "destination": {"type": "string", "description": "For copy/move/rename"},
+        }, "required": ["action", "path"]}}},
     {"type": "function", "function": {
         "name": "install_app",
         "description": "Find an app in the Mac App Store so it can be installed.",
@@ -1097,6 +1110,10 @@ class DesktopAssistant:
                 return window_control(app, str(args.get("action", "")), **{
                     k: v for k, v in args.items() if k not in {"app", "action"}
                 })
+            if name == "file_operations":
+                return self.file_operations(
+                    str(args.get("action", "")), str(args.get("path", "")), str(args.get("destination", "")),
+                )
             if name == "install_app":
                 return self.install_app(str(args.get("name", "")))
             if name == "uninstall_app":
@@ -1741,6 +1758,94 @@ class DesktopAssistant:
                 return (f"Pressed {label} for {app} in the App Store. If Apple asks, confirm with Touch ID or your "
                         "password; it then installs into Applications.")
         return f"Opened {app} in the App Store, but no Get button appeared (it may already be installed or need sign-in)."
+
+    def file_operations(self, action: str, path: str, destination: str = "", content: str = "") -> str:
+        """list/read_text/make_folder/copy/move/rename/delete, scoped to the user's home directory.
+        Deletes go to the Trash (recoverable), and delete/move/rename always ask first."""
+        if action == "make_folder" and destination and not Path(path).is_absolute():
+            # The model sometimes splits "folder X inside Y" as path=X, destination=Y.
+            path, destination = f"{destination.rstrip('/')}/{path}", ""
+        try:
+            target = self._safe_path(path)
+        except ValueError as error:
+            return str(error)
+        if action == "list":
+            if not target.is_dir():
+                return f"{target} is not a folder, or does not exist."
+            entries = sorted(target.iterdir())[:200]
+            return "\n".join(f"{'📁' if e.is_dir() else '📄'} {e.name}" for e in entries) or "(empty folder)"
+        if action == "read_text":
+            if not target.is_file():
+                return f"{target} is not a file, or does not exist."
+            if target.stat().st_size > 200_000:
+                return f"{target.name} is too large to read here (over 200 KB)."
+            try:
+                return target.read_text(encoding="utf-8", errors="replace")[:20_000]
+            except OSError as error:
+                return f"Could not read {target.name}: {error}"
+        if action == "make_folder":
+            try:
+                target.mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                return f"Could not create {target.name}: {error}"
+            return f"Created folder {target}."
+        if action in {"copy", "move", "rename"}:
+            if not destination:
+                return "A destination is required."
+            try:
+                dest = self._safe_path(destination)
+            except ValueError as error:
+                return str(error)
+            if not target.exists():
+                return f"{target} does not exist."
+            if action != "copy" and not self._confirm(f"{action} {target.name} to {dest}"):
+                return "The user declined, so nothing changed."
+            try:
+                if action == "copy":
+                    (shutil.copytree if target.is_dir() else shutil.copy2)(target, dest)
+                else:
+                    shutil.move(str(target), str(dest))
+            except OSError as error:
+                return f"Could not {action} {target.name}: {error}"
+            return f"{'Copied' if action == 'copy' else 'Moved'} {target.name} to {dest}."
+        if action == "delete":
+            if not target.exists():
+                return f"{target} does not exist."
+            if not self._confirm(f"move {target.name} to the Trash"):
+                return "The user declined, so nothing was deleted."
+            result = subprocess.run(
+                ["osascript", "-e", f'tell application "Finder" to delete POSIX file "{target}"'],
+                capture_output=True, text=True,
+            )
+            if result.returncode:
+                return f"macOS did not allow deleting {target.name}: {result.stderr.strip()[:200]}"
+            return f"Moved {target.name} to the Trash. Drag it back out to undo."
+        return f"Unknown file action: {action}."
+
+    @staticmethod
+    def _safe_path(raw: str) -> Path:
+        """Resolve a path and require it to stay under the user's home, out of sensitive folders."""
+        if not raw.strip():
+            raise ValueError("A file or folder path is required.")
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            candidate = Path.home() / candidate
+        resolved = candidate.resolve()  # non-strict by default: resolves symlinks even if the path doesn't exist yet
+        home = Path.home().resolve()
+        if home not in resolved.parents and resolved != home:
+            raise ValueError("Helm only manages files inside your home folder, for safety.")
+        blocked = {".ssh", ".aws", ".gnupg", "Keychains", ".config/gh"}
+        if any(part in blocked for part in resolved.relative_to(home).parts):
+            raise ValueError(f"{resolved.name} is in a protected folder Helm won't touch.")
+        return resolved
+
+    @staticmethod
+    def _confirm(summary: str) -> bool:
+        """Always asks, even in full autonomy — matches uninstall_app's policy for file changes."""
+        if os.environ.get("HELM_DRY_RUN") == "1":
+            return True
+        print(f"APPROVAL_REQUIRED: {summary}", flush=True)
+        return action_approved(input("Allow this action? [y/yes/N] "))
 
     def uninstall_app(self, name: str) -> str:
         name = name.strip().removesuffix(".app") if hasattr(str, "removesuffix") else name.strip()

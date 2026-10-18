@@ -1,6 +1,7 @@
 import io
 import json
 import sys
+import os
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -888,6 +889,55 @@ class BackgroundTypingTests(unittest.TestCase):
             type_out(fake, "hello \u201cworld\u201d", app="TextEdit")
         post.assert_called_once_with(617, 'hello "world"')
         fake.write.assert_not_called()  # nothing went through the shared keyboard
+
+
+class FileOperationsTests(unittest.TestCase):
+    def test_path_outside_home_is_rejected(self):
+        assistant = DesktopAssistant()
+        self.assertIn("inside your home folder", assistant.file_operations("list", "/etc"))
+
+    def test_protected_subfolder_is_rejected(self):
+        assistant = DesktopAssistant()
+        self.assertIn("protected folder", assistant.file_operations("list", "~/.ssh"))
+
+    def test_list_and_read_text_need_no_confirmation(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"HOME": folder}):
+            (Path(folder) / "notes.txt").write_text("hello")
+            assistant = DesktopAssistant()
+            with patch("builtins.input") as prompt:
+                self.assertIn("notes.txt", assistant.file_operations("list", "~"))
+                self.assertEqual(assistant.file_operations("read_text", "~/notes.txt"), "hello")
+            prompt.assert_not_called()
+
+    def test_delete_goes_to_trash_and_always_asks(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"HOME": folder}):
+            (Path(folder) / "old.txt").write_text("x")
+            assistant = DesktopAssistant(autonomous=True)
+            with patch("builtins.input", return_value="n") as prompt, \
+                    patch("assistant.subprocess.run") as run, redirect_stdout(io.StringIO()):
+                result = assistant.file_operations("delete", "~/old.txt")
+            prompt.assert_called_once()
+            run.assert_not_called()
+            self.assertIn("declined", result)
+            self.assertTrue((Path(folder) / "old.txt").exists())  # nothing happened
+
+    def test_make_folder_combines_a_split_path_and_destination(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"HOME": folder}):
+            assistant = DesktopAssistant()
+            result = assistant.file_operations("make_folder", "test", "Desktop")
+            self.assertIn("Created folder", result)
+            self.assertTrue((Path(folder) / "Desktop" / "test").is_dir())
+
+    def test_copy_does_not_require_confirmation_but_move_does(self):
+        with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {"HOME": folder}):
+            (Path(folder) / "a.txt").write_text("x")
+            assistant = DesktopAssistant(autonomous=True)
+            with patch("builtins.input") as prompt:
+                result = assistant.file_operations("copy", "~/a.txt", "~/b.txt")
+            prompt.assert_not_called()
+            self.assertIn("Copied", result)
+            self.assertTrue((Path(folder) / "b.txt").exists())
+            self.assertTrue((Path(folder) / "a.txt").exists())  # source untouched
 
 
 class WindowControlTests(unittest.TestCase):
