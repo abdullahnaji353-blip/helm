@@ -188,9 +188,10 @@ Swift: build check) and most verified live against real apps/files:
 | Voice barge-in (talking over Helm stops it) | DONE, build-verified only (no mic in this environment) |
 | `drag_in_app` (in-app drag-and-drop) | DONE; Finder file-drag itself has a known macOS synthetic-input limitation — use `file_operations` for moving files |
 | Settings -> Logs tab | DONE |
+| Pause/resume for interrupted `control_screen` tasks (`resume_task` tool) | DONE, test-verified |
+| Playwright replaces Accessibility-based reading for web tasks (`browser_automation.py`) | DONE, live-verified against a real page (navigate + click) |
 
-Known gaps, not yet started:
-- Resumable/pausable task state (today: full-stop only via Control+Shift+Escape)
-- A real browser automation framework (Playwright/WebDriver) in place of the
-  current Accessibility-based page reading — a large, higher-risk swap of
-  working code; flagged for confirmation before starting
+All 8 items from the plan are now done. Non-web app control (Mail, Finder,
+Discord, etc.) is unaffected — Playwright only drives browsers, so
+`screen_elements.py`'s Accessibility API is still how Helm sees and acts on
+everything that isn't a webpage.
