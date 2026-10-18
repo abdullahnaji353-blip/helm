@@ -2213,6 +2213,48 @@ private struct PermissionItem: Identifiable {
 }
 
 private enum PermissionManager {
+    /// Apple Events (Automation) has no CGPreflight-style check; probe with a harmless, read-only
+    /// script. The first call prompts the user; a denied app answers with error -1743. The
+    /// Permissions tab re-renders every second (TimelineView), so this result is cached briefly
+    /// rather than spawning osascript on every tick.
+    private static var cachedAutomationAllowed: Bool?
+    private static var lastAutomationCheck = Date.distantPast
+
+    private static func automationAllowed() -> Bool {
+        let now = Date()
+        if let cached = cachedAutomationAllowed, now.timeIntervalSince(lastAutomationCheck) < 5 {
+            return cached
+        }
+        lastAutomationCheck = now
+        let script = Process()
+        script.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        script.arguments = ["-e", "tell application \"Finder\" to return name"]
+        let stderr = Pipe()
+        script.standardOutput = Pipe()
+        script.standardError = stderr
+        let result: Bool
+        do {
+            try script.run()
+            script.waitUntilExit()
+            if script.terminationStatus == 0 {
+                result = true
+            } else {
+                let errorText = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                result = !errorText.contains("-1743") && !errorText.localizedCaseInsensitiveContains("not allowed")
+            }
+        } catch {
+            result = false  // osascript itself could not run; treat as unknown/denied rather than crash
+        }
+        cachedAutomationAllowed = result
+        return result
+    }
+
+    /// Forces the next automationAllowed() call to re-probe instead of serving the cache,
+    /// so pressing "Allow" reflects the user's answer immediately.
+    private static func invalidateAutomationCache() {
+        lastAutomationCheck = .distantPast
+    }
+
     private static let desktopTools: Set<String> = [
         "control_screen", "resume_task", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app",
         "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard",
@@ -2281,6 +2323,12 @@ private enum PermissionManager {
                 canRequest: false
             ),
             PermissionItem(
+                id: "automation", symbol: "bolt.horizontal.circle", title: "Automation (Apple Events)",
+                detail: "Needed to script Finder, System Events, Safari and Chrome — used for opening apps correctly, reading browser search results, and verifying chat windows before sending.",
+                state: automationAllowed() ? .granted : .needsPermission,
+                canRequest: true
+            ),
+            PermissionItem(
                 id: "files", symbol: "folder", title: "Files",
                 detail: "No general file tools are built in. A configured MCP filesystem server has separate access; only trust servers you configure.",
                 state: .limited,
@@ -2336,6 +2384,12 @@ private enum PermissionManager {
         case "keyboard", "mouse":
             let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
             _ = AXIsProcessTrustedWithOptions(options)
+        case "automation":
+            invalidateAutomationCache()
+            if !automationAllowed() {
+                // Already decided (denied) — the prompt won't reappear; send the user to Settings.
+                openPrivacySettings("Privacy_Automation")
+            }
         default:
             break
         }
