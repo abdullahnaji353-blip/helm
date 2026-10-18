@@ -26,6 +26,7 @@ from writing_check import grade
 from screen_elements import (
     bring_to_front, describe_elements, frontmost_app_name, frontmost_elements, mark_elements,
     app_pid, choose_menu, element_center, find_in_app, post_keys, post_text, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
+    window_control,
 )
 from providers import PROVIDERS, anthropic_turn, check_provider, openai_turn, parse_json_object, provider_key
 
@@ -257,6 +258,18 @@ CHAT_TOOLS = [
         "description": "Press a keyboard shortcut in an app, e.g. keys 'command+l' in Safari or 'command+n'.",
         "parameters": {"type": "object", "properties": {
             "app": {"type": "string"}, "keys": {"type": "string"}}, "required": ["app", "keys"]}}},
+    {"type": "function", "function": {
+        "name": "window_control",
+        "description": (
+            "Move, resize, snap to half/quarter of the screen, minimize/restore, or close an app's window."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string"},
+            "action": {"type": "string", "enum": ["move", "resize", "snap", "minimize", "unminimize", "close"]},
+            "x": {"type": "integer", "description": "For move"}, "y": {"type": "integer", "description": "For move"},
+            "width": {"type": "integer", "description": "For resize"}, "height": {"type": "integer", "description": "For resize"},
+            "position": {"type": "string", "description": "For snap: left, right, top, bottom, top-left, top-right, bottom-left, bottom-right, full, or center"},
+        }, "required": ["app", "action"]}}},
     {"type": "function", "function": {
         "name": "install_app",
         "description": "Find an app in the Mac App Store so it can be installed.",
@@ -1077,6 +1090,13 @@ class DesktopAssistant:
                 return self.ask_chatgpt(str(args.get("question", "")))
             if name in {"click_in_app", "menu_in_app", "type_in_app", "keys_in_app"}:
                 return self.interact(name, args)
+            if name == "window_control":
+                app = str(args.get("app", "")).strip()
+                if not APP_NAME_PATTERN.fullmatch(app):
+                    return "That is not a valid app name."
+                return window_control(app, str(args.get("action", "")), **{
+                    k: v for k, v in args.items() if k not in {"app", "action"}
+                })
             if name == "install_app":
                 return self.install_app(str(args.get("name", "")))
             if name == "uninstall_app":

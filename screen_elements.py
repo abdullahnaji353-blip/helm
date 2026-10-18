@@ -41,6 +41,81 @@ def _frame(element) -> tuple[float, float, float, float] | None:
     return point.x, point.y, extent.width, extent.height
 
 
+def _main_window(app_name: str):
+    element = _app_element(app_name)
+    if element is None:
+        return None, None
+    window = (_attribute(element, "AXMainWindow") or _attribute(element, "AXFocusedWindow")
+              or (_attribute(element, "AXWindows") or [None])[0])
+    return element, window
+
+
+def _set_frame(window, x: float | None, y: float | None, width: float | None, height: float | None) -> bool:
+    import ApplicationServices as AS
+    import Quartz
+
+    ok = True
+    if x is not None and y is not None:
+        point_value = AS.AXValueCreate(AS.kAXValueCGPointType, Quartz.CGPoint(x, y))
+        ok = AS.AXUIElementSetAttributeValue(window, "AXPosition", point_value) == 0 and ok
+    if width is not None and height is not None:
+        size_value = AS.AXValueCreate(AS.kAXValueCGSizeType, Quartz.CGSize(width, height))
+        ok = AS.AXUIElementSetAttributeValue(window, "AXSize", size_value) == 0 and ok
+    return ok
+
+
+def screen_bounds() -> tuple[int, int]:
+    """Main display size in points (top-left origin), matching Accessibility coordinates."""
+    import Quartz
+
+    display = Quartz.CGMainDisplayID()
+    return int(Quartz.CGDisplayPixelsWide(display)), int(Quartz.CGDisplayPixelsHigh(display))
+
+
+SNAP_REGIONS = {
+    "left": (0.0, 0.0, 0.5, 1.0), "right": (0.5, 0.0, 0.5, 1.0),
+    "top": (0.0, 0.0, 1.0, 0.5), "bottom": (0.0, 0.5, 1.0, 0.5),
+    "top-left": (0.0, 0.0, 0.5, 0.5), "top-right": (0.5, 0.0, 0.5, 0.5),
+    "bottom-left": (0.0, 0.5, 0.5, 0.5), "bottom-right": (0.5, 0.5, 0.5, 0.5),
+    "full": (0.0, 0.0, 1.0, 1.0),
+    "center": (0.1, 0.1, 0.8, 0.8),
+}
+
+
+def window_control(app_name: str, action: str, **params) -> str:
+    """move/resize/snap/minimize/unminimize/close the app's main window. Returns a status string."""
+    import ApplicationServices as AS
+
+    _element, window = _main_window(app_name)
+    if window is None:
+        return f"{app_name} has no window to control (not running, or no visible window)."
+    if action == "minimize":
+        ok = AS.AXUIElementSetAttributeValue(window, "AXMinimized", True) == 0
+        return f"Minimized {app_name}." if ok else f"Could not minimize {app_name}."
+    if action == "unminimize":
+        ok = AS.AXUIElementSetAttributeValue(window, "AXMinimized", False) == 0
+        return f"Restored {app_name}'s window." if ok else f"Could not restore {app_name}."
+    if action == "close":
+        button = _attribute(window, "AXCloseButton")
+        ok = button is not None and press(button)
+        return f"Closed {app_name}'s window." if ok else f"Could not close {app_name}'s window."
+    if action == "move":
+        ok = _set_frame(window, params.get("x"), params.get("y"), None, None)
+        return f"Moved {app_name} to ({params.get('x')}, {params.get('y')})." if ok else f"Could not move {app_name}."
+    if action == "resize":
+        ok = _set_frame(window, None, None, params.get("width"), params.get("height"))
+        return f"Resized {app_name} to {params.get('width')}x{params.get('height')}." if ok else f"Could not resize {app_name}."
+    if action == "snap":
+        region = SNAP_REGIONS.get(params.get("position", ""))
+        if region is None:
+            return f"Unknown snap position. Use one of: {', '.join(SNAP_REGIONS)}."
+        width, height = screen_bounds()
+        fx, fy, fw, fh = region
+        ok = _set_frame(window, round(fx * width), round(fy * height), round(fw * width), round(fh * height))
+        return f"Snapped {app_name} to {params['position']}." if ok else f"Could not snap {app_name}."
+    return f"Unknown window action: {action}."
+
+
 def frontmost_app_name() -> str:
     try:
         from AppKit import NSWorkspace

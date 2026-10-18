@@ -890,5 +890,35 @@ class BackgroundTypingTests(unittest.TestCase):
         fake.write.assert_not_called()  # nothing went through the shared keyboard
 
 
+class WindowControlTests(unittest.TestCase):
+    def test_rejects_invalid_app_name_before_touching_the_screen(self):
+        assistant = DesktopAssistant()
+        with patch("assistant.window_control") as control:
+            result = assistant.run_tool("window_control", {"app": "x; rm -rf /", "action": "close"})
+        control.assert_not_called()
+        self.assertIn("not a valid app name", result)
+
+    def test_forwards_action_and_params_to_screen_elements(self):
+        assistant = DesktopAssistant()
+        with patch("assistant.window_control", return_value="Snapped Safari to left.") as control:
+            result = assistant.run_tool(
+                "window_control", {"app": "Safari", "action": "snap", "position": "left"}
+            )
+        control.assert_called_once_with("Safari", "snap", position="left")
+        self.assertEqual(result, "Snapped Safari to left.")
+
+    def test_no_window_reports_cleanly(self):
+        from screen_elements import window_control
+        with patch("screen_elements._main_window", return_value=(None, None)):
+            result = window_control("NoSuchApp", "minimize")
+        self.assertIn("no window", result)
+
+    def test_unknown_snap_position_is_rejected(self):
+        from screen_elements import window_control
+        with patch("screen_elements._main_window", return_value=(object(), object())):
+            result = window_control("Safari", "snap", position="diagonal")
+        self.assertIn("Unknown snap position", result)
+
+
 if __name__ == "__main__":
     unittest.main()
