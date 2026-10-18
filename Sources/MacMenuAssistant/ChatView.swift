@@ -273,6 +273,9 @@ final class ChatController: NSObject, ObservableObject {
     @Published var discordBridgeStatus = "Not configured"
     private var discordBridgeProcess: Process?
     private var discordTerminationObserver: NSObjectProtocol?
+    @Published var slackBridgeStatus = "Not configured"
+    private var slackBridgeProcess: Process?
+    private var slackTerminationObserver: NSObjectProtocol?
     /// Bumped by the Control+Shift+§ shortcut; the menu bar label opens the HUD when it changes.
     @Published var hudRequests = 0
     /// Three background agents, each with its own engine, conversation and coloured cursor.
@@ -608,6 +611,104 @@ final class ChatController: NSObject, ObservableObject {
         }
         process.terminate()
         discordBridgeStatus = "Stopping…"
+    }
+
+    func startSlackBridge() {
+        guard slackBridgeProcess?.isRunning != true else {
+            slackBridgeStatus = "Running"
+            return
+        }
+        guard let botToken = KeyStore.readSecret("slack.bot-token") else {
+            slackBridgeStatus = "Save the Slack bot token first."
+            return
+        }
+        let channelID = UserDefaults.standard.string(forKey: "slack.channel-id") ?? ""
+        let ownerUserID = UserDefaults.standard.string(forKey: "slack.owner-user-id") ?? ""
+        guard !channelID.isEmpty, !ownerUserID.isEmpty else {
+            slackBridgeStatus = "Fill in the channel ID and owner user ID first."
+            return
+        }
+        let python = projectRoot.appendingPathComponent(".venv/bin/python")
+        let script = projectRoot.appendingPathComponent("slack_bridge.py")
+        guard FileManager.default.isExecutableFile(atPath: python.path),
+              FileManager.default.fileExists(atPath: script.path) else {
+            slackBridgeStatus = "Project Python or slack_bridge.py is missing."
+            return
+        }
+
+        let child = Process()
+        let output = Pipe()
+        child.executableURL = python
+        child.arguments = ["-u", script.path]
+        child.currentDirectoryURL = projectRoot
+        child.standardOutput = output
+        child.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["ASSISTANT_PROJECT_DIR"] = projectRoot.path
+        environment["HELM_SLACK_BOT_TOKEN"] = botToken
+        environment["HELM_SLACK_CHANNEL_ID"] = channelID
+        environment["HELM_SLACK_OWNER_USER_ID"] = ownerUserID
+        environment["HELM_SLACK_PYTHON"] = python.path
+        environment["HELM_SLACK_PROVIDER"] = provider
+        if !model(for: provider).isEmpty {
+            environment["HELM_SLACK_MODEL"] = model(for: provider)
+        }
+        if provider != "ollama", let key = KeyStore.read(provider) {
+            environment["HELM_API_KEY"] = key
+        }
+        environment["HELM_SLACK_DISABLED_TOOLS"] = disabledTools.sorted().joined(separator: ",")
+        child.environment = environment
+        child.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async {
+                guard self?.slackBridgeProcess === process else { return }
+                self?.slackBridgeProcess = nil
+                self?.slackBridgeStatus = process.terminationStatus == 0
+                    ? "Stopped"
+                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+            }
+        }
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async {
+                if let line = text.components(separatedBy: .newlines)
+                    .first(where: { $0.hasPrefix("SLACK_BRIDGE_READY:") }) {
+                    self?.slackBridgeStatus = "Running — " + line.dropFirst("SLACK_BRIDGE_READY:".count)
+                } else if let line = text.components(separatedBy: .newlines)
+                    .first(where: { $0.hasPrefix("SLACK_BRIDGE_ERROR:") }) {
+                    self?.slackBridgeStatus = String(line.dropFirst("SLACK_BRIDGE_ERROR:".count))
+                }
+            }
+        }
+        do {
+            try child.run()
+            slackBridgeProcess = child
+            slackBridgeStatus = "Starting…"
+            if slackTerminationObserver == nil {
+                slackTerminationObserver = NotificationCenter.default.addObserver(
+                    forName: NSApplication.willTerminateNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.stopSlackBridge()
+                }
+            }
+        } catch {
+            slackBridgeStatus = "Could not start bridge: \(error.localizedDescription)"
+        }
+    }
+
+    func stopSlackBridge() {
+        guard let process = slackBridgeProcess, process.isRunning else {
+            slackBridgeStatus = "Stopped"
+            return
+        }
+        process.terminate()
+        slackBridgeStatus = "Stopping…"
     }
 
     private var appShortcuts: [GlobalHotKey] = []
@@ -2803,12 +2904,91 @@ struct DiscordSettingsView: View {
     }
 }
 
+struct SlackSettingsView: View {
+    @EnvironmentObject private var chat: ChatController
+    @AppStorage("slack.channel-id") private var channelID = ""
+    @AppStorage("slack.owner-user-id") private var ownerUserID = ""
+    @State private var tokenDraft = ""
+    @State private var saveStatus: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("SLACK BOT")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
+            Text("Helm polls one Slack channel every few seconds rather than using Socket Mode, so no extra app setup is needed beyond the bot itself. The Mac and Helm must stay awake and online.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                SecureField(KeyStore.hasSecret("slack.bot-token") ? "Bot token saved (enter to replace)" : "Bot User OAuth Token (xoxb-...)", text: $tokenDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") { saveToken() }
+                    .disabled(tokenDraft.isEmpty)
+            }
+            HStack(spacing: 10) {
+                TextField("Channel ID (e.g. C0123456789)", text: $channelID)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Your Slack user ID (e.g. U0123456789)", text: $ownerUserID)
+                    .textFieldStyle(.roundedBorder)
+                if let saveStatus {
+                    Text(saveStatus)
+                        .font(.system(size: 11))
+                        .foregroundStyle(saveStatus.hasPrefix("Could") ? .orange : .green)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    chat.startSlackBridge()
+                } label: {
+                    Label("Start bridge", systemImage: "paperplane")
+                }
+                .disabled(!KeyStore.hasSecret("slack.bot-token") || channelID.isEmpty || ownerUserID.isEmpty)
+                Button("Stop") { chat.stopSlackBridge() }
+                    .disabled(chat.slackBridgeStatus == "Stopped" || chat.slackBridgeStatus == "Not configured")
+                Text(chat.slackBridgeStatus)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(chat.slackBridgeStatus.hasPrefix("Running") ? .green : .secondary)
+                    .lineLimit(2)
+            }
+
+            GroupBox("Setup") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("1. At api.slack.com/apps, create an app, add the chat:write, channels:history, and groups:history (or im:history) scopes under OAuth & Permissions, then install it to your workspace.")
+                    Text("2. Copy the Bot User OAuth Token (starts with xoxb-). Paste it above and save.")
+                    Text("3. Invite the bot to a channel only you use for this (/invite @YourBotName). Right-click the channel for its ID, and check your Slack profile for your own member ID.")
+                    Text("4. Press Start bridge. From then on only messages from you in that channel run on this Mac; sensitive steps pause and require APPROVE <code> or DENY <code> in Slack.")
+                }
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("Log: ~/Library/Logs/Helm/slack-bridge.log")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func saveToken() {
+        if KeyStore.saveSecret(tokenDraft.trimmingCharacters(in: .whitespacesAndNewlines), key: "slack.bot-token") {
+            saveStatus = "Bot token saved in Keychain."
+            tokenDraft = ""
+        } else {
+            saveStatus = "Could not save the bot token to Keychain."
+        }
+    }
+}
+
 // MARK: - Settings
 
 struct LogsView: View {
     private static let files: [(String, String)] = [
         ("Engine", "backend.log"), ("Telegram", "telegram-bridge.log"), ("WhatsApp", "whatsapp-bridge.log"),
-        ("Discord", "discord-bridge.log"),
+        ("Discord", "discord-bridge.log"), ("Slack", "slack-bridge.log"),
     ]
     @State private var selected = 0
     @State private var contents = "(loading…)"
@@ -2867,7 +3047,8 @@ struct SettingsView: View {
                 Text("WhatsApp").tag(3)
                 Text("Telegram").tag(4)
                 Text("Discord").tag(5)
-                Text("Logs").tag(6)
+                Text("Slack").tag(6)
+                Text("Logs").tag(7)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -2881,6 +3062,7 @@ struct SettingsView: View {
                     case 3: WhatsAppSettingsView()
                     case 4: TelegramSettingsView()
                     case 5: DiscordSettingsView()
+                    case 6: SlackSettingsView()
                     default: LogsView()
                     }
                 }
