@@ -270,6 +270,9 @@ final class ChatController: NSObject, ObservableObject {
     @Published var telegramBridgeStatus = "Not configured"
     private var telegramBridgeProcess: Process?
     private var telegramTerminationObserver: NSObjectProtocol?
+    @Published var discordBridgeStatus = "Not configured"
+    private var discordBridgeProcess: Process?
+    private var discordTerminationObserver: NSObjectProtocol?
     /// Bumped by the Control+Shift+§ shortcut; the menu bar label opens the HUD when it changes.
     @Published var hudRequests = 0
     /// Three background agents, each with its own engine, conversation and coloured cursor.
@@ -507,6 +510,104 @@ final class ChatController: NSObject, ObservableObject {
         }
         process.terminate()
         telegramBridgeStatus = "Stopping…"
+    }
+
+    func startDiscordBridge() {
+        guard discordBridgeProcess?.isRunning != true else {
+            discordBridgeStatus = "Running"
+            return
+        }
+        guard let botToken = KeyStore.readSecret("discord.bot-token") else {
+            discordBridgeStatus = "Save the Discord bot token first."
+            return
+        }
+        let channelID = UserDefaults.standard.string(forKey: "discord.channel-id") ?? ""
+        let ownerUserID = UserDefaults.standard.string(forKey: "discord.owner-user-id") ?? ""
+        guard !channelID.isEmpty, !ownerUserID.isEmpty else {
+            discordBridgeStatus = "Fill in the channel ID and owner user ID first."
+            return
+        }
+        let python = projectRoot.appendingPathComponent(".venv/bin/python")
+        let script = projectRoot.appendingPathComponent("discord_bridge.py")
+        guard FileManager.default.isExecutableFile(atPath: python.path),
+              FileManager.default.fileExists(atPath: script.path) else {
+            discordBridgeStatus = "Project Python or discord_bridge.py is missing."
+            return
+        }
+
+        let child = Process()
+        let output = Pipe()
+        child.executableURL = python
+        child.arguments = ["-u", script.path]
+        child.currentDirectoryURL = projectRoot
+        child.standardOutput = output
+        child.standardError = output
+        var environment = ProcessInfo.processInfo.environment
+        environment["ASSISTANT_PROJECT_DIR"] = projectRoot.path
+        environment["HELM_DISCORD_BOT_TOKEN"] = botToken
+        environment["HELM_DISCORD_CHANNEL_ID"] = channelID
+        environment["HELM_DISCORD_OWNER_USER_ID"] = ownerUserID
+        environment["HELM_DISCORD_PYTHON"] = python.path
+        environment["HELM_DISCORD_PROVIDER"] = provider
+        if !model(for: provider).isEmpty {
+            environment["HELM_DISCORD_MODEL"] = model(for: provider)
+        }
+        if provider != "ollama", let key = KeyStore.read(provider) {
+            environment["HELM_API_KEY"] = key
+        }
+        environment["HELM_DISCORD_DISABLED_TOOLS"] = disabledTools.sorted().joined(separator: ",")
+        child.environment = environment
+        child.terminationHandler = { [weak self] process in
+            DispatchQueue.main.async {
+                guard self?.discordBridgeProcess === process else { return }
+                self?.discordBridgeProcess = nil
+                self?.discordBridgeStatus = process.terminationStatus == 0
+                    ? "Stopped"
+                    : "Bridge exited (code \(process.terminationStatus)). Check its log."
+            }
+        }
+        output.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                handle.readabilityHandler = nil
+                return
+            }
+            let text = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async {
+                if let line = text.components(separatedBy: .newlines)
+                    .first(where: { $0.hasPrefix("DISCORD_BRIDGE_READY:") }) {
+                    self?.discordBridgeStatus = "Running — " + line.dropFirst("DISCORD_BRIDGE_READY:".count)
+                } else if let line = text.components(separatedBy: .newlines)
+                    .first(where: { $0.hasPrefix("DISCORD_BRIDGE_ERROR:") }) {
+                    self?.discordBridgeStatus = String(line.dropFirst("DISCORD_BRIDGE_ERROR:".count))
+                }
+            }
+        }
+        do {
+            try child.run()
+            discordBridgeProcess = child
+            discordBridgeStatus = "Starting…"
+            if discordTerminationObserver == nil {
+                discordTerminationObserver = NotificationCenter.default.addObserver(
+                    forName: NSApplication.willTerminateNotification,
+                    object: nil,
+                    queue: .main
+                ) { [weak self] _ in
+                    self?.stopDiscordBridge()
+                }
+            }
+        } catch {
+            discordBridgeStatus = "Could not start bridge: \(error.localizedDescription)"
+        }
+    }
+
+    func stopDiscordBridge() {
+        guard let process = discordBridgeProcess, process.isRunning else {
+            discordBridgeStatus = "Stopped"
+            return
+        }
+        process.terminate()
+        discordBridgeStatus = "Stopping…"
     }
 
     private var appShortcuts: [GlobalHotKey] = []
@@ -2623,11 +2724,91 @@ struct TelegramSettingsView: View {
     }
 }
 
+struct DiscordSettingsView: View {
+    @EnvironmentObject private var chat: ChatController
+    @AppStorage("discord.channel-id") private var channelID = ""
+    @AppStorage("discord.owner-user-id") private var ownerUserID = ""
+    @State private var tokenDraft = ""
+    @State private var saveStatus: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("DISCORD BOT")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .tracking(2)
+                .foregroundStyle(.secondary)
+            Text("Helm polls one Discord channel every few seconds; it can't watch DMs without a persistent Gateway connection, so talk to it in a server channel only you (and the bot) can see. The Mac and Helm must stay awake and online.")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                SecureField(KeyStore.hasSecret("discord.bot-token") ? "Bot token saved (enter to replace)" : "Bot token from the Discord Developer Portal", text: $tokenDraft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Save") { saveToken() }
+                    .disabled(tokenDraft.isEmpty)
+            }
+            HStack(spacing: 10) {
+                TextField("Channel ID", text: $channelID)
+                    .textFieldStyle(.roundedBorder)
+                TextField("Your Discord user ID", text: $ownerUserID)
+                    .textFieldStyle(.roundedBorder)
+                if let saveStatus {
+                    Text(saveStatus)
+                        .font(.system(size: 11))
+                        .foregroundStyle(saveStatus.hasPrefix("Could") ? .orange : .green)
+                }
+            }
+
+            HStack(spacing: 12) {
+                Button {
+                    chat.startDiscordBridge()
+                } label: {
+                    Label("Start bridge", systemImage: "paperplane")
+                }
+                .disabled(!KeyStore.hasSecret("discord.bot-token") || channelID.isEmpty || ownerUserID.isEmpty)
+                Button("Stop") { chat.stopDiscordBridge() }
+                    .disabled(chat.discordBridgeStatus == "Stopped" || chat.discordBridgeStatus == "Not configured")
+                Text(chat.discordBridgeStatus)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(chat.discordBridgeStatus.hasPrefix("Running") ? .green : .secondary)
+                    .lineLimit(2)
+            }
+
+            GroupBox("Setup") {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("1. In the Discord Developer Portal, create an Application, add a Bot, and copy its token. Paste it above and save.")
+                    Text("2. Invite the bot to your server with the \"Send Messages\" and \"Read Message History\" permissions, and add/use a channel only you can see.")
+                    Text("3. In Discord, enable Settings > Advanced > Developer Mode. Right-click the channel for \"Copy Channel ID\", and right-click your own name for \"Copy User ID\". Paste both above.")
+                    Text("4. Press Start bridge. From then on only messages from you in that channel run on this Mac; sensitive steps pause and require APPROVE <code> or DENY <code> in Discord.")
+                }
+                .font(.system(size: 10))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("Log: ~/Library/Logs/Helm/discord-bridge.log")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func saveToken() {
+        if KeyStore.saveSecret(tokenDraft.trimmingCharacters(in: .whitespacesAndNewlines), key: "discord.bot-token") {
+            saveStatus = "Bot token saved in Keychain."
+            tokenDraft = ""
+        } else {
+            saveStatus = "Could not save the bot token to Keychain."
+        }
+    }
+}
+
 // MARK: - Settings
 
 struct LogsView: View {
     private static let files: [(String, String)] = [
         ("Engine", "backend.log"), ("Telegram", "telegram-bridge.log"), ("WhatsApp", "whatsapp-bridge.log"),
+        ("Discord", "discord-bridge.log"),
     ]
     @State private var selected = 0
     @State private var contents = "(loading…)"
@@ -2685,7 +2866,8 @@ struct SettingsView: View {
                 Text("Permissions").tag(2)
                 Text("WhatsApp").tag(3)
                 Text("Telegram").tag(4)
-                Text("Logs").tag(5)
+                Text("Discord").tag(5)
+                Text("Logs").tag(6)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -2698,6 +2880,7 @@ struct SettingsView: View {
                     case 2: PermissionsView()
                     case 3: WhatsAppSettingsView()
                     case 4: TelegramSettingsView()
+                    case 5: DiscordSettingsView()
                     default: LogsView()
                     }
                 }
