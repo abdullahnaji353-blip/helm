@@ -202,3 +202,11 @@ OS ever refuses to bind that shortcut or Control+Shift+D (dictation) — e.g.
 another app already grabbed it — Helm previously failed silently. It now
 shows an error line (as the emergency-stop shortcut already did) naming the
 fallback (menu bar / mic button).
+
+**Discord bridge added** (`discord_bridge.py`): polls one configured channel
+via Discord's REST API with the same APPROVE/DENY/STOP flow, owner-only
+allowlist, and remote-task pattern as the Telegram and WhatsApp bridges.
+Bots can't discover new DMs without a persistent Gateway websocket
+connection, so this watches a server channel instead of a DM — set up via
+the new Discord tab in Settings. Slack bridge is the one remaining item from
+the original "fix Telegram, then Discord, Slack, WhatsApp" request.
