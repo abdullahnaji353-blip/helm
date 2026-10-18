@@ -2609,6 +2609,54 @@ struct TelegramSettingsView: View {
 
 // MARK: - Settings
 
+struct LogsView: View {
+    private static let files: [(String, String)] = [
+        ("Engine", "backend.log"), ("Telegram", "telegram-bridge.log"), ("WhatsApp", "whatsapp-bridge.log"),
+    ]
+    @State private var selected = 0
+    @State private var contents = "(loading…)"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("TASK LOGS").font(.system(size: 11, weight: .semibold, design: .monospaced)).tracking(2).foregroundStyle(.secondary)
+            Picker("", selection: $selected) {
+                ForEach(Self.files.indices, id: \.self) { i in Text(Self.files[i].0).tag(i) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .onChange(of: selected) { _ in reload() }
+            ScrollView {
+                Text(contents)
+                    .font(.system(size: 10, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 420)
+            .background(Color.black.opacity(0.2))
+            HStack {
+                Button("Refresh") { reload() }
+                Spacer()
+                Text(Self.folder.path).font(.system(size: 9)).foregroundStyle(.secondary).textSelection(.enabled)
+            }
+        }
+        .onAppear { reload() }
+    }
+
+    private static var folder: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Helm", isDirectory: true)
+    }
+
+    private func reload() {
+        let url = Self.folder.appendingPathComponent(Self.files[selected].1)
+        guard let data = FileManager.default.contents(atPath: url.path), let text = String(data: data, encoding: .utf8) else {
+            contents = "No log yet at \(url.path)."
+            return
+        }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        contents = lines.suffix(300).joined(separator: "\n")
+    }
+}
+
 struct SettingsView: View {
     @EnvironmentObject private var chat: ChatController
     @State private var tab = 0
@@ -2621,6 +2669,7 @@ struct SettingsView: View {
                 Text("Permissions").tag(2)
                 Text("WhatsApp").tag(3)
                 Text("Telegram").tag(4)
+                Text("Logs").tag(5)
             }
             .pickerStyle(.segmented)
             .labelsHidden()
@@ -2632,7 +2681,8 @@ struct SettingsView: View {
                     case 1: AbilitiesView()
                     case 2: PermissionsView()
                     case 3: WhatsAppSettingsView()
-                    default: TelegramSettingsView()
+                    case 4: TelegramSettingsView()
+                    default: LogsView()
                     }
                 }
                 .padding(.horizontal, 24)
