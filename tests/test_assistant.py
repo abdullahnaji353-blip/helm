@@ -28,6 +28,8 @@ from assistant import (
     validate_desktop_action,
     validate_ollama_host,
     validate_url,
+    looks_like_web_task,
+    validate_browser_action,
 )
 from mcp_client import MCPConnector, MCPError
 from providers import openai_turn, parse_json_object, to_anthropic_messages, to_openai_messages
@@ -764,6 +766,42 @@ class PausedTaskTests(unittest.TestCase):
         assistant = DesktopAssistant()
         with tempfile.TemporaryDirectory() as folder, patch("assistant.PAUSED_TASK_PATH", Path(folder) / "paused_task.json"):
             self.assertEqual(assistant.resume_task(), "There is no paused task to resume.")
+
+
+class BrowserTaskTests(unittest.TestCase):
+    def test_looks_like_web_task_detects_urls_and_domains(self):
+        self.assertTrue(looks_like_web_task("open github.com and star a repo"))
+        self.assertTrue(looks_like_web_task("go to https://example.com/page"))
+        self.assertFalse(looks_like_web_task("open Calculator"))
+
+    def test_validate_browser_action_requires_a_known_ref(self):
+        elements = [{"role": "link", "name": "Sign in"}]
+        clean = validate_browser_action({"action": "click", "ref": 1, "reason": "open sign in"}, elements)
+        self.assertEqual(clean["element"], elements[0])
+        with self.assertRaises(ValueError):
+            validate_browser_action({"action": "click", "ref": 9, "reason": "x"}, elements)
+
+    def test_web_task_routes_through_browser_loop_to_done(self):
+        page = MagicMock(url="https://example.com")
+        elements = [{"role": "link", "name": "Sign in"}]
+        actions = [
+            json.dumps({"action": "click", "ref": 1, "reason": "open sign in"}),
+            json.dumps({"action": "done", "message": "Signed in."}),
+        ]
+        da = DesktopAssistant(autonomous=True)
+        output = io.StringIO()
+        with (
+            patch("assistant.BROWSER_ENGINE.page", return_value=page),
+            patch("assistant.browser_automation.goto"),
+            patch("assistant.browser_automation.snapshot", return_value=("Page: 'Example'", elements)),
+            patch("assistant.browser_automation.click_element") as click_element,
+            patch.object(da, "vision_chat", side_effect=actions),
+            patch("assistant.time.sleep"),
+            redirect_stdout(output),
+        ):
+            result = da.desktop_task("open github.com and sign in")
+        click_element.assert_called_once_with(page, elements[0])
+        self.assertEqual(result, "Signed in.")
 
 
 class ClipboardToolTests(unittest.TestCase):

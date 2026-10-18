@@ -3,3 +3,4 @@ pyobjc-framework-Cocoa==11.1; sys_platform == "darwin"
 pyobjc-framework-quartz==11.1; sys_platform == "darwin"
 pyobjc-framework-ApplicationServices==11.1; sys_platform == "darwin"
 anthropic>=0.125,<1
+playwright>=1.60,<2
