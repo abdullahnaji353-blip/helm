@@ -504,8 +504,14 @@ def run_server() -> int:
         bridge.stop_active_task()
         threading.Thread(target=server.shutdown, daemon=True).start()
 
+    def cancel_active_task(_signal: int, _frame: object) -> None:
+        # The host app's emergency-stop shortcut sends this to cancel an in-flight remote task
+        # without shutting down the bridge (its webhook server) itself.
+        bridge.stop_active_task()
+
     signal.signal(signal.SIGTERM, stop_bridge)
     signal.signal(signal.SIGINT, stop_bridge)
+    signal.signal(signal.SIGUSR1, cancel_active_task)
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:

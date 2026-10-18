@@ -982,8 +982,19 @@ final class ChatController: NSObject, ObservableObject {
         stop()
         agents.filter(\.isRunning).forEach { $0.stop() }
         speech.stopSpeaking(at: .immediate)
+        cancelActiveBridgeTasks()
         if hadActiveTasks {
             addActivity("Emergency stop: stopped all running tasks. (⌃⇧Esc)")
+        }
+    }
+
+    /// Cancels any in-flight remote task a bridge is running, without stopping the bridge
+    /// itself — a task triggered from WhatsApp/Telegram/Discord/Slack while you were away is
+    /// covered by the same local kill switch, not just tasks started from this Mac.
+    private func cancelActiveBridgeTasks() {
+        for process in [whatsappBridgeProcess, telegramBridgeProcess, discordBridgeProcess, slackBridgeProcess] {
+            guard let process, process.isRunning else { continue }
+            kill(process.processIdentifier, SIGUSR1)
         }
     }
 

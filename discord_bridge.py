@@ -377,8 +377,14 @@ def run_bridge() -> int:
     def stop_bridge(_signal: int, _frame: object) -> None:
         bridge.stop()
 
+    def cancel_active_task(_signal: int, _frame: object) -> None:
+        # The host app's emergency-stop shortcut sends this to cancel an in-flight remote task
+        # without shutting down the bridge itself.
+        bridge.stop_active_task()
+
     signal.signal(signal.SIGTERM, stop_bridge)
     signal.signal(signal.SIGINT, stop_bridge)
+    signal.signal(signal.SIGUSR1, cancel_active_task)
     try:
         bridge.run_forever()
     except KeyboardInterrupt:
