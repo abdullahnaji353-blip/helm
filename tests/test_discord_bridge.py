@@ -76,6 +76,26 @@ class DiscordMessageHandlingTests(unittest.TestCase):
         bridge._handle_message({"author": {"id": "1"}, "content": "Helm could not complete that task"})
         bridge.handle_owner_message.assert_not_called()
 
+    def test_pairing_mode_adopts_the_first_sender_and_runs_no_commands(self):
+        api = MagicMock()
+        bridge = make_bridge(api, owner_user_id=None)
+        bridge.handle_owner_message = MagicMock()
+        bridge._handle_message({"author": {"id": "555"}, "content": "hello"})
+        self.assertEqual(bridge.owner_user_id, "555")
+        bridge.handle_owner_message.assert_not_called()
+        api.send_text.assert_called_once()
+        self.assertIn("555", api.send_text.call_args.args[1])
+
+    def test_pairing_mode_ignores_further_senders_once_paired(self):
+        api = MagicMock()
+        bridge = make_bridge(api, owner_user_id=None)
+        bridge.handle_owner_message = MagicMock()
+        bridge._handle_message({"author": {"id": "555"}, "content": "hello"})
+        api.send_text.reset_mock()
+        bridge._handle_message({"author": {"id": "777"}, "content": "open Safari"})
+        bridge.handle_owner_message.assert_not_called()
+        api.send_text.assert_not_called()
+
     def test_approval_commands_resolve_only_current_code(self):
         api = MagicMock()
         bridge = make_bridge(api)

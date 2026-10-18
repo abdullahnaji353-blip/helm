@@ -103,7 +103,7 @@ class SlackBridge:
         *,
         bot_token: str,
         channel_id: str,
-        owner_user_id: str,
+        owner_user_id: str | None,
         project_root: Path,
         python: str = sys.executable,
     ) -> None:
@@ -140,9 +140,22 @@ class SlackBridge:
             return  # ignore any bot message, including our own
         user_id = message.get("user")
         text = message.get("text")
-        if not isinstance(user_id, str) or not isinstance(text, str):
+        if not isinstance(user_id, str) or not isinstance(text, str) or user_id == self._bot_user_id:
             return
-        if user_id == self._bot_user_id or user_id != self.owner_user_id:
+        if self.owner_user_id is None:
+            # Pairing mode: the first person to write in the channel becomes the owner. No
+            # command ever runs here, same as Telegram's chat-ID pairing.
+            self.owner_user_id = user_id
+            print(f"SLACK_BRIDGE_PAIRED:{user_id}", flush=True)
+            try:
+                self.api.send_text(
+                    self.channel_id,
+                    f"Paired to <@{user_id}>. Only messages from you will run on this Mac from now on.",
+                )
+            except SlackError:
+                LOGGER.exception("Could not send pairing confirmation")
+            return
+        if user_id != self.owner_user_id:
             return  # silently ignore anyone who is not the configured owner
         text = text.strip()
         if not text or len(text) > MAX_MESSAGE_LENGTH:
@@ -309,13 +322,12 @@ def configure_logging() -> Path:
 def bridge_from_environment() -> SlackBridge:
     bot_token = os.environ.get("HELM_SLACK_BOT_TOKEN", "")
     channel_id = os.environ.get("HELM_SLACK_CHANNEL_ID", "").strip()
-    owner_user_id = os.environ.get("HELM_SLACK_OWNER_USER_ID", "").strip()
+    owner_raw = os.environ.get("HELM_SLACK_OWNER_USER_ID", "").strip()
     if not bot_token:
         raise ValueError("Missing Slack configuration: bot token.")
     if not channel_id:
         raise ValueError("Missing Slack configuration: channel ID.")
-    if not owner_user_id:
-        raise ValueError("Missing Slack configuration: owner user ID.")
+    owner_user_id: str | None = owner_raw or None  # empty means pairing mode
     project_root = Path(os.environ.get("ASSISTANT_PROJECT_DIR", Path(__file__).resolve().parent))
     return SlackBridge(
         bot_token=bot_token,
@@ -334,8 +346,9 @@ def run_bridge() -> int:
         LOGGER.exception("Slack bridge configuration failed")
         print(f"SLACK_BRIDGE_ERROR:{error}", flush=True)
         return 1
-    LOGGER.info("Slack bridge polling started, channel=%s owner=%s", bridge.channel_id, bridge.owner_user_id)
-    print(f"SLACK_BRIDGE_READY:channel {bridge.channel_id}", flush=True)
+    mode = "pairing (no owner set yet)" if bridge.owner_user_id is None else f"owner={bridge.owner_user_id}"
+    LOGGER.info("Slack bridge polling started, channel=%s %s", bridge.channel_id, mode)
+    print(f"SLACK_BRIDGE_READY:channel {bridge.channel_id}, {mode}", flush=True)
 
     def stop_bridge(_signal: int, _frame: object) -> None:
         bridge.stop()

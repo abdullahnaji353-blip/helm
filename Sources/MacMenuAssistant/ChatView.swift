@@ -533,8 +533,8 @@ final class ChatController: NSObject, ObservableObject {
         }
         let channelID = UserDefaults.standard.string(forKey: "discord.channel-id") ?? ""
         let ownerUserID = UserDefaults.standard.string(forKey: "discord.owner-user-id") ?? ""
-        guard !channelID.isEmpty, !ownerUserID.isEmpty else {
-            discordBridgeStatus = "Fill in the channel ID and owner user ID first."
+        guard !channelID.isEmpty else {
+            discordBridgeStatus = "Fill in the channel ID first."
             return
         }
         let python = projectRoot.appendingPathComponent(".venv/bin/python")
@@ -587,12 +587,16 @@ final class ChatController: NSObject, ObservableObject {
             }
             let text = String(decoding: data, as: UTF8.self)
             DispatchQueue.main.async {
-                if let line = text.components(separatedBy: .newlines)
-                    .first(where: { $0.hasPrefix("DISCORD_BRIDGE_READY:") }) {
+                let lines = text.components(separatedBy: .newlines)
+                if let line = lines.first(where: { $0.hasPrefix("DISCORD_BRIDGE_READY:") }) {
                     self?.discordBridgeStatus = "Running — " + line.dropFirst("DISCORD_BRIDGE_READY:".count)
-                } else if let line = text.components(separatedBy: .newlines)
-                    .first(where: { $0.hasPrefix("DISCORD_BRIDGE_ERROR:") }) {
+                } else if let line = lines.first(where: { $0.hasPrefix("DISCORD_BRIDGE_ERROR:") }) {
                     self?.discordBridgeStatus = String(line.dropFirst("DISCORD_BRIDGE_ERROR:".count))
+                }
+                if let line = lines.first(where: { $0.hasPrefix("DISCORD_BRIDGE_PAIRED:") }) {
+                    UserDefaults.standard.set(
+                        String(line.dropFirst("DISCORD_BRIDGE_PAIRED:".count)), forKey: "discord.owner-user-id"
+                    )
                 }
             }
         }
@@ -634,8 +638,8 @@ final class ChatController: NSObject, ObservableObject {
         }
         let channelID = UserDefaults.standard.string(forKey: "slack.channel-id") ?? ""
         let ownerUserID = UserDefaults.standard.string(forKey: "slack.owner-user-id") ?? ""
-        guard !channelID.isEmpty, !ownerUserID.isEmpty else {
-            slackBridgeStatus = "Fill in the channel ID and owner user ID first."
+        guard !channelID.isEmpty else {
+            slackBridgeStatus = "Fill in the channel ID first."
             return
         }
         let python = projectRoot.appendingPathComponent(".venv/bin/python")
@@ -688,12 +692,16 @@ final class ChatController: NSObject, ObservableObject {
             }
             let text = String(decoding: data, as: UTF8.self)
             DispatchQueue.main.async {
-                if let line = text.components(separatedBy: .newlines)
-                    .first(where: { $0.hasPrefix("SLACK_BRIDGE_READY:") }) {
+                let lines = text.components(separatedBy: .newlines)
+                if let line = lines.first(where: { $0.hasPrefix("SLACK_BRIDGE_READY:") }) {
                     self?.slackBridgeStatus = "Running — " + line.dropFirst("SLACK_BRIDGE_READY:".count)
-                } else if let line = text.components(separatedBy: .newlines)
-                    .first(where: { $0.hasPrefix("SLACK_BRIDGE_ERROR:") }) {
+                } else if let line = lines.first(where: { $0.hasPrefix("SLACK_BRIDGE_ERROR:") }) {
                     self?.slackBridgeStatus = String(line.dropFirst("SLACK_BRIDGE_ERROR:".count))
+                }
+                if let line = lines.first(where: { $0.hasPrefix("SLACK_BRIDGE_PAIRED:") }) {
+                    UserDefaults.standard.set(
+                        String(line.dropFirst("SLACK_BRIDGE_PAIRED:".count)), forKey: "slack.owner-user-id"
+                    )
                 }
             }
         }
@@ -2951,7 +2959,7 @@ struct DiscordSettingsView: View {
             HStack(spacing: 10) {
                 TextField("Channel ID", text: $channelID)
                     .textFieldStyle(.roundedBorder)
-                TextField("Your Discord user ID", text: $ownerUserID)
+                TextField("Owner user ID (leave empty to pair)", text: $ownerUserID)
                     .textFieldStyle(.roundedBorder)
                 if let saveStatus {
                     Text(saveStatus)
@@ -2966,7 +2974,7 @@ struct DiscordSettingsView: View {
                 } label: {
                     Label("Start bridge", systemImage: "paperplane")
                 }
-                .disabled(!KeyStore.hasSecret("discord.bot-token") || channelID.isEmpty || ownerUserID.isEmpty)
+                .disabled(!KeyStore.hasSecret("discord.bot-token") || channelID.isEmpty)
                 Button("Stop") { chat.stopDiscordBridge() }
                     .disabled(chat.discordBridgeStatus == "Stopped" || chat.discordBridgeStatus == "Not configured")
                 Text(chat.discordBridgeStatus)
@@ -2981,8 +2989,9 @@ struct DiscordSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("1. In the Discord Developer Portal, create an Application, add a Bot, and copy its token. Paste it above and save.")
                     Text("2. Invite the bot to your server with the \"Send Messages\" and \"Read Message History\" permissions, and add/use a channel only you can see.")
-                    Text("3. In Discord, enable Settings > Advanced > Developer Mode. Right-click the channel for \"Copy Channel ID\", and right-click your own name for \"Copy User ID\". Paste both above.")
-                    Text("4. Press Start bridge. From then on only messages from you in that channel run on this Mac; sensitive steps pause and require APPROVE <code> or DENY <code> in Discord.")
+                    Text("3. In Discord, enable Settings > Advanced > Developer Mode, then right-click the channel for \"Copy Channel ID\". Paste it above.")
+                    Text("4. Leave the owner user ID empty and press Start bridge. Message the bot anything in that channel — Helm pairs to whoever sends the first message there, and only that person's messages run anything after that.")
+                    Text("5. Sensitive steps pause and require APPROVE <code> or DENY <code> in Discord.")
                 }
                 .font(.system(size: 10))
                 .fixedSize(horizontal: false, vertical: true)
@@ -3033,7 +3042,7 @@ struct SlackSettingsView: View {
             HStack(spacing: 10) {
                 TextField("Channel ID (e.g. C0123456789)", text: $channelID)
                     .textFieldStyle(.roundedBorder)
-                TextField("Your Slack user ID (e.g. U0123456789)", text: $ownerUserID)
+                TextField("Owner user ID (leave empty to pair)", text: $ownerUserID)
                     .textFieldStyle(.roundedBorder)
                 if let saveStatus {
                     Text(saveStatus)
@@ -3048,7 +3057,7 @@ struct SlackSettingsView: View {
                 } label: {
                     Label("Start bridge", systemImage: "paperplane")
                 }
-                .disabled(!KeyStore.hasSecret("slack.bot-token") || channelID.isEmpty || ownerUserID.isEmpty)
+                .disabled(!KeyStore.hasSecret("slack.bot-token") || channelID.isEmpty)
                 Button("Stop") { chat.stopSlackBridge() }
                     .disabled(chat.slackBridgeStatus == "Stopped" || chat.slackBridgeStatus == "Not configured")
                 Text(chat.slackBridgeStatus)
@@ -3063,8 +3072,9 @@ struct SlackSettingsView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("1. At api.slack.com/apps, create an app, add the chat:write, channels:history, and groups:history (or im:history) scopes under OAuth & Permissions, then install it to your workspace.")
                     Text("2. Copy the Bot User OAuth Token (starts with xoxb-). Paste it above and save.")
-                    Text("3. Invite the bot to a channel only you use for this (/invite @YourBotName). Right-click the channel for its ID, and check your Slack profile for your own member ID.")
-                    Text("4. Press Start bridge. From then on only messages from you in that channel run on this Mac; sensitive steps pause and require APPROVE <code> or DENY <code> in Slack.")
+                    Text("3. Invite the bot to a channel only you use for this (/invite @YourBotName). Right-click the channel for its ID and paste it above.")
+                    Text("4. Leave the owner user ID empty and press Start bridge. Message the bot anything in that channel — Helm pairs to whoever sends the first message there, and only that person's messages run anything after that.")
+                    Text("5. Sensitive steps pause and require APPROVE <code> or DENY <code> in Slack.")
                 }
                 .font(.system(size: 10))
                 .fixedSize(horizontal: false, vertical: true)

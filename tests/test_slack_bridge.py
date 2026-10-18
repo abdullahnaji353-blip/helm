@@ -85,6 +85,26 @@ class SlackMessageHandlingTests(unittest.TestCase):
         bridge._handle_message({"user": "U999", "text": "hi", "bot_id": "B1"})
         bridge.handle_owner_message.assert_not_called()
 
+    def test_pairing_mode_adopts_the_first_sender_and_runs_no_commands(self):
+        api = MagicMock()
+        bridge = make_bridge(api, owner_user_id=None)
+        bridge.handle_owner_message = MagicMock()
+        bridge._handle_message({"user": "U555", "text": "hello"})
+        self.assertEqual(bridge.owner_user_id, "U555")
+        bridge.handle_owner_message.assert_not_called()
+        api.send_text.assert_called_once()
+        self.assertIn("U555", api.send_text.call_args.args[1])
+
+    def test_pairing_mode_ignores_further_senders_once_paired(self):
+        api = MagicMock()
+        bridge = make_bridge(api, owner_user_id=None)
+        bridge.handle_owner_message = MagicMock()
+        bridge._handle_message({"user": "U555", "text": "hello"})
+        api.send_text.reset_mock()
+        bridge._handle_message({"user": "U777", "text": "open Safari"})
+        bridge.handle_owner_message.assert_not_called()
+        api.send_text.assert_not_called()
+
     def test_approval_commands_resolve_only_current_code(self):
         api = MagicMock()
         bridge = make_bridge(api)
