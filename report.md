@@ -172,3 +172,25 @@ unchanged; the full model-driven training run was not repeated.
 5. Add cancellable/resumable task records and user controls for saved history.
 6. Add automated SwiftUI tests and UI-level tests for permissions, emergency
    stop, and responsive layouts.
+
+## Addendum — this session
+
+Since the audit above, these were added, each tested (Python: unit tests;
+Swift: build check) and most verified live against real apps/files:
+
+| Feature | Status |
+|---|---|
+| Telegram bridge (own file, polling, pairing mode, optional HTTP proxy) | DONE |
+| System prompt shrink (long example wall broke tool-calling on gemma4:e2b) | DONE |
+| "Continue working, don't just ask" rule for multi-step tasks | DONE |
+| `window_control` (move/resize/snap/minimize/close) | DONE, live-verified |
+| `file_operations` (list/read/copy/move/rename/delete, home-scoped, Trash) | DONE, live-verified |
+| Voice barge-in (talking over Helm stops it) | DONE, build-verified only (no mic in this environment) |
+| `drag_in_app` (in-app drag-and-drop) | DONE; Finder file-drag itself has a known macOS synthetic-input limitation — use `file_operations` for moving files |
+| Settings -> Logs tab | DONE |
+
+Known gaps, not yet started:
+- Resumable/pausable task state (today: full-stop only via Control+Shift+Escape)
+- A real browser automation framework (Playwright/WebDriver) in place of the
+  current Accessibility-based page reading — a large, higher-risk swap of
+  working code; flagged for confirmation before starting
