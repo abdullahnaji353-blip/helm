@@ -27,7 +27,7 @@ from writing_check import grade
 from screen_elements import (
     bring_to_front, describe_elements, frontmost_app_name, frontmost_elements, mark_elements,
     app_pid, choose_menu, element_center, find_in_app, post_keys, post_text, focus_field, press, press_matching, read_app, wait_for_frontmost, window_title,
-    window_control,
+    window_control, DRAG_ROLES,
 )
 from providers import PROVIDERS, anthropic_turn, check_provider, openai_turn, parse_json_object, provider_key
 
@@ -228,6 +228,16 @@ CHAT_TOOLS = [
         ),
         "parameters": {"type": "object", "properties": {
             "app": {"type": "string"}, "label": {"type": "string"}}, "required": ["app", "label"]}}},
+    {"type": "function", "function": {
+        "name": "drag_in_app",
+        "description": (
+            "Drag one item onto another within an app's own UI by their visible names (e.g. reordering "
+            "a list, dragging a slider). For moving/copying an actual FILE into a folder, use "
+            "file_operations(move/copy) instead — it's more reliable than simulating a Finder drag."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string"}, "from_label": {"type": "string"}, "to_label": {"type": "string"},
+        }, "required": ["app", "from_label", "to_label"]}}},
     {"type": "function", "function": {
         "name": "calculator",
         "description": (
@@ -650,6 +660,37 @@ def real_click(pyautogui, x: int, y: int) -> None:
     """Click with the real pointer, then hand the user's pointer straight back."""
     home = pyautogui.position()
     pyautogui.click(x, y)
+    pyautogui.moveTo(*home)
+
+
+def real_drag(pyautogui, start: tuple[int, int], end: tuple[int, int]) -> None:
+    """Drag with the real pointer (macOS drag targets mostly don't expose an AX drop action),
+    then hand the user's pointer straight back. A single jump-and-release (pyautogui.dragTo)
+    moves the item but macOS's own drag manager never engages, so nothing actually drops;
+    a brief pause after mouse-down plus incremental movement is what makes it register."""
+    import Quartz
+
+    home = pyautogui.position()
+    source = Quartz.CGEventSourceCreate(Quartz.kCGEventSourceStateHIDSystemState)
+
+    def post(kind):
+        event = Quartz.CGEventCreateMouseEvent(source, kind, (x, y), Quartz.kCGMouseButtonLeft)
+        Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+
+    x, y = start
+    post(Quartz.kCGEventMouseMoved)
+    x, y = start
+    post(Quartz.kCGEventLeftMouseDown)
+    time.sleep(0.2)  # let the OS recognise this as the start of a drag, not a click
+    steps = 12
+    for i in range(1, steps + 1):
+        x = start[0] + (end[0] - start[0]) * i / steps
+        y = start[1] + (end[1] - start[1]) * i / steps
+        post(Quartz.kCGEventLeftMouseDragged)
+        time.sleep(0.02)
+    time.sleep(0.15)  # settle on the drop target before releasing
+    x, y = end
+    post(Quartz.kCGEventLeftMouseUp)
     pyautogui.moveTo(*home)
 
 
@@ -1101,7 +1142,7 @@ class DesktopAssistant:
                            "new_document again." if problems else ""))
             if name == "ask_chatgpt":
                 return self.ask_chatgpt(str(args.get("question", "")))
-            if name in {"click_in_app", "menu_in_app", "type_in_app", "keys_in_app"}:
+            if name in {"click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "drag_in_app"}:
                 return self.interact(name, args)
             if name == "window_control":
                 app = str(args.get("app", "")).strip()
@@ -1634,7 +1675,13 @@ class DesktopAssistant:
         if not APP_NAME_PATTERN.fullmatch(app):
             return "That is not a valid app name."
         try:
-            subprocess.run(["open", "-a", app], check=True, capture_output=True)
+            if app.lower() == "finder":
+                # "open -a Finder" resets to Finder's default new-window (e.g. Recents),
+                # discarding whatever window was actually frontmost. Finder is always
+                # running, so just activate it instead of relaunching it.
+                subprocess.run(["osascript", "-e", 'tell application "Finder" to activate'], check=True, capture_output=True)
+            else:
+                subprocess.run(["open", "-a", app], check=True, capture_output=True)
         except subprocess.CalledProcessError:
             return f"{app} is not installed."
         if not (wait_for_frontmost(app) or bring_to_front(app)):
@@ -1696,6 +1743,24 @@ class DesktopAssistant:
             time.sleep(0.5)
             shown = " ".join(read_app(app, max_chars=600)[0].replace("\u200e", "").replace("\u2212", "-").split())[:300]
             return f"Pressed '{found}' in {app}. The window now shows: {shown}"
+        if name == "drag_in_app":
+            from_label, to_label = str(args.get("from_label", "")).strip(), str(args.get("to_label", "")).strip()
+            start, start_found = find_in_app(app, lambda text: names_match(from_label, text), roles=DRAG_ROLES)
+            end, end_found = find_in_app(app, lambda text: names_match(to_label, text), roles=DRAG_ROLES)
+            if start is None:
+                return f"No '{from_label}' to drag in {app}. Use read_screen to see what is there."
+            if end is None:
+                return f"No '{to_label}' to drag onto in {app}. Use read_screen to see what is there."
+            start_point, end_point = element_center(start), element_center(end)
+            if not start_point or not end_point:
+                return f"'{start_found}' or '{end_found}' has no on-screen position to drag."
+            show_cursor(start_point, f"drag {start_found}")
+            if frontmost_app_name() != app:
+                return f"{app} is no longer in front; nothing was dragged."
+            real_drag(pyautogui, start_point, end_point)
+            show_cursor(end_point, f"dropped on {end_found}", click=True)
+            time.sleep(0.5)
+            return f"Dragged '{start_found}' onto '{end_found}' in {app}."
         if name == "menu_in_app":
             show_cursor(None, f"menu {args.get('path', '')}")
             path = [part.strip() for part in re.split(r">|/|→", str(args.get("path", ""))) if part.strip()]

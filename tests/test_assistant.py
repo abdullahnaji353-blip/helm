@@ -940,6 +940,33 @@ class FileOperationsTests(unittest.TestCase):
             self.assertTrue((Path(folder) / "a.txt").exists())  # source untouched
 
 
+class DragInAppTests(unittest.TestCase):
+    def test_drags_between_two_found_elements(self):
+        assistant = DesktopAssistant(autonomous=True)
+        fake = MagicMock()
+        fake.position.return_value = (10, 10)
+        found = iter([("item-a", "a.txt"), ("item-b", "Archive")])
+        with patch.object(assistant, "focus_app", return_value=""), \
+                patch.object(DesktopAssistant, "desktop_tools", return_value=fake), \
+                patch("assistant.find_in_app", side_effect=lambda app, m, roles=None: next(found)), \
+                patch("assistant.element_center", side_effect=[(50, 50), (200, 200)]), \
+                patch("assistant.frontmost_app_name", return_value="Finder"), \
+                patch("assistant.real_drag") as drag, patch("assistant.time.sleep"):
+            result = assistant.interact("drag_in_app", {"app": "Finder", "from_label": "a.txt", "to_label": "Archive"})
+        drag.assert_called_once_with(fake, (50, 50), (200, 200))
+        self.assertIn("Dragged 'a.txt' onto 'Archive'", result)
+
+    def test_missing_source_element_is_reported(self):
+        assistant = DesktopAssistant(autonomous=True)
+        with patch.object(assistant, "focus_app", return_value=""), \
+                patch.object(DesktopAssistant, "desktop_tools", return_value=MagicMock()), \
+                patch("assistant.find_in_app", return_value=(None, "")), \
+                patch("assistant.real_drag") as drag:
+            result = assistant.interact("drag_in_app", {"app": "Finder", "from_label": "ghost.txt", "to_label": "Archive"})
+        drag.assert_not_called()
+        self.assertIn("No 'ghost.txt'", result)
+
+
 class WindowControlTests(unittest.TestCase):
     def test_rejects_invalid_app_name_before_touching_the_screen(self):
         assistant = DesktopAssistant()

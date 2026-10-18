@@ -265,6 +265,9 @@ PRESSABLE_ROLES = {
     "AXButton", "AXLink", "AXMenuItem", "AXMenuButton", "AXCheckBox", "AXRadioButton",
     "AXPopUpButton", "AXTab", "AXCell", "AXRow", "AXDisclosureTriangle", "AXStaticText",
 }
+# Finder icon-view files expose as AXImage, not any of the above — kept separate so
+# click_in_app/menu_in_app don't start matching decorative icons in other apps.
+DRAG_ROLES = PRESSABLE_ROLES | {"AXImage"}
 
 
 def _label(element) -> str:
