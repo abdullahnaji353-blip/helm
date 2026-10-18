@@ -1841,9 +1841,10 @@ private struct Ability: Identifiable {
     let tools: [String]
 
     static let all = [
-        Ability(id: "screen", title: "Screen control", detail: "Clicks, types, reads and navigates apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard"]),
+        Ability(id: "screen", title: "Screen control", detail: "Clicks, types, reads and navigates apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard", "window_control"]),
         Ability(id: "web", title: "Web, YouTube & TikTok", detail: "Opens websites, searches the web and finds video examples", symbol: "magnifyingglass", tools: ["open_url", "web_search", "ask_chatgpt", "watch_video"]),
         Ability(id: "apps", title: "Applications", detail: "Opens apps and manages installs with confirmation", symbol: "square.grid.2x2", tools: ["open_app", "install_app", "uninstall_app"]),
+        Ability(id: "files", title: "Files & folders", detail: "List, read, copy, move and delete files in your home folder — deletes and moves always ask first", symbol: "folder", tools: ["file_operations"]),
         Ability(id: "media", title: "Music & volume", detail: "Plays, pauses and skips in Spotify or Music", symbol: "music.note", tools: ["media_control", "set_volume"]),
         Ability(id: "status", title: "Time & battery", detail: "Reads the current date, time and battery level", symbol: "battery.75percent", tools: ["system_status"]),
     ]
