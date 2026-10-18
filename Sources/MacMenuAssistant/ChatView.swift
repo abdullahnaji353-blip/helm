@@ -1018,9 +1018,17 @@ final class ChatController: NSObject, ObservableObject {
     }
 
     private func logBackend(_ text: String) {
+        if let error = Self.appendToHelmLog(filename: "backend.log", text: text) {
+            lines.append(ChatLine(role: .error, text: "Could not securely write the backend log: \(error)"))
+        }
+    }
+
+    /// Appends redacted text to ~/Library/Logs/Helm/<filename>, creating the folder and file with
+    /// owner-only permissions if needed. Shared by the main chat log and each agent's own log.
+    fileprivate static func appendToHelmLog(filename: String, text: String) -> String? {
         let folder = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Helm", isDirectory: true)
-        let url = folder.appendingPathComponent("backend.log")
-        let redacted = Self.redactLogSecrets(text)
+        let url = folder.appendingPathComponent(filename)
+        let redacted = redactLogSecrets(text)
         do {
             try FileManager.default.createDirectory(
                 at: folder,
@@ -1035,12 +1043,13 @@ final class ChatController: NSObject, ObservableObject {
             handle.seekToEndOfFile()
             handle.write(Data(redacted.utf8))
             try handle.close()
+            return nil
         } catch {
-            lines.append(ChatLine(role: .error, text: "Could not securely write the backend log: \(error.localizedDescription)"))
+            return error.localizedDescription
         }
     }
 
-    private static func redactLogSecrets(_ text: String) -> String {
+    fileprivate static func redactLogSecrets(_ text: String) -> String {
         let patterns: [(String, String)] = [
             (#"(?i)(\b(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|password|passphrase|secret|authorization)\b(?:\s+(?:is\s+)?|[:=]\s*))[^\s,;]+"#, "$1[REDACTED]"),
             (#"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+"#, "$1[REDACTED]"),
@@ -3114,6 +3123,7 @@ struct LogsView: View {
     private static let files: [(String, String)] = [
         ("Engine", "backend.log"), ("Telegram", "telegram-bridge.log"), ("WhatsApp", "whatsapp-bridge.log"),
         ("Discord", "discord-bridge.log"), ("Slack", "slack-bridge.log"),
+        ("Agent 1", "agent1.log"), ("Agent 2", "agent2.log"), ("Agent 3", "agent3.log"),
     ]
     @State private var selected = 0
     @State private var contents = "(loading…)"
@@ -3448,6 +3458,15 @@ final class AgentRun: ObservableObject, Identifiable {
             .appendingPathComponent("Library/Application Support/Local Desktop Assistant/agent\(number)_history.json")
     }
 
+    /// Mirrors the main chat's backend.log, so a failed or misbehaving agent can actually be
+    /// reviewed afterward instead of only showing the last 3 lines in its lane, then losing
+    /// everything on the next run.
+    private var logFilename: String { "agent\(number).log" }
+
+    private func log(_ text: String) {
+        _ = ChatController.appendToHelmLog(filename: logFilename, text: text)
+    }
+
     func run(_ text: String) {
         guard let owner, !isRunning else { return }
         try? FileManager.default.removeItem(at: historyURL)  // each task starts fresh
@@ -3455,6 +3474,7 @@ final class AgentRun: ObservableObject, Identifiable {
         activity = ["Starting…"]
         reply = ""
         failed = false
+        log("\n=== \(Date()) task: \(text)\n")
         let child = Process()
         let output = Pipe()
         let input = Pipe()
@@ -3502,6 +3522,7 @@ final class AgentRun: ObservableObject, Identifiable {
     }
 
     private func receive(_ text: String) {
+        log(text)
         buffer += text
         let parts = buffer.components(separatedBy: .newlines)
         buffer = parts.last ?? ""
@@ -3541,6 +3562,7 @@ final class AgentRun: ObservableObject, Identifiable {
 
     private func finish(status: Int32) {
         if status != 0 && reply.isEmpty { failed = true; note("Stopped (exit \(status)).") }
+        log("\n=== \(Date()) exited with status \(status)\n")
         process = nil
         inputPipe = nil
         pendingApproval = nil
