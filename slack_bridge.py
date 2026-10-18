@@ -37,6 +37,14 @@ class SlackError(RuntimeError):
     pass
 
 
+class SlackRateLimited(SlackError):
+    """Slack answered 429; retry_after is the seconds it asked us to wait."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(f"Slack rate-limited this request; retry after {retry_after:.1f}s.")
+        self.retry_after = retry_after
+
+
 class SlackBotAPI:
     def __init__(self, bot_token: str) -> None:
         if not bot_token.strip().startswith("xoxb-"):
@@ -57,6 +65,12 @@ class SlackBotAPI:
             response = urlopen(request, timeout=timeout)
             result = json.loads(response.read())
         except HTTPError as error:
+            if error.code == 429:
+                try:
+                    retry_after = float(error.headers.get("Retry-After", "1"))
+                except (TypeError, ValueError):
+                    retry_after = 1.0
+                raise SlackRateLimited(min(retry_after, 60.0)) from error
             raise SlackError(f"Slack returned HTTP {error.code} for {path}.") from error
         except (URLError, TimeoutError, OSError) as error:
             raise SlackError(f"Could not reach Slack for {path}.") from error
@@ -123,13 +137,17 @@ class SlackBridge:
     def run_forever(self) -> None:
         self._bot_user_id = self.api.current_user_id()
         while not self._stopping.is_set():
+            wait_seconds = POLL_INTERVAL
             try:
                 for message in self.api.get_messages_after(self.channel_id, self._last_ts):
                     self._last_ts = message.get("ts") or self._last_ts
                     self._handle_message(message)
+            except SlackRateLimited as error:
+                LOGGER.warning("Rate-limited: %s", error)
+                wait_seconds = error.retry_after
             except SlackError as error:
                 LOGGER.warning("Poll failed: %s", error)
-            self._stopping.wait(POLL_INTERVAL)
+            self._stopping.wait(wait_seconds)
 
     def stop(self) -> None:
         self._stopping.set()

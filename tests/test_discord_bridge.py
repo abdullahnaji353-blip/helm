@@ -6,7 +6,7 @@ from threading import Thread
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
-from discord_bridge import DiscordBotAPI, DiscordBridge, DiscordError, PendingApproval
+from discord_bridge import DiscordBotAPI, DiscordBridge, DiscordError, DiscordRateLimited, PendingApproval
 
 
 def make_bridge(api=None, owner_user_id="999"):
@@ -44,6 +44,14 @@ class DiscordBotAPITests(unittest.TestCase):
             with self.assertRaisesRegex(DiscordError, "HTTP 401"):
                 api.send_text("42", "hello")
 
+    def test_429_response_raises_rate_limited_with_retry_after(self):
+        error = HTTPError("url", 429, "rate limited", {"Retry-After": "2.5"}, None)
+        with patch("discord_bridge.urlopen", side_effect=error):
+            api = DiscordBotAPI("a-fake-discord-bot-token-value")
+            with self.assertRaises(DiscordRateLimited) as context:
+                api.send_text("42", "hello")
+        self.assertAlmostEqual(context.exception.retry_after, 2.5)
+
     def test_get_messages_after_reverses_to_oldest_first(self):
         response = MagicMock()
         response.read.return_value = json.dumps([{"id": "2"}, {"id": "1"}]).encode()
@@ -51,6 +59,17 @@ class DiscordBotAPITests(unittest.TestCase):
             api = DiscordBotAPI("a-fake-discord-bot-token-value")
             messages = api.get_messages_after("42", after=None)
         self.assertEqual([m["id"] for m in messages], ["1", "2"])
+
+
+class DiscordRunForeverTests(unittest.TestCase):
+    def test_rate_limit_waits_retry_after_not_poll_interval(self):
+        api = MagicMock()
+        api.current_user_id.return_value = "1"
+        api.get_messages_after.side_effect = DiscordRateLimited(12.0)
+        bridge = make_bridge(api)
+        bridge._stopping.wait = MagicMock(side_effect=lambda _: bridge._stopping.set())
+        bridge.run_forever()
+        bridge._stopping.wait.assert_called_once_with(12.0)
 
 
 class DiscordMessageHandlingTests(unittest.TestCase):

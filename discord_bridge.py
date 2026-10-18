@@ -36,6 +36,14 @@ class DiscordError(RuntimeError):
     pass
 
 
+class DiscordRateLimited(DiscordError):
+    """Discord answered 429; retry_after is the seconds it asked us to wait."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__(f"Discord rate-limited this request; retry after {retry_after:.1f}s.")
+        self.retry_after = retry_after
+
+
 class DiscordBotAPI:
     def __init__(self, bot_token: str) -> None:
         if not bot_token.strip() or len(bot_token.strip()) < 20:
@@ -59,6 +67,12 @@ class DiscordBotAPI:
             body = response.read()
             return json.loads(body) if body else None
         except HTTPError as error:
+            if error.code == 429:
+                try:
+                    retry_after = float(error.headers.get("Retry-After", "1"))
+                except (TypeError, ValueError):
+                    retry_after = 1.0
+                raise DiscordRateLimited(min(retry_after, 60.0)) from error
             try:
                 detail = error.read().decode("utf-8", "replace")[:300]
             except Exception:
@@ -126,13 +140,17 @@ class DiscordBridge:
     def run_forever(self) -> None:
         self._bot_user_id = self.api.current_user_id()
         while not self._stopping.is_set():
+            wait_seconds = POLL_INTERVAL
             try:
                 for message in self.api.get_messages_after(self.channel_id, self._last_message_id):
                     self._last_message_id = message.get("id") or self._last_message_id
                     self._handle_message(message)
+            except DiscordRateLimited as error:
+                LOGGER.warning("Rate-limited: %s", error)
+                wait_seconds = error.retry_after
             except DiscordError as error:
                 LOGGER.warning("Poll failed: %s", error)
-            self._stopping.wait(POLL_INTERVAL)
+            self._stopping.wait(wait_seconds)
 
     def stop(self) -> None:
         self._stopping.set()

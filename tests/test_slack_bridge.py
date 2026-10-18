@@ -6,7 +6,7 @@ from threading import Thread
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
-from slack_bridge import PendingApproval, SlackBotAPI, SlackBridge, SlackError
+from slack_bridge import PendingApproval, SlackBotAPI, SlackBridge, SlackError, SlackRateLimited
 
 
 def make_bridge(api=None, owner_user_id="U999"):
@@ -53,6 +53,14 @@ class SlackBotAPITests(unittest.TestCase):
             with self.assertRaisesRegex(SlackError, "channel_not_found"):
                 api.send_text("C42", "hello")
 
+    def test_429_response_raises_rate_limited_with_retry_after(self):
+        error = HTTPError("url", 429, "rate limited", {"Retry-After": "2.5"}, None)
+        with patch("slack_bridge.urlopen", side_effect=error):
+            api = SlackBotAPI("xoxb-fake-slack-bot-token")
+            with self.assertRaises(SlackRateLimited) as context:
+                api.send_text("C42", "hello")
+        self.assertAlmostEqual(context.exception.retry_after, 2.5)
+
     def test_get_messages_after_reverses_to_oldest_first(self):
         response = MagicMock()
         response.read.return_value = json.dumps({"ok": True, "messages": [{"ts": "2"}, {"ts": "1"}]}).encode()
@@ -60,6 +68,17 @@ class SlackBotAPITests(unittest.TestCase):
             api = SlackBotAPI("xoxb-fake-slack-bot-token")
             messages = api.get_messages_after("C42", oldest=None)
         self.assertEqual([m["ts"] for m in messages], ["1", "2"])
+
+
+class SlackRunForeverTests(unittest.TestCase):
+    def test_rate_limit_waits_retry_after_not_poll_interval(self):
+        api = MagicMock()
+        api.current_user_id.return_value = "U1"
+        api.get_messages_after.side_effect = SlackRateLimited(12.0)
+        bridge = make_bridge(api)
+        bridge._stopping.wait = MagicMock(side_effect=lambda _: bridge._stopping.set())
+        bridge.run_forever()
+        bridge._stopping.wait.assert_called_once_with(12.0)
 
 
 class SlackMessageHandlingTests(unittest.TestCase):
