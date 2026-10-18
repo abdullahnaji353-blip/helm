@@ -534,11 +534,26 @@ final class ChatController: NSObject, ObservableObject {
         appShortcuts = [UInt32(kVK_ISO_Section), UInt32(kVK_ANSI_Grave)].enumerated().map { index, key in
             GlobalHotKey(keyCode: key, modifiers: modifiers, id: UInt32(index + 1)) { [weak self] in self?.showHUD() }
         }
+        // Both § and ` are registered so either keyboard layout works; only warn if neither bound
+        // (e.g. another app already claimed both), since a single miss is expected and harmless.
+        if appShortcuts.allSatisfy({ $0.registrationError != nil }) {
+            lines.append(ChatLine(
+                role: .error,
+                text: "Could not register Control+Shift+§ to open Helm (another app may be using it). Open Helm from the menu bar instead."
+            ))
+        }
         // Control+Shift+D: start/stop dictation into Helm's command box.
-        appShortcuts.append(GlobalHotKey(keyCode: UInt32(kVK_ANSI_D), modifiers: modifiers, id: 3) { [weak self] in
+        let dictationShortcut = GlobalHotKey(keyCode: UInt32(kVK_ANSI_D), modifiers: modifiers, id: 3) { [weak self] in
             self?.showHUD()
             self?.toggleDictation()
-        })
+        }
+        appShortcuts.append(dictationShortcut)
+        if let error = dictationShortcut.registrationError {
+            lines.append(ChatLine(
+                role: .error,
+                text: "Could not register Control+Shift+D for dictation (Carbon status \(error)). Use the mic button in the HUD instead."
+            ))
+        }
         let stopShortcut = GlobalHotKey(keyCode: UInt32(kVK_Escape), modifiers: modifiers, id: 4) { [weak self] in
             self?.emergencyStop()
         }

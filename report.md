@@ -195,3 +195,10 @@ All 8 items from the plan are now done. Non-web app control (Mail, Finder,
 Discord, etc.) is unaffected — Playwright only drives browsers, so
 `screen_elements.py`'s Accessibility API is still how Helm sees and acts on
 everything that isn't a webpage.
+
+**User-confirmed:** Control+Shift+§ opens the HUD from anywhere, instantly,
+with no issues. While confirming this, found and fixed a related gap: if the
+OS ever refuses to bind that shortcut or Control+Shift+D (dictation) — e.g.
+another app already grabbed it — Helm previously failed silently. It now
+shows an error line (as the emergency-stop shortcut already did) naming the
+fallback (menu bar / mic button).
