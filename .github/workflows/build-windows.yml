@@ -1,0 +1,65 @@
+name: Build Windows executable
+
+# Builds a real Windows .exe on an actual windows-latest runner, since
+# PyInstaller cannot cross-compile (it can only build for the OS it runs on).
+# This is how the project gets a downloadable .exe without anyone owning a
+# Windows machine: open the Actions tab -> this workflow's latest run ->
+# the "helm-windows" artifact.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "assistant.py"
+      - "platform_compat.py"
+      - "screen_elements_win.py"
+      - "app_discovery_win.py"
+      - "windows_tray/**"
+      - "browser_automation.py"
+      - "mcp_client.py"
+      - "providers.py"
+      - "writing_check.py"
+      - "requirements.txt"
+      - ".github/workflows/build-windows.yml"
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Build assistant.exe (backend)
+        run: |
+          pyinstaller --onefile --name assistant --console `
+            --collect-all pywinauto --collect-all win32com `
+            assistant.py
+
+      - name: Build Helm.exe (tray UI)
+        run: |
+          pyinstaller --onefile --name Helm --windowed `
+            --collect-all pystray --collect-all PIL `
+            windows_tray/app.py
+
+      - name: Assemble release folder
+        run: |
+          mkdir dist\helm-windows
+          copy dist\assistant.exe dist\helm-windows\
+          copy dist\Helm.exe dist\helm-windows\
+          copy README.md dist\helm-windows\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: helm-windows
+          path: dist/helm-windows
+          retention-days: 30

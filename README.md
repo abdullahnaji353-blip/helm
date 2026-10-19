@@ -55,6 +55,15 @@ You can also double-click `Open Helm.command` in Finder to launch it.
 
 ### Windows
 
+**Pre-built executable (no Python install needed):** push to `main` triggers
+`.github/workflows/build-windows.yml`, which builds `Helm.exe` and
+`assistant.exe` on a real Windows GitHub Actions runner (PyInstaller cannot
+cross-compile, so this has to run on actual Windows). Download the
+`helm-windows` artifact from the workflow's latest run under this repo's
+**Actions** tab, unzip it, and double-click `Helm.exe`.
+
+**From source:**
+
 1. Install [Ollama](https://ollama.com/) and start it, then pull a model:
 
    ```powershell

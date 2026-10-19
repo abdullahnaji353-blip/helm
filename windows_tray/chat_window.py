@@ -34,8 +34,29 @@ def _python_executable() -> str:
     return str(venv_python) if venv_python.exists() else sys.executable
 
 
+def _backend_command(text: str, autonomous: bool) -> tuple[list[str], str]:
+    """The subprocess argv to run one chat turn, and the cwd to run it in.
+
+    In a PyInstaller build (`sys.frozen`), assistant.py is itself built into a
+    standalone assistant.exe sitting next to Helm.exe (see
+    .github/workflows/build-windows.yml) — there is no bundled python.exe to
+    run a .py script with. Running from source (this repo checked out,
+    `python -m windows_tray.app`) spawns assistant.py with Python directly,
+    same as before.
+    """
+    autonomy = "autonomous" if autonomous else "approval"
+    if getattr(sys, "frozen", False):
+        app_dir = Path(sys.executable).resolve().parent
+        backend = app_dir / "assistant.exe"
+        if backend.exists():
+            return [str(backend), "--chat", text, "--autonomy", autonomy], str(app_dir)
+    script = _project_root() / "assistant.py"
+    arguments = [_python_executable(), "-u", str(script), "--chat", text, "--autonomy", autonomy]
+    return arguments, str(_project_root())
+
+
 class BackendSession:
-    """Owns one assistant.py subprocess and its stdout-parsing thread."""
+    """Owns one assistant.py (or assistant.exe) subprocess and its stdout-parsing thread."""
 
     def __init__(self, on_event) -> None:
         self._on_event = on_event  # called with dict events from the reader thread
@@ -49,16 +70,11 @@ class BackendSession:
     def start(self, text: str, autonomous: bool) -> None:
         if self.running:
             return
-        script = _project_root() / "assistant.py"
-        arguments = [
-            _python_executable(), "-u", str(script),
-            "--chat", text,
-            "--autonomy", "autonomous" if autonomous else "approval",
-        ]
+        arguments, cwd = _backend_command(text, autonomous)
         try:
             self.process = subprocess.Popen(
                 arguments,
-                cwd=str(_project_root()),
+                cwd=cwd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
