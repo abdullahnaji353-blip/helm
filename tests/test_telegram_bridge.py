@@ -1,4 +1,6 @@
 import json
+from io import BytesIO
+import tempfile
 import time
 import unittest
 from pathlib import Path
@@ -6,7 +8,14 @@ from threading import Thread
 from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError
 
-from telegram_bridge import PendingApproval, TelegramBotAPI, TelegramBridge, TelegramError
+from telegram_bridge import (
+    PendingApproval,
+    TelegramBotAPI,
+    TelegramBridge,
+    TelegramConflictError,
+    TelegramError,
+    acquire_polling_lock,
+)
 
 
 def make_bridge(api=None, owner_chat_id=999):
@@ -64,6 +73,30 @@ class TelegramBotAPITests(unittest.TestCase):
         api = TelegramBotAPI("123456789:AAFakeTokenFakeTokenFakeToken123", opener=MagicMock(return_value=response))
         with self.assertRaisesRegex(TelegramError, "bad request"):
             api.get_updates(None)
+
+    def test_get_updates_explains_telegram_polling_conflict(self):
+        error = HTTPError(
+            "url", 409, "conflict", {},
+            BytesIO(b'{"ok":false,"description":"terminated by other getUpdates request"}'),
+        )
+        api = TelegramBotAPI("123456789:AAFakeTokenFakeTokenFakeToken123", opener=MagicMock(side_effect=error))
+        with self.assertRaisesRegex(TelegramConflictError, "Another process is already polling this bot") as raised:
+            api.get_updates(None)
+        self.assertIn("terminated by other getUpdates request", str(raised.exception))
+
+
+class TelegramPollingLockTests(unittest.TestCase):
+    def test_only_one_local_bridge_can_poll_a_bot_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch("telegram_bridge.Path.home", return_value=Path(directory)):
+                first_lock = acquire_polling_lock("123456789:AAFakeTokenFakeTokenFakeToken123")
+                try:
+                    with self.assertRaisesRegex(TelegramError, "already polling this Telegram bot"):
+                        acquire_polling_lock("123456789:AAFakeTokenFakeTokenFakeToken123")
+                finally:
+                    first_lock.close()
+                second_lock = acquire_polling_lock("123456789:AAFakeTokenFakeTokenFakeToken123")
+                second_lock.close()
 
 
 class TelegramUpdateHandlingTests(unittest.TestCase):

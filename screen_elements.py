@@ -65,16 +65,22 @@ def _set_frame(window, x: float | None, y: float | None, width: float | None, he
 
 
 def screen_bounds() -> tuple[int, int]:
-    """Main display size in points (top-left origin), matching Accessibility coordinates."""
+    """Main display size in points (top-left origin), matching Accessibility coordinates.
+
+    Do not use CGDisplayPixelsWide/High here: those are physical pixel counts and
+    are commonly twice the window-frame dimensions on Retina displays.
+    """
     import Quartz
 
     display = Quartz.CGMainDisplayID()
-    return int(Quartz.CGDisplayPixelsWide(display)), int(Quartz.CGDisplayPixelsHigh(display))
+    bounds = Quartz.CGDisplayBounds(display)
+    return int(bounds.size.width), int(bounds.size.height)
 
 
 SNAP_REGIONS = {
     "left": (0.0, 0.0, 0.5, 1.0), "right": (0.5, 0.0, 0.5, 1.0),
     "top": (0.0, 0.0, 1.0, 0.5), "bottom": (0.0, 0.5, 1.0, 0.5),
+    "up": (0.0, 0.0, 1.0, 0.5), "down": (0.0, 0.5, 1.0, 0.5),
     "top-left": (0.0, 0.0, 0.5, 0.5), "top-right": (0.5, 0.0, 0.5, 0.5),
     "bottom-left": (0.0, 0.5, 0.5, 0.5), "bottom-right": (0.5, 0.5, 0.5, 0.5),
     "full": (0.0, 0.0, 1.0, 1.0),
@@ -123,6 +129,19 @@ def frontmost_app_name() -> str:
         return ""
     app = NSWorkspace.sharedWorkspace().frontmostApplication()
     return app.localizedName() if app else ""
+
+
+def running_app_names() -> list[str]:
+    """Names of all running macOS applications, including those without visible windows."""
+    try:
+        from AppKit import NSWorkspace
+    except ImportError as error:
+        raise RuntimeError("Listing running apps requires the macOS AppKit framework.") from error
+    names = {
+        name for app in NSWorkspace.sharedWorkspace().runningApplications()
+        if (name := app.localizedName()) and name.casefold() != "helm"
+    }
+    return sorted(names, key=str.casefold)
 
 
 def wait_for_frontmost(app_name: str, timeout: float = 4.0) -> bool:

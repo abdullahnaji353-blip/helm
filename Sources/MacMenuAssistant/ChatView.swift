@@ -7,8 +7,10 @@ import Speech
 import SwiftUI
 import UserNotifications
 
-private let jarvisCyan = Color(red: 0.30, green: 0.85, blue: 1.0)
-private let jarvisBlue = Color(red: 0.16, green: 0.42, blue: 1.0)
+private let jarvisCyan = Color(red: 0.45, green: 0.72, blue: 0.68)
+private let jarvisBlue = Color(red: 0.36, green: 0.53, blue: 0.68)
+private let helmBackground = Color(red: 0.075, green: 0.078, blue: 0.086)
+private let helmSurface = Color(red: 0.115, green: 0.121, blue: 0.132)
 
 /// System-wide hotkey through Carbon: works from any app and needs no permission.
 final class GlobalHotKey {
@@ -149,17 +151,53 @@ struct ChatLine: Identifiable, Equatable {
     var text: String
 }
 
+struct ResearchSource: Codable, Equatable {
+    let title: String
+    let url: String
+    let snippet: String
+}
+
+struct WorkflowCheckpoint: Codable, Identifiable {
+    let id: Int
+    let title: String
+    var status: String
+    var evidence: String
+}
+
+struct AgentWorkflowRecord: Codable {
+    let id: String
+    let task: String
+    var status: String
+    var checkpoints: [WorkflowCheckpoint]
+    var sources: [ResearchSource]
+    var plans: [String: [String]]
+    var research: String
+    var operation: String
+    var verification: String
+    var updatedAt: String
+}
+
+private func loadDisabledTools() -> Set<String> {
+    var disabled = Set(UserDefaults.standard.stringArray(forKey: "disabledTools") ?? [])
+    let previouslyGroupedAppTools: Set<String> = ["open_app", "install_app", "uninstall_app"]
+    if previouslyGroupedAppTools.isSubset(of: disabled) {
+        disabled.formUnion(["list_applications", "list_running_apps", "quit_app"])
+    }
+    return disabled
+}
+
 /// Drives the Helm conversation through `assistant.py --chat`, which keeps
 /// history and calls device tools (apps, URLs, volume, status, screen control).
 @MainActor
 final class ChatController: NSObject, ObservableObject {
     @Published var lines: [ChatLine] = []
     @Published var draft = ""
+    @Published private(set) var workflowRecord: AgentWorkflowRecord?
     @Published var isThinking = false
     @Published var isListening = false
     @Published var dictating = false
     private var dictationBase = ""
-    @Published var voiceStatus = "Hold ⌃⌥ to talk"
+    @Published var voiceStatus = "Tap ⌃⌥ to open Helm; hold to speak"
     /// Set when a voice message was sent while the HUD window wasn't open, so the reply should
     /// also go to the floating top-right toast, not just the (unseen) chat transcript.
     private var pendingVoiceToast = false
@@ -175,16 +213,32 @@ final class ChatController: NSObject, ObservableObject {
         didSet { UserDefaults.standard.set(provider, forKey: "provider") }
     }
     /// Chat tools the user switched off (names match CHAT_TOOLS in assistant.py).
-    @Published var disabledTools = Set(UserDefaults.standard.stringArray(forKey: "disabledTools") ?? []) {
+    @Published var disabledTools = loadDisabledTools() {
         didSet { UserDefaults.standard.set(Array(disabledTools), forKey: "disabledTools") }
     }
     @Published var browser = UserDefaults.standard.string(forKey: "browser")
         ?? (FileManager.default.fileExists(atPath: "/Applications/Google Chrome.app") ? "chrome" : "safari") {
         didSet { UserDefaults.standard.set(browser, forKey: "browser") }
     }
-    @Published var voiceHotkey = UserDefaults.standard.object(forKey: "voiceHotkey") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(voiceHotkey, forKey: "voiceHotkey") }
+    @Published var persistentBrowserSession = UserDefaults.standard.bool(forKey: "persistentBrowserSession") {
+        didSet { UserDefaults.standard.set(persistentBrowserSession, forKey: "persistentBrowserSession") }
     }
+    @Published var voiceHotkey = UserDefaults.standard.object(forKey: "voiceHotkey") as? Bool ?? true {
+        didSet {
+            UserDefaults.standard.set(voiceHotkey, forKey: "voiceHotkey")
+            voice.setShortcutEnabled(voiceHotkey)
+        }
+    }
+    @Published var voiceShortcut = UserDefaults.standard.string(forKey: "voiceShortcut") ?? "control+option" {
+        didSet {
+            UserDefaults.standard.set(voiceShortcut, forKey: "voiceShortcut")
+            voice.setShortcut(voiceShortcut)
+        }
+    }
+    @Published var voiceShortcutTestStatus = ""
+    @Published private(set) var voiceShortcutTestPending = false
+    @Published private(set) var launchShortcutAvailable = false
+    @Published var requestedSettingsTab: Int?
     @Published var keyCheck: (ok: Bool, message: String)?
     @Published var isCheckingKey = false
     @Published var cloudVision = UserDefaults.standard.bool(forKey: "cloudVision") {
@@ -197,6 +251,59 @@ final class ChatController: NSObject, ObservableObject {
     private static var supportDirectory: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Local Desktop Assistant", isDirectory: true)
+    }
+
+    private var workflowRecordURL: URL {
+        Self.supportDirectory.appendingPathComponent("agent-workflow.json")
+    }
+
+    private var browserProfileDirectory: URL {
+        Self.supportDirectory.appendingPathComponent("browser-sessions", isDirectory: true)
+    }
+
+    func clearSavedBrowserSessions() throws {
+        guard !hasActiveTasks else {
+            throw NSError(domain: "Helm", code: 1, userInfo: [NSLocalizedDescriptionKey: "Stop active tasks before clearing browser sessions."])
+        }
+        if FileManager.default.fileExists(atPath: browserProfileDirectory.path) {
+            try FileManager.default.removeItem(at: browserProfileDirectory)
+        }
+        addActivity("Cleared Helm's saved browser sessions.")
+    }
+
+    private func saveWorkflowRecord() {
+        guard let workflowRecord else { return }
+        do {
+            try FileManager.default.createDirectory(
+                at: Self.supportDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+            let data = try JSONEncoder().encode(workflowRecord)
+            try data.write(to: workflowRecordURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: workflowRecordURL.path
+            )
+        } catch {
+            lines.append(ChatLine(role: .error, text: "Could not save the task checkpoints: \(error.localizedDescription)"))
+        }
+    }
+
+    private func restoreWorkflowRecord() {
+        guard let data = try? Data(contentsOf: workflowRecordURL),
+              var restored = try? JSONDecoder().decode(AgentWorkflowRecord.self, from: data) else { return }
+        if restored.status == "running" {
+            restored.status = "interrupted"
+            for index in restored.checkpoints.indices where restored.checkpoints[index].status == "in_progress" {
+                restored.checkpoints[index].status = "interrupted"
+            }
+            restored.updatedAt = ISO8601DateFormatter().string(from: Date())
+            workflowRecord = restored
+            saveWorkflowRecord()
+        } else {
+            workflowRecord = restored
+        }
     }
 
     /// First run only if nothing of Helm exists on this Mac yet: no setup flag, no
@@ -282,6 +389,7 @@ final class ChatController: NSObject, ObservableObject {
     private var slackTerminationObserver: NSObjectProtocol?
     /// Bumped by the Control+Shift+§ shortcut; the menu bar label opens the HUD when it changes.
     @Published var hudRequests = 0
+    @Published var focusInputAfterOpen = false
     /// Three background agents, each with its own engine, conversation and coloured cursor.
     lazy var agents: [AgentRun] = (1...3).map { AgentRun(number: $0, owner: self) }
 
@@ -289,34 +397,212 @@ final class ChatController: NSObject, ObservableObject {
     @discardableResult
     func dispatch(_ task: String) -> Bool {
         let text = task.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, let agent = agents.first(where: { !$0.isRunning }) else { return false }
-        agent.run(text)
+        guard !text.isEmpty,
+              agents.allSatisfy({ !$0.isRunning && $0.pendingApproval == nil }) else { return false }
+        startWorkflow(text)
         objectWillChange.send()
         return true
     }
 
+    private func startWorkflow(_ task: String) {
+        workflowRecord = AgentWorkflowRecord(
+            id: UUID().uuidString,
+            task: task,
+            status: "running",
+            checkpoints: [
+                WorkflowCheckpoint(id: 1, title: "Research and gather evidence", status: "in_progress", evidence: ""),
+                WorkflowCheckpoint(id: 2, title: "Perform the task with approvals", status: "pending", evidence: ""),
+                WorkflowCheckpoint(id: 3, title: "Verify the outcome", status: "pending", evidence: ""),
+            ],
+            sources: [],
+            plans: [:],
+            research: "",
+            operation: "",
+            verification: "",
+            updatedAt: ISO8601DateFormatter().string(from: Date())
+        )
+        saveWorkflowRecord()
+        agents[0].run(task, workflowID: workflowRecord?.id)
+    }
+
+    fileprivate func recordPlan(_ plan: [String], from agent: AgentRun) {
+        guard var record = workflowRecord, record.id == agent.workflowID else { return }
+        record.plans[agent.role] = plan
+        record.updatedAt = ISO8601DateFormatter().string(from: Date())
+        workflowRecord = record
+        saveWorkflowRecord()
+    }
+
+    fileprivate func recordSource(_ source: ResearchSource, from agent: AgentRun) {
+        guard var record = workflowRecord, record.id == agent.workflowID else { return }
+        if !record.sources.contains(where: { $0.url == source.url }) {
+            record.sources.append(source)
+            record.sources = Array(record.sources.prefix(8))
+        }
+        record.updatedAt = ISO8601DateFormatter().string(from: Date())
+        workflowRecord = record
+        saveWorkflowRecord()
+    }
+
+    fileprivate func recordAgentActivity(_ text: String, from agent: AgentRun) {
+        guard var record = workflowRecord, record.id == agent.workflowID,
+              let index = record.checkpoints.firstIndex(where: { $0.id == agent.number }) else { return }
+        record.checkpoints[index].evidence = String(text.prefix(500))
+        record.updatedAt = ISO8601DateFormatter().string(from: Date())
+        workflowRecord = record
+        saveWorkflowRecord()
+    }
+
+    fileprivate func agentDidFinish(_ agent: AgentRun, status: Int32) {
+        guard var record = workflowRecord, record.id == agent.workflowID else { return }
+        let successful = status == 0 && !agent.failed && !agent.reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard successful else {
+            record.status = status == 0 ? "blocked" : "interrupted"
+            record.checkpoints[agent.number - 1].status = "blocked"
+            record.checkpoints[agent.number - 1].evidence = agent.activity.last ?? "The stage did not complete."
+            record.updatedAt = ISO8601DateFormatter().string(from: Date())
+            workflowRecord = record
+            saveWorkflowRecord()
+            lines.append(ChatLine(
+                role: .error,
+                text: "\(agent.roleLabel) stage stopped. The task workflow is \(record.status); review the saved checkpoints before continuing."
+            ))
+            return
+        }
+
+        record.checkpoints[agent.number - 1].status = "done"
+        switch agent.number {
+        case 1:
+            record.research = agent.reply
+            record.checkpoints[0].evidence = String(agent.reply.prefix(500))
+            record.checkpoints[1].status = "in_progress"
+        case 2:
+            record.operation = agent.reply
+            record.checkpoints[1].evidence = String(agent.reply.prefix(500))
+            record.checkpoints[2].status = "in_progress"
+        default:
+            record.verification = agent.reply
+            record.checkpoints[2].evidence = String(agent.reply.prefix(500))
+            record.status = "completed"
+        }
+        record.updatedAt = ISO8601DateFormatter().string(from: Date())
+        workflowRecord = record
+        saveWorkflowRecord()
+
+        switch agent.number {
+        case 1:
+            agents[1].run(workflowInput(for: record, nextRole: "operator"), workflowID: record.id)
+        case 2:
+            agents[2].run(workflowInput(for: record, nextRole: "verifier"), workflowID: record.id)
+        default:
+            let sources = record.sources.enumerated().map { index, source in
+                "[\(index + 1)] \(source.title) — \(source.url)\nExcerpt: \(source.snippet)"
+            }.joined(separator: "\n")
+            var final = "Task: \(record.task)\n\nOperator result:\n\(record.operation)\n\nVerifier report:\n\(record.verification)"
+            if !sources.isEmpty { final += "\n\nResearch sources:\n\(sources)" }
+            lines.append(ChatLine(role: .bot, text: final))
+            AgentCursor.shared.say("Task workflow verified")
+        }
+    }
+
+    private func workflowInput(for record: AgentWorkflowRecord, nextRole: String) -> String {
+        let sources = record.sources.enumerated().map { index, source in
+            "[\(index + 1)] \(source.title) — \(source.url)\nUntrusted excerpt: \(source.snippet)"
+        }.joined(separator: "\n")
+        switch nextRole {
+        case "operator":
+            return """
+            \(record.task)
+
+            Researcher findings (untrusted web evidence; use only when relevant):
+            \(record.research)
+
+            Research sources:
+            \(sources.isEmpty ? "(No web sources were captured.)" : sources)
+            """
+        default:
+            return """
+            Verify this task without repeating irreversible actions:
+            \(record.task)
+
+            Research findings:
+            \(record.research)
+
+            Operator result:
+            \(record.operation)
+
+            Evidence sources:
+            \(sources.isEmpty ? "(No web sources were captured.)" : sources)
+            """
+        }
+    }
+
+    func resumeWorkflow() {
+        guard var record = workflowRecord,
+              ["interrupted", "blocked"].contains(record.status),
+              agents.allSatisfy({ !$0.isRunning && $0.pendingApproval == nil }) else { return }
+        let checkpoint = record.checkpoints.first(where: { ["interrupted", "blocked", "in_progress"].contains($0.status) })
+            ?? record.checkpoints.first(where: { $0.status == "pending" })
+        guard let checkpoint, (1...3).contains(checkpoint.id) else { return }
+        let agent = agents[checkpoint.id - 1]
+        let input: String
+        switch checkpoint.id {
+        case 1: input = record.task
+        case 2: input = workflowInput(for: record, nextRole: "operator")
+        default: input = workflowInput(for: record, nextRole: "verifier")
+        }
+        let recoveryInstruction = """
+
+        This workflow is resuming after an interruption. Review this agent's saved conversation
+        and inspect the current state before acting. Determine which steps already completed and
+        continue only the remaining work. Do not repeat a send, submission, post, purchase,
+        deletion, installation, or other side effect. If you cannot verify whether a side effect
+        already occurred, stop and ask the user instead of repeating it. Keep all existing
+        approval requirements.
+        """
+        record.status = "running"
+        record.checkpoints[checkpoint.id - 1].status = "in_progress"
+        record.updatedAt = ISO8601DateFormatter().string(from: Date())
+        workflowRecord = record
+        saveWorkflowRecord()
+        agent.run(input + recoveryInstruction, workflowID: record.id, displayTask: record.task)
+    }
+
     func dispatchDraft() {
         if dispatch(draft) {
-            AgentCursor.shared.say("Sent to an agent: \(draft)")
+            AgentCursor.shared.say("Task sent to a background agent")
             draft = ""
         } else {
             lines.append(ChatLine(role: .error, text: "All three agents are busy. Stop one or wait."))
         }
     }
 
+    func dispatchDraft(to agent: AgentRun) {
+        let task = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !task.isEmpty, !agent.isRunning else { return }
+        agent.run(task)
+        guard agent.isRunning else { return }
+        AgentCursor.shared.say("Assigned to \(agent.id)")
+        draft = ""
+        objectWillChange.send()
+    }
+
     /// The same engine settings the main chat uses.
-    func engineArguments(for text: String, history: URL? = nil) -> [String] {
+    func engineArguments(for text: String, history: URL? = nil, agentRole: String? = nil) -> [String] {
         var arguments = ["--chat", text, "--autonomy", askBeforeActing ? "approval" : "autonomous", "--provider", provider]
         if !model(for: provider).isEmpty { arguments += ["--model", model(for: provider)] }
         if !disabledTools.isEmpty { arguments += ["--disable-tools", disabledTools.sorted().joined(separator: ",")] }
         if cloudVision { arguments.append("--cloud-vision") }
         arguments += ["--browser", browser]
         if let history { arguments += ["--history", history.path] }
+        if let agentRole {
+            arguments += ["--agent-role", agentRole, "--create-plan"]
+        }
         return arguments
     }
 
     func engineEnvironment() -> [String: String] {
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ProcessInfo.processInfo.environment.merging(ScreenCaptureBridge.shared.environment) { _, new in new }
         if provider != "ollama", let key = KeyStore.read(provider) { environment["HELM_API_KEY"] = key }
         return environment
     }
@@ -489,12 +775,12 @@ final class ChatController: NSObject, ObservableObject {
             }
             let text = String(decoding: data, as: UTF8.self)
             DispatchQueue.main.async {
-                if let line = text.components(separatedBy: .newlines)
-                    .first(where: { $0.hasPrefix("TELEGRAM_BRIDGE_READY:") }) {
-                    self?.telegramBridgeStatus = "Running — " + line.dropFirst("TELEGRAM_BRIDGE_READY:".count)
-                } else if let line = text.components(separatedBy: .newlines)
-                    .first(where: { $0.hasPrefix("TELEGRAM_BRIDGE_ERROR:") }) {
-                    self?.telegramBridgeStatus = String(line.dropFirst("TELEGRAM_BRIDGE_ERROR:".count))
+                for line in text.components(separatedBy: .newlines) {
+                    if line.hasPrefix("TELEGRAM_BRIDGE_READY:") {
+                        self?.telegramBridgeStatus = "Running — " + line.dropFirst("TELEGRAM_BRIDGE_READY:".count)
+                    } else if line.hasPrefix("TELEGRAM_BRIDGE_ERROR:") {
+                        self?.telegramBridgeStatus = String(line.dropFirst("TELEGRAM_BRIDGE_ERROR:".count))
+                    }
                 }
             }
         }
@@ -736,13 +1022,28 @@ final class ChatController: NSObject, ObservableObject {
     }
 
     private var appShortcuts: [GlobalHotKey] = []
+    private var shortcutTestTimeout: DispatchWorkItem?
 
     override init() {
         super.init()
+        restoreWorkflowRecord()
         installAppShortcut()  // ready as soon as Helm launches
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        configureVoice()  // install the shortcut before a menu or window is opened
         DispatchQueue.main.async { AgentCursor.shared.start() }
         DispatchQueue.main.async { [weak self] in self?.autoStartConfiguredBridges() }
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+    }
+
+    @objc private func applicationDidBecomeActive() {
+        guard onboarded, voiceHotkey else { return }
+        configureVoice()
+        if CGPreflightListenEventAccess() { voice.installHotkey() }
     }
 
     /// A bridge can now be left running unattended (see "start automatically"), so an
@@ -768,9 +1069,18 @@ final class ChatController: NSObject, ObservableObject {
         if defaults.bool(forKey: "slack.auto-start") { startSlackBridge() }
     }
 
-    /// helm://ask?q=... runs a command as if it were typed into Helm. Off unless the user enables
-    /// developerURLCommands, because any web page could otherwise send Helm commands.
+    /// helm://settings?tab=... opens a settings page. helm://ask remains off unless enabled,
+    /// because any web page could otherwise send Helm commands.
     func handleOpenURL(_ url: URL) {
+        if url.host == "settings",
+           let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+           let tabName = components.queryItems?.first(where: { $0.name == "tab" })?.value,
+           let tab = ["brain": 0, "permissions": 2, "whatsapp": 3, "telegram": 4, "discord": 5, "slack": 6][tabName] {
+            requestedSettingsTab = tab
+            showProviderSettings = true
+            hudRequests += 1
+            return
+        }
         guard UserDefaults.standard.bool(forKey: "developerURLCommands"),
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false), components.host == "ask",
               let query = components.queryItems?.first(where: { $0.name == "q" })?.value else { return }
@@ -781,6 +1091,16 @@ final class ChatController: NSObject, ObservableObject {
     /// Control+Shift+§ opens Helm from anywhere (§ is the ISO key left of 1; ` on US keyboards).
     func installAppShortcut() {
         guard appShortcuts.isEmpty else { return }
+        // Unlike modifier-only shortcuts, this key chord works without Input Monitoring.
+        // Helm must already be running in the menu bar to receive any global hotkey.
+        let openShortcut = GlobalHotKey(
+            keyCode: UInt32(kVK_Space), modifiers: UInt32(controlKey | optionKey), id: 5
+        ) { [weak self] in self?.showHUD() }
+        appShortcuts.append(openShortcut)
+        launchShortcutAvailable = openShortcut.registrationError == nil
+        if let error = openShortcut.registrationError {
+            lines.append(ChatLine(role: .error, text: "Could not register Control+Option+Space (Carbon status \(error)). Open Helm from its menu bar icon."))
+        }
         let modifiers = UInt32(controlKey | shiftKey)
         appShortcuts = [UInt32(kVK_ISO_Section), UInt32(kVK_ANSI_Grave)].enumerated().map { index, key in
             GlobalHotKey(keyCode: key, modifiers: modifiers, id: UInt32(index + 1)) { [weak self] in self?.showHUD() }
@@ -832,6 +1152,44 @@ final class ChatController: NSObject, ObservableObject {
         } else {
             hudRequests += 1  // window was closed: ask SwiftUI to reopen it
         }
+    }
+
+    func testVoiceShortcut() {
+        guard voiceHotkey else {
+            voiceShortcutTestStatus = "Turn on the voice shortcut first."
+            return
+        }
+        shortcutTestTimeout?.cancel()
+        voiceShortcutTestPending = true
+        voiceShortcutTestStatus = "Press and release \(voiceShortcutLabel) within 5 seconds."
+        let timeout = DispatchWorkItem { [weak self] in
+            guard let self, self.voiceShortcutTestPending else { return }
+            self.voiceShortcutTestPending = false
+            self.voiceShortcutTestStatus = CGPreflightListenEventAccess()
+                ? "No key press detected. Check the selected keys or try again."
+                : "Not detected. Enable Input Monitoring, or open Helm with Control+Option+Space."
+        }
+        shortcutTestTimeout = timeout
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5, execute: timeout)
+    }
+
+    private var voiceShortcutLabel: String {
+        voiceShortcut.split(separator: "+").map { part in
+            switch part {
+            case "control": "Control"
+            case "option": "Option"
+            case "shift": "Shift"
+            case "command": "Command"
+            default: String(part)
+            }
+        }.joined(separator: "+")
+    }
+
+    func voiceShortcutWasPressed() {
+        guard voiceShortcutTestPending else { showHUD(); return }
+        shortcutTestTimeout?.cancel()
+        voiceShortcutTestPending = false
+        voiceShortcutTestStatus = "Shortcut detected. Tap opens Helm; holding starts voice input."
     }
     /// "hud" = full window, "menubar" = compact popup from the menu bar icon.
     @Published var interfaceStyle = UserDefaults.standard.string(forKey: "interfaceStyle") ?? "hud" {
@@ -912,6 +1270,7 @@ final class ChatController: NSObject, ObservableObject {
         voice.onError = { [weak self] message in
             self?.lines.append(ChatLine(role: .error, text: message))
         }
+        voice.onShortcutTap = { [weak self] in self?.voiceShortcutWasPressed() }
         voice.onPartialTranscript = { [weak self] transcript in
             guard let self else { return }
             self.draft = self.dictating
@@ -933,12 +1292,18 @@ final class ChatController: NSObject, ObservableObject {
                 self.send()
             }
         }
-        if voiceHotkey { voice.installHotkey() }
+        voice.setShortcut(voiceShortcut)
+        voice.setShortcutEnabled(voiceHotkey)
     }
 
     func toggleVoice() {
         configureVoice()
         voice.toggleCapture()
+    }
+
+    func retryVoiceShortcut() {
+        configureVoice()
+        voice.installHotkey()
     }
 
     /// Talk, and the words appear in the command box (not sent) — Control+Shift+D or the mic button.
@@ -1029,6 +1394,13 @@ final class ChatController: NSObject, ObservableObject {
         NSApp.deactivate()
     }
 
+    func takeOver(from agent: AgentRun) {
+        if agent.isRunning { agent.stop() }
+        let progress = agent.activity.suffix(8).map { "- \($0)" }.joined(separator: "\n")
+        draft = "Take over this task from \(agent.id): \(agent.task)\n\nProgress so far:\n\(progress.isEmpty ? "- No activity recorded yet." : progress)\n\nContinue from the current state. Do not repeat completed or irreversible actions; verify what is already done first."
+        showHUD()
+    }
+
     private func logBackend(_ text: String) {
         if let error = Self.appendToHelmLog(filename: "backend.log", text: text) {
             lines.append(ChatLine(role: .error, text: "Could not securely write the backend log: \(error)"))
@@ -1096,7 +1468,7 @@ final class ChatController: NSObject, ObservableObject {
         child.standardOutput = output
         child.standardError = output
         child.standardInput = input
-        var environment = ProcessInfo.processInfo.environment
+        var environment = ProcessInfo.processInfo.environment.merging(ScreenCaptureBridge.shared.environment) { _, new in new }
         if provider != "ollama", let key = KeyStore.read(provider) {
             environment["HELM_API_KEY"] = key
         }
@@ -1230,12 +1602,45 @@ struct MenuBarIcon: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: chat.isListening ? "waveform" : "circle.hexagongrid.fill")
+        Group {
+            if chat.isListening {
+                Image(systemName: "waveform")
+            } else {
+                HelmBrandMark(size: 18)
+            }
+        }
             .onChange(of: chat.hudRequests) { _ in
                 openWindow(id: "hud")
                 NSApp.activate(ignoringOtherApps: true)
             }
             .onOpenURL { chat.handleOpenURL($0) }
+    }
+}
+
+private struct HelmBrandMark: View {
+    var size: CGFloat = 32
+
+    var body: some View {
+        Image(nsImage: NSWorkspace.shared.icon(forFile: Bundle.main.bundleURL.path))
+            .resizable()
+            .interpolation(.high)
+            .frame(width: size, height: size)
+            .clipShape(RoundedRectangle(cornerRadius: size * 0.23, style: .continuous))
+            .accessibilityHidden(true)
+    }
+}
+
+private struct ShortcutKey: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 9, weight: .medium, design: .rounded))
+            .foregroundStyle(.primary.opacity(0.86))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 5)
+            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 5))
+            .overlay(RoundedRectangle(cornerRadius: 5).strokeBorder(Color.white.opacity(0.09)))
     }
 }
 
@@ -1245,37 +1650,128 @@ struct MenuLauncher: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Orb(active: chat.isThinking || chat.isListening, size: 26)
-                VStack(alignment: .leading, spacing: 1) {
-                    Text("HELM").font(.system(size: 12, weight: .bold, design: .monospaced)).tracking(3)
-                    Text(chat.isThinking ? "Working…" : chat.onboarded ? "Online" : "Setup not finished")
-                        .font(.system(size: 10)).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 11) {
+                HelmBrandMark(size: 42)
+                    .shadow(color: jarvisCyan.opacity(0.18), radius: 12, y: 3)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("H E L M")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .tracking(1.5)
+                    Text("Your Mac copilot")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 4)
+                HStack(spacing: 5) {
+                    Circle().fill(chat.isThinking ? jarvisCyan : Color.green).frame(width: 6, height: 6)
+                    Text(!chat.onboarded ? "SETUP" : chat.isThinking ? "ACTIVE" : "READY")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .tracking(0.5)
+                        .foregroundStyle(.secondary)
                 }
             }
+
+            Button(action: openHelm) {
+                HStack(spacing: 10) {
+                    Image(systemName: chat.onboarded ? "arrow.up.forward.app" : "sparkles")
+                        .font(.system(size: 14, weight: .semibold))
+                    Text(chat.onboarded ? "Open Helm" : "Finish setup")
+                        .font(.system(size: 12, weight: .semibold))
+                    Spacer()
+                    Image(systemName: "arrow.up.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .opacity(0.78)
+                }
+                .foregroundStyle(Color.white)
+                .padding(.horizontal, 14)
+                .frame(maxWidth: .infinity, minHeight: 42)
+                .background(
+                    LinearGradient(colors: [jarvisBlue.opacity(0.82), jarvisCyan.opacity(0.62)], startPoint: .topLeading, endPoint: .bottomTrailing),
+                    in: RoundedRectangle(cornerRadius: 11, style: .continuous)
+                )
+                .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(Color.white.opacity(0.13)))
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(chat.onboarded ? "Open Helm" : "Finish Helm setup")
+
+            HStack(spacing: 7) {
+                Image(systemName: "keyboard")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.secondary)
+                Text(chat.launchShortcutAvailable ? "Open from anywhere" : "Keyboard shortcut unavailable")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 4)
+                if chat.launchShortcutAvailable {
+                    ShortcutKey(title: "⌃")
+                    ShortcutKey(title: "⌥")
+                    ShortcutKey(title: "Space")
+                }
+            }
+            .padding(9)
+            .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 9))
+            .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(Color.white.opacity(0.055)))
+
             Button {
-                openWindow(id: "hud")
-                NSApp.activate(ignoringOtherApps: true)
-            } label: {
-                Label(chat.onboarded ? "Open Helm" : "Continue setup", systemImage: "macwindow")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(jarvisCyan)
-            HStack {
-                Button("Settings") {
-                    chat.showProviderSettings = true
-                    openWindow(id: "hud")
-                    NSApp.activate(ignoringOtherApps: true)
+                openHelm()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    chat.focusInputAfterOpen = true
                 }
-                Spacer()
-                Button("Quit") { NSApplication.shared.terminate(nil) }
+            } label: {
+                Label("Quick Ask", systemImage: "bubble.left.and.bubble.right")
+                    .font(.system(size: 10, weight: .medium))
+                    .frame(maxWidth: .infinity, minHeight: 30)
+                    .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
             }
-            .controlSize(.small)
+            .buttonStyle(.plain)
+
+            if chat.onboarded && chat.voiceHotkey && !CGPreflightListenEventAccess() {
+                Button {
+                    PermissionManager.request("input-monitoring")
+                } label: {
+                    Label("Set up voice shortcut", systemImage: "waveform.badge.exclamationmark")
+                        .font(.system(size: 10, weight: .medium))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(.orange)
+                .padding(.horizontal, 2)
+            }
+
+            Rectangle().fill(Color.white.opacity(0.07)).frame(height: 1)
+            HStack(spacing: 8) {
+                Button {
+                    chat.showProviderSettings = true
+                    openHelm()
+                } label: {
+                    Label("Settings", systemImage: "gearshape")
+                        .font(.system(size: 10, weight: .medium))
+                        .frame(maxWidth: .infinity, minHeight: 30)
+                        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+
+                Button { NSApplication.shared.terminate(nil) } label: {
+                    Image(systemName: "power")
+                        .font(.system(size: 12, weight: .medium))
+                        .frame(width: 36, height: 30)
+                        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .help("Quit Helm")
+            }
         }
-        .padding(16)
+        .padding(15)
+        .frame(width: 310)
+        .background(helmBackground)
         .preferredColorScheme(.dark)
+        .onAppear { chat.configureVoice() }
+    }
+
+    private func openHelm() {
+        openWindow(id: "hud")
+        NSApp.activate(ignoringOtherApps: true)
     }
 }
 
@@ -1286,7 +1782,7 @@ struct ChatRootView: View {
 
     var body: some View {
         if chat.interfaceStyle == "hud" || !chat.onboarded {
-            MenuLauncher().frame(width: 280)
+            MenuLauncher()
         } else {
             panel.frame(width: 420, height: 640)
         }
@@ -1331,20 +1827,14 @@ struct ChatPanel: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            Rectangle().fill(jarvisCyan.opacity(0.12)).frame(height: 1)
+            Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1)
             transcript
             if let action = chat.pendingApproval {
                 approvalCard(action)
             }
             inputBar
         }
-        .background(
-            LinearGradient(
-                colors: [Color(red: 0.03, green: 0.05, blue: 0.10), Color(red: 0.05, green: 0.09, blue: 0.17)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-        )
+        .background(helmBackground)
         .preferredColorScheme(.dark)
         .onAppear { chat.configureVoice() }
     }
@@ -1353,21 +1843,24 @@ struct ChatPanel: View {
         if chat.isListening { return "Listening…" }
         if chat.pendingApproval != nil { return "Waiting for your OK" }
         if chat.isThinking { return "Thinking…" }
-        return "Online · running on this Mac"
+        if chat.voiceHotkey && !CGPreflightListenEventAccess() { return "⌃⌥Space opens Helm · voice shortcut needs Input Monitoring" }
+        return chat.voiceHotkey ? "⌃⌥Space opens Helm · tap Control+Option or hold to speak" : "⌃⌥Space opens Helm · voice shortcut off"
     }
 
     private var header: some View {
         HStack(spacing: 12) {
-            Orb(active: chat.isThinking || chat.isListening, size: 30)
+            HelmBrandMark(size: 29)
             VStack(alignment: .leading, spacing: 2) {
-                Text("HELM")
-                    .font(.system(size: 13, weight: .bold, design: .rounded))
-                    .tracking(3)
+                Text("Helm").font(.system(size: 12, weight: .semibold))
                 Text(status)
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if chat.voiceHotkey && !CGPreflightListenEventAccess() {
+                Button("Enable shortcut") { PermissionManager.request("input-monitoring") }
+                    .font(.system(size: 9, weight: .medium)).buttonStyle(.bordered).controlSize(.mini)
+            }
             Menu {
                 Toggle("Ask before screen actions", isOn: $chat.askBeforeActing)
                 Toggle("Speak replies", isOn: $chat.speakReplies)
@@ -1394,8 +1887,10 @@ struct ChatPanel: View {
                 Divider()
                 Button("Quit Helm") { NSApplication.shared.terminate(nil) }
             } label: {
-                Image(systemName: "slider.horizontal.3")
-                    .font(.system(size: 13))
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(width: 26, height: 26)
+                    .background(Color.white.opacity(0.05), in: Circle())
                     .foregroundStyle(.secondary)
             }
             .menuStyle(.borderlessButton)
@@ -1403,8 +1898,8 @@ struct ChatPanel: View {
             .fixedSize()
             .accessibilityLabel("Settings")
         }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 11)
     }
 
     private var transcript: some View {
@@ -1421,7 +1916,8 @@ struct ChatPanel: View {
                         TypingDots().id("typing")
                     }
                 }
-                .padding(16)
+                .padding(.horizontal, 15)
+                .padding(.vertical, 14)
             }
             .onChange(of: chat.lines) { _ in
                 withAnimation(.easeOut(duration: 0.2)) {
@@ -1432,33 +1928,33 @@ struct ChatPanel: View {
     }
 
     private var welcome: some View {
-        VStack(spacing: 14) {
-            Orb(active: false, size: 74).padding(.top, 36)
-            Text("How can I help?")
-                .font(.system(size: 18, weight: .semibold, design: .rounded))
-            Text("Ask anything, or tell me what to do on your Mac.")
-                .font(.system(size: 12))
-                .foregroundStyle(.secondary)
-            VStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 9) {
+            Text("What can I help with?")
+                .font(.system(size: 21, weight: .semibold))
+                .padding(.top, 20)
+            Text("Ask a question or describe a task for your Mac.")
+                .font(.system(size: 11)).foregroundStyle(.secondary)
+            VStack(spacing: 5) {
                 ForEach(suggestions, id: \.self) { suggestion in
                     Button {
                         chat.draft = suggestion
                         chat.send()
                     } label: {
-                        Text(suggestion)
-                            .font(.system(size: 12))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 9)
-                            .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 10))
-                            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(jarvisCyan.opacity(0.18)))
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.turn.down.right").font(.system(size: 9)).foregroundStyle(.tertiary)
+                            Text(suggestion).font(.system(size: 11))
+                            Spacer(minLength: 0)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 9).padding(.vertical, 8)
+                        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 7))
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(.plain).foregroundStyle(.primary.opacity(0.82))
                 }
             }
-            .padding(.top, 8)
+            .padding(.top, 4)
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -1468,24 +1964,18 @@ struct ChatPanel: View {
             HStack {
                 Spacer(minLength: 50)
                 Text(line.text)
-                    .font(.system(size: 13))
+                    .font(.system(size: 12))
                     .textSelection(.enabled)
-                    .padding(.horizontal, 13)
-                    .padding(.vertical, 9)
-                    .background(
-                        LinearGradient(colors: [jarvisBlue, jarvisCyan.opacity(0.8)], startPoint: .topLeading, endPoint: .bottomTrailing),
-                        in: RoundedRectangle(cornerRadius: 15)
-                    )
+                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .background(Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
             }
         case .bot:
-            HStack {
+            HStack(alignment: .top, spacing: 8) {
+                HelmBrandMark(size: 21)
                 Text(line.text)
-                    .font(.system(size: 13))
+                    .font(.system(size: 12))
                     .textSelection(.enabled)
-                    .padding(.horizontal, 13)
-                    .padding(.vertical, 9)
-                    .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 15))
-                    .overlay(RoundedRectangle(cornerRadius: 15).strokeBorder(jarvisCyan.opacity(0.15)))
+                    .padding(.top, 2)
                 Spacer(minLength: 50)
             }
         case .activity:
@@ -1494,7 +1984,7 @@ struct ChatPanel: View {
             } icon: {
                 Image(systemName: "gearshape.2").foregroundStyle(jarvisCyan)
             }
-            .font(.system(size: 11, design: .monospaced))
+            .font(.system(size: 10))
             .foregroundStyle(.secondary)
             .padding(.leading, 4)
         case .error:
@@ -1522,25 +2012,25 @@ struct ChatPanel: View {
             .controlSize(.small)
         }
         .padding(12)
-        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 12))
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
     }
 
     private var inputBar: some View {
-        HStack(spacing: 10) {
+        HStack(spacing: 8) {
             Button {
-                chat.toggleVoice()
+                chat.toggleDictation()
             } label: {
-                Image(systemName: chat.isListening ? "waveform" : "mic.fill")
+                Image(systemName: chat.isListening && chat.dictating ? "waveform" : "mic.fill")
                     .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(chat.isListening ? .white : jarvisCyan)
-                    .frame(width: 32, height: 32)
-                    .background(chat.isListening ? Color.red : jarvisCyan.opacity(0.12), in: Circle())
+                    .foregroundStyle(chat.isListening && chat.dictating ? .white : jarvisCyan)
+                    .frame(width: 29, height: 29)
+                    .background(chat.isListening && chat.dictating ? Color.red : Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
             }
             .buttonStyle(.plain)
-            .help("Talk (or hold Control+Option)")
-            .accessibilityLabel(chat.isListening ? "Stop listening" : "Start voice input")
+            .help("Dictate into the message box; review before sending")
+            .accessibilityLabel(chat.isListening && chat.dictating ? "Stop dictation" : "Dictate")
 
             TextField("Message Helm…", text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
@@ -1551,70 +2041,57 @@ struct ChatPanel: View {
 
             if chat.isThinking {
                 Button { chat.stop() } label: {
-                    Image(systemName: "stop.circle.fill").font(.system(size: 24))
+                    Image(systemName: "stop.fill").font(.system(size: 11, weight: .semibold))
+                        .frame(width: 29, height: 29).background(Color.red.opacity(0.8), in: RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.red.opacity(0.85))
                 .help("Stop")
             } else {
                 Button { chat.send() } label: {
-                    Image(systemName: "arrow.up.circle.fill").font(.system(size: 24))
+                    Image(systemName: "arrow.up").font(.system(size: 12, weight: .semibold))
+                        .frame(width: 29, height: 29).background(jarvisCyan, in: RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(jarvisCyan)
+                .foregroundStyle(.white)
                 .disabled(chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 .help("Send")
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 18))
-        .overlay(RoundedRectangle(cornerRadius: 18).strokeBorder(jarvisCyan.opacity(0.22)))
-        .padding(14)
+        .padding(.horizontal, 9).padding(.vertical, 7)
+        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 11))
+        .overlay(RoundedRectangle(cornerRadius: 11).strokeBorder(Color.white.opacity(0.09)))
+        .padding(12)
     }
 }
 
 private struct Orb: View {
     let active: Bool
     let size: CGFloat
-    @State private var pulse = false
 
     var body: some View {
         ZStack {
-            Circle()
-                .fill(jarvisCyan.opacity(active ? 0.45 : 0.25))
-                .blur(radius: size * 0.3)
-            Circle()
-                .fill(AngularGradient(colors: [jarvisCyan, jarvisBlue, jarvisCyan], center: .center))
-            Circle()
-                .strokeBorder(Color.white.opacity(0.6), lineWidth: max(1, size * 0.04))
-                .padding(size * 0.18)
+            Circle().fill(Color.white.opacity(0.035))
+            Circle().strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+            Circle().fill(jarvisCyan.opacity(active ? 0.95 : 0.58))
+                .frame(width: size * 0.23, height: size * 0.23)
+            if active {
+                Circle().strokeBorder(jarvisCyan.opacity(0.45), lineWidth: 1)
+                    .padding(size * 0.20)
+            }
         }
         .frame(width: size, height: size)
-        .scaleEffect(pulse ? 1.06 : 0.94)
-        .animation(.easeInOut(duration: active ? 0.5 : 1.6).repeatForever(autoreverses: true), value: pulse)
-        .onAppear { pulse = true }
         .accessibilityHidden(true)
     }
 }
 
 private struct TypingDots: View {
-    @State private var phase = false
-
     var body: some View {
-        HStack(spacing: 5) {
-            ForEach(0..<3) { index in
-                Circle()
-                    .fill(jarvisCyan)
-                    .frame(width: 6, height: 6)
-                    .opacity(phase ? 1 : 0.25)
-                    .animation(.easeInOut(duration: 0.6).repeatForever().delay(Double(index) * 0.2), value: phase)
-            }
+        HStack(spacing: 7) {
+            ProgressView().controlSize(.small).tint(jarvisCyan)
+            Text("Helm is working…").font(.system(size: 10)).foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 11)
-        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 15))
-        .onAppear { phase = true }
+        .padding(.leading, 33).padding(.vertical, 5)
         .accessibilityLabel("Helm is thinking")
     }
 }
@@ -1628,37 +2105,23 @@ struct HUDView: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.01, green: 0.02, blue: 0.05).ignoresSafeArea()
-            RadialGradient(
-                colors: [jarvisCyan.opacity(0.10), .clear],
-                center: .init(x: 0.25, y: 0.45),
-                startRadius: 10,
-                endRadius: 520
-            )
-            .ignoresSafeArea()
-            GridBackdrop().opacity(0.35).ignoresSafeArea()
-            if !chat.onboarded {
-                OnboardingView()
-            } else if showAdvanced {
-                ChatRootViewAdvanced(showAdvanced: $showAdvanced)
-            } else {
+            helmBackground.ignoresSafeArea()
+            if !chat.onboarded { OnboardingView() }
+            else if showAdvanced { ChatRootViewAdvanced(showAdvanced: $showAdvanced) }
+            else {
                 HStack(spacing: 0) {
-                    reactorColumn
-                        .frame(width: 340)
-                    Rectangle().fill(jarvisCyan.opacity(0.15)).frame(width: 1)
+                    workspaceSidebar.frame(width: 238)
+                    Rectangle().fill(Color.white.opacity(0.07)).frame(width: 1)
                     conversationColumn
                 }
             }
         }
         .preferredColorScheme(.dark)
-        .frame(minWidth: 820, minHeight: 560)
-        .sheet(isPresented: $chat.showProviderSettings) {
-            SettingsView().preferredColorScheme(.dark)
-        }
+        .frame(minWidth: 1020, minHeight: 680)
+        .sheet(isPresented: $chat.showProviderSettings) { SettingsView().preferredColorScheme(.dark) }
         .onOpenURL { chat.handleOpenURL($0) }
         .onAppear {
             chat.configureVoice()
-            // Menu bar style hides the big window at launch, but not when the shortcut asked for it.
             if chat.onboarded && chat.interfaceStyle == "menubar" && chat.hudRequests == 0 { closeHUDWindow() }
         }
         .onChange(of: chat.interfaceStyle) { style in
@@ -1667,132 +2130,154 @@ struct HUDView: View {
     }
 
     private func closeHUDWindow() {
-        DispatchQueue.main.async {
-            NSApp.windows.filter { $0.title == "Helm" && !($0 is NSPanel) }.forEach { $0.close() }
-        }
+        DispatchQueue.main.async { NSApp.windows.filter { $0.title == "Helm" && !($0 is NSPanel) }.forEach { $0.close() } }
     }
 
-    private var stateText: String {
-        if chat.isListening { return "LISTENING" }
-        if chat.pendingApproval != nil { return "AWAITING AUTHORISATION" }
-        if chat.isThinking { return "PROCESSING" }
-        return "STANDING BY"
+    private func openSettings(_ tab: Int) {
+        chat.requestedSettingsTab = tab
+        chat.showProviderSettings = true
     }
 
-    private var reactorColumn: some View {
-        VStack(spacing: 22) {
-            HStack {
-                Text("H · E · L · M")
-                    .font(.system(size: 12, weight: .bold, design: .monospaced))
-                    .foregroundStyle(jarvisCyan)
+    private var workspaceSidebar: some View {
+        VStack(alignment: .leading, spacing: 17) {
+            HStack(spacing: 9) {
+                HelmBrandMark(size: 28)
+                Text("Helm").font(.system(size: 14, weight: .semibold))
                 Spacer()
             }
-            Spacer()
-            Button { chat.toggleVoice() } label: {
-                Reactor(active: chat.isThinking || chat.isListening, listening: chat.isListening)
-                    .frame(width: 230, height: 230)
+            Button { chat.newChat() } label: {
+                Label("New task", systemImage: "plus")
+                    .font(.system(size: 12, weight: .medium))
+                    .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 9)
+                    .background(Color.white.opacity(0.055), in: RoundedRectangle(cornerRadius: 8))
+                    .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(Color.white.opacity(0.06)))
+            }.buttonStyle(.plain).foregroundStyle(.primary)
+
+            VStack(alignment: .leading, spacing: 3) {
+                sidebarSection("Workspace")
+                sidebarButton("Chat", "bubble.left.and.bubble.right", selected: true) {}
+                sidebarButton("Integrations", "square.grid.2x2") { openSettings(3) }
+                sidebarButton("Permissions", "hand.raised") { openSettings(2) }
+                sidebarButton("Activity", "clock.arrow.circlepath") { openSettings(7) }
             }
-            .buttonStyle(.plain)
-            .help("Click to talk, or hold Control+Option")
-            .accessibilityLabel(chat.isListening ? "Stop listening" : "Start voice input")
-            Text(stateText)
-                .font(.system(size: 13, weight: .semibold, design: .monospaced))
-                .tracking(4)
-                .foregroundStyle(chat.isListening ? .red : jarvisCyan)
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                VStack(spacing: 4) {
-                    Text(context.date, format: .dateTime.hour().minute().second())
-                        .font(.system(size: 28, weight: .light, design: .monospaced))
-                    Text(context.date, format: .dateTime.weekday(.wide).day().month(.wide))
-                        .font(.system(size: 11, design: .monospaced))
-                        .foregroundStyle(.secondary)
+            VStack(alignment: .leading, spacing: 2) {
+                sidebarSection("Connections")
+                connectorButton("Telegram", "paperplane.fill", 4)
+                connectorButton("Slack", "number", 6)
+                connectorButton("WhatsApp", "message.fill", 3)
+                connectorButton("Discord", "bubble.left.and.bubble.right.fill", 5)
+            }
+            Spacer(minLength: 10)
+            Button { openSettings(0) } label: {
+                HStack(spacing: 9) {
+                    Image(systemName: "cpu").font(.system(size: 13)).foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("AI model").font(.system(size: 10)).foregroundStyle(.secondary)
+                        Text(chat.provider == "ollama" ? "On this Mac" : ProviderOption.find(chat.provider).label)
+                            .font(.system(size: 11, weight: .medium)).lineLimit(1)
+                    }
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary)
                 }
-            }
-            Spacer()
-            VStack(alignment: .leading, spacing: 6) {
-                telemetry("BRAIN", chat.brainLabel)
-                telemetry("WEB ACCESS", chat.isEnabled(["web_search"]) ? "ON" : "OFF")
-                telemetry("SCREEN CONTROL", chat.askBeforeActing ? "ASK FIRST" : "FULL AUTONOMY")
-                telemetry("VOICE", chat.speakReplies ? "ON" : "MUTED")
-            }
+                .padding(.horizontal, 9).padding(.vertical, 9)
+                .background(Color.white.opacity(0.04), in: RoundedRectangle(cornerRadius: 8))
+            }.buttonStyle(.plain)
         }
-        .padding(26)
+        .padding(14).padding(.vertical, 8).frame(maxHeight: .infinity)
+        .background(Color.white.opacity(0.018))
     }
 
-    private func telemetry(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(label).foregroundStyle(.secondary)
-            Spacer()
-            Text(value).foregroundStyle(jarvisCyan)
+    private func sidebarSection(_ text: String) -> some View {
+        Text(text).font(.system(size: 10, weight: .medium)).foregroundStyle(.secondary)
+            .padding(.horizontal, 10).padding(.top, 6).padding(.bottom, 3)
+    }
+
+    private func sidebarButton(_ title: String, _ icon: String, selected: Bool = false, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon).font(.system(size: 11, weight: selected ? .medium : .regular))
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 7)
+                .background(selected ? Color.white.opacity(0.075) : .clear, in: RoundedRectangle(cornerRadius: 7))
+        }.buttonStyle(.plain)
+    }
+
+    private func connectorButton(_ title: String, _ icon: String, _ tab: Int) -> some View {
+        let bridge: String? = switch tab {
+        case 3: chat.whatsappBridgeStatus
+        case 4: chat.telegramBridgeStatus
+        case 5: chat.discordBridgeStatus
+        case 6: chat.slackBridgeStatus
+        default: nil
         }
-        .font(.system(size: 10, design: .monospaced))
+        let connected = bridge?.hasPrefix("Running") == true
+        let connectionLabel: String = connected ? "Connected" :
+            (bridge == "Not configured" || bridge == "Stopped" ? "Setup" : "Check")
+        return Button { openSettings(tab) } label: {
+            HStack(spacing: 8) {
+                Image(systemName: icon).font(.system(size: 10)).foregroundStyle(.secondary).frame(width: 15)
+                Text(title).font(.system(size: 10)).foregroundStyle(.primary.opacity(0.82))
+                Spacer()
+                Text(connectionLabel).font(.system(size: 8, weight: .medium))
+                    .foregroundStyle(connected ? Color.green : Color.secondary)
+                Circle().fill(connected ? Color.green : Color.white.opacity(0.20)).frame(width: 5, height: 5)
+            }.padding(.horizontal, 10).padding(.vertical, 6).contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(bridge ?? "Open integration settings")
+        .accessibilityLabel("\(title), \(connectionLabel). Open integration settings.")
     }
 
     private var conversationColumn: some View {
         VStack(spacing: 0) {
-            HStack {
-                Text("COMMS LOG")
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .tracking(3)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Toggle("Full autonomy", isOn: Binding(
-                    get: { !chat.askBeforeActing },
-                    set: { chat.askBeforeActing = !$0 }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .font(.system(size: 11, design: .monospaced))
-                .help("When on, Helm clicks and types without asking first.")
-                Menu {
-                    Button("Settings (brain, abilities, permissions)…") { chat.showProviderSettings = true }
-                    Toggle("Speak replies", isOn: $chat.speakReplies)
-                    if chat.hasActiveTasks {
-                        Button(
-                            "Emergency stop all tasks\(chat.emergencyStopShortcutAvailable ? "  ⌃⇧Esc" : "")",
-                            role: .destructive
-                        ) {
-                            chat.emergencyStop()
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Text("Chat").font(.system(size: 14, weight: .semibold))
+                        if chat.isThinking || chat.isListening {
+                            Circle().fill(chat.isListening ? Color.orange : jarvisCyan).frame(width: 6, height: 6)
                         }
                     }
+                    Text(chat.isListening ? "Listening" : chat.pendingApproval != nil ? "Waiting for approval" : chat.isThinking ? "Working on your request" : "")
+                        .font(.system(size: 10)).foregroundStyle(.secondary).frame(height: 12, alignment: .leading)
+                }
+                Spacer()
+                if chat.voiceHotkey && !CGPreflightListenEventAccess() {
+                    Button("Enable shortcut") { PermissionManager.request("input-monitoring") }
+                        .font(.system(size: 9, weight: .medium)).buttonStyle(.bordered).controlSize(.mini)
+                }
+                Menu {
+                    Toggle("Ask before actions", isOn: $chat.askBeforeActing)
+                    Toggle("Speak replies", isOn: $chat.speakReplies)
+                    if chat.hasActiveTasks { Button("Stop all tasks", role: .destructive) { chat.emergencyStop() } }
+                    Divider()
                     Button("New chat") { chat.newChat() }
-                    Button("Permissions & MCP tools…") { showAdvanced = true }
+                    Button("AI model & API keys…") { openSettings(0) }
+                    Button("Open Permissions…") { openSettings(2) }
+                    Button("Abilities…") { openSettings(1) }
+                    Button("MCP tools…") { showAdvanced = true }
                     Divider()
                     Button("Quit Helm") { NSApplication.shared.terminate(nil) }
                 } label: {
-                    Image(systemName: "slider.horizontal.3").foregroundStyle(.secondary)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .padding(.leading, 12)
-                .accessibilityLabel("Settings")
+                    Image(systemName: "ellipsis").font(.system(size: 14, weight: .semibold)).foregroundStyle(.primary.opacity(0.8))
+                        .frame(width: 34, height: 34).background(helmSurface, in: Circle())
+                }.menuStyle(.borderlessButton).menuIndicator(.hidden).fixedSize()
             }
-            .padding(.horizontal, 24)
-            .padding(.vertical, 16)
+            .padding(.horizontal, 26).padding(.vertical, 12).background(helmBackground)
+            Rectangle().fill(Color.white.opacity(0.06)).frame(height: 1)
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 16) {
+                    LazyVStack(alignment: .leading, spacing: 20) {
                         if chat.lines.isEmpty { hudWelcome }
-                        ForEach(chat.lines) { line in
-                            hudLine(line).id(line.id)
-                        }
-                        if chat.isThinking && chat.pendingApproval == nil {
-                            TypingDots().id("typing")
-                        }
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 8)
+                        ForEach(chat.lines) { line in hudLine(line).id(line.id) }
+                        if chat.isThinking && chat.pendingApproval == nil { TypingDots().id("typing") }
+                    }.frame(maxWidth: 760).frame(maxWidth: .infinity)
+                        .padding(.horizontal, 30).padding(.vertical, 22)
                 }
                 .onChange(of: chat.lines) { _ in
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        proxy.scrollTo(chat.isThinking ? AnyHashable("typing") : AnyHashable(chat.lines.last?.id), anchor: .bottom)
-                    }
+                    withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(chat.isThinking ? AnyHashable("typing") : AnyHashable(chat.lines.last?.id), anchor: .bottom) }
                 }
             }
-            if let action = chat.pendingApproval {
-                HUDApproval(action: action)
-            }
+            if let action = chat.pendingApproval { HUDApproval(action: action) }
             AgentsBoard().padding(.horizontal, 24)
             HUDInput()
         }
@@ -1800,66 +2285,80 @@ struct HUDView: View {
 
     private var greeting: String {
         switch Calendar.current.component(.hour, from: Date()) {
-        case 5..<12: return "Good morning."
-        case 12..<18: return "Good afternoon."
-        default: return "Good evening."
+        case 5..<12: return "Good morning"
+        case 12..<18: return "Good afternoon"
+        default: return "Good evening"
         }
     }
 
     private var hudWelcome: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text(greeting)
-                .font(.system(size: 26, weight: .light))
-            Text("Say or type a command. I can open apps and websites, search the web, YouTube and TikTok, control your music and volume, and drive the screen with the mouse and keyboard.")
-                .font(.system(size: 13))
+        VStack(spacing: 10) {
+            HelmBrandMark(size: 76)
+                .shadow(color: jarvisBlue.opacity(0.18), radius: 24, y: 8)
+                .padding(.bottom, 2)
+            Text("H E L M")
+                .font(.system(size: 20, weight: .semibold, design: .rounded))
+                .tracking(3)
+            Text("Think. Create. Solve. Together.")
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                ForEach(["What's my battery and the time?", "Find TikTok videos about latte art", "Play some music", "Search YouTube for SwiftUI tutorials"], id: \.self) { suggestion in
-                    Button {
-                        chat.draft = suggestion
-                        chat.send()
-                    } label: {
-                        Text(suggestion)
-                            .font(.system(size: 12, design: .monospaced))
-                            .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
-                            .padding(.horizontal, 12)
-                            .background(jarvisCyan.opacity(0.06))
-                            .overlay(HUDBrackets())
+            Text(greeting + ". What are we working on?")
+                .font(.system(size: 14, weight: .medium))
+                .padding(.top, 7)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], alignment: .center, spacing: 8) {
+                ForEach(Array([
+                    ("Search the web", "magnifyingglass", "Search the web for "),
+                    ("Analyze a file", "doc.text", "Analyze the file I attach and summarize what matters."),
+                    ("Code & debug", "chevron.left.forwardslash.chevron.right", "Help me debug this code. Explain the issue, then suggest a fix."),
+                    ("Guide me in an app", "cursorarrow.motionlines", "Look at my current screen and guide me through what I'm trying to do, one clear step at a time."),
+                    ("Draft an email", "envelope", "Help me draft an email. Ask about the recipient, purpose, and tone, then show me the draft before anything is sent."),
+                    ("Ask about this screen", "viewfinder", "Look at my current screen and explain what I'm seeing and one useful next step.")
+                ].enumerated()), id: \.offset) { entry in
+                    let suggestion = entry.element
+                    Button { chat.draft = suggestion.2 } label: {
+                        VStack(spacing: 7) {
+                            Image(systemName: suggestion.1)
+                                .font(.system(size: 14, weight: .medium))
+                                .foregroundStyle(jarvisCyan)
+                            Text(suggestion.0)
+                                .font(.system(size: 9, weight: .medium))
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 58)
+                        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+                        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.white.opacity(0.075)))
                     }
                     .buttonStyle(.plain)
+                    .foregroundStyle(.primary.opacity(0.82))
                 }
             }
-            .padding(.top, 8)
+            .padding(.top, 4)
         }
-        .padding(.top, 30)
+        .frame(maxWidth: .infinity)
+        .padding(.top, 10)
     }
 
     @ViewBuilder
     private func hudLine(_ line: ChatLine) -> some View {
         switch line.role {
         case .user:
-            VStack(alignment: .leading, spacing: 4) {
-                Text("YOU ›").font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(.secondary)
-                Text(line.text).font(.system(size: 14)).textSelection(.enabled)
+            HStack {
+                Spacer(minLength: 70)
+                Text(line.text).font(.system(size: 12)).lineSpacing(3).textSelection(.enabled)
+                    .padding(.horizontal, 13).padding(.vertical, 9)
+                    .background(Color.white.opacity(0.09), in: RoundedRectangle(cornerRadius: 12))
             }
         case .bot:
-            VStack(alignment: .leading, spacing: 4) {
-                Text("HELM ›").font(.system(size: 10, weight: .bold, design: .monospaced)).foregroundStyle(jarvisCyan)
-                Text(line.text).font(.system(size: 15)).textSelection(.enabled)
+            HStack(alignment: .top, spacing: 10) {
+                HelmBrandMark(size: 23)
+                Text(line.text).font(.system(size: 12)).lineSpacing(4).textSelection(.enabled).padding(.top, 2)
+                Spacer(minLength: 18)
             }
-            .padding(.leading, 10)
-            .overlay(alignment: .leading) { Rectangle().fill(jarvisCyan).frame(width: 2) }
         case .activity:
-            Text(line.text)
-                .font(.system(size: 11, design: .monospaced))
-                .foregroundStyle(jarvisCyan.opacity(0.7))
-                .textSelection(.enabled)
+            Label(line.text, systemImage: "checkmark.circle").font(.system(size: 10)).foregroundStyle(.secondary).textSelection(.enabled).padding(.leading, 33)
         case .error:
-            Label(line.text, systemImage: "exclamationmark.triangle.fill")
-                .font(.system(size: 12, design: .monospaced))
-                .foregroundStyle(.orange)
-                .textSelection(.enabled)
+            Label(line.text, systemImage: "exclamationmark.triangle.fill").font(.system(size: 11)).foregroundStyle(.orange).textSelection(.enabled)
+                .padding(10).frame(maxWidth: .infinity, alignment: .leading).background(Color.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: 9))
         }
     }
 }
@@ -1909,70 +2408,80 @@ private struct HUDApproval: View {
 
 private struct HUDInput: View {
     @EnvironmentObject private var chat: ChatController
+    @FocusState private var inputFocused: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 11) {
             Button { chat.toggleDictation() } label: {
                 Image(systemName: chat.isListening && chat.dictating ? "waveform" : "mic.fill")
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(chat.isListening && chat.dictating ? .white : jarvisCyan)
-                    .frame(width: 28, height: 28)
-                    .background(chat.isListening && chat.dictating ? Color.red : jarvisCyan.opacity(0.12), in: Circle())
+                    .frame(width: 30, height: 30)
+                    .background(chat.isListening && chat.dictating ? Color.red.opacity(0.8) : Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8))
             }
             .buttonStyle(.plain)
-            .help("Dictate into the box (Control+Shift+D)")
+            .help("Dictate into the message box")
             .accessibilityLabel(chat.isListening && chat.dictating ? "Stop dictation" : "Dictate")
-            Text("›").font(.system(size: 16, weight: .bold, design: .monospaced)).foregroundStyle(jarvisCyan)
-            TextField("Enter a command…", text: $chat.draft, axis: .vertical)
+
+            TextField("Message Helm…", text: $chat.draft, axis: .vertical)
                 .textFieldStyle(.plain)
-                .font(.system(size: 14, design: .monospaced))
+                .font(.system(size: 12))
                 .lineLimit(1...4)
+                .focused($inputFocused)
                 .onSubmit { chat.send() }
                 .disabled(chat.isThinking)
+                .padding(.vertical, 5)
+
             if chat.isThinking {
-                Button("ABORT") { chat.stop() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.red)
+                Button { chat.stop() } label: {
+                    Image(systemName: "stop.fill").font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(.white).frame(width: 30, height: 30).background(Color.red.opacity(0.82), in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .help("Stop Helm")
             } else {
-                Button("AGENT") { chat.dispatchDraft() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(AgentCursor.colors["Agent 1"] ?? jarvisCyan)
-                    .disabled(chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                    .help("Run this in the background on one of 3 agents")
-                Button("SEND") { chat.send() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(jarvisCyan)
-                    .disabled(chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                Button { chat.dispatchDraft() } label: {
+                    Image(systemName: "arrowshape.turn.up.right").font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary).frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .disabled(chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("Run this request in the background")
+
+                Button { chat.send() } label: {
+                    Image(systemName: "arrow.up").font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(.white).frame(width: 30, height: 30).background(jarvisCyan, in: RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+                .disabled(chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("Send")
             }
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 13)
-        .background(jarvisCyan.opacity(0.05))
-        .overlay(HUDBrackets())
-        .padding(24)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(Color.white.opacity(0.045), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.09)))
+        .padding(.horizontal, 24)
+        .padding(.top, 9)
+        .padding(.bottom, 11)
+        .onAppear {
+            if chat.focusInputAfterOpen {
+                inputFocused = true
+                chat.focusInputAfterOpen = false
+            }
+        }
+        .onChange(of: chat.focusInputAfterOpen) { shouldFocus in
+            guard shouldFocus else { return }
+            inputFocused = true
+            chat.focusInputAfterOpen = false
+        }
     }
 }
 
-/// Corner brackets that give panels the HUD frame look.
 private struct HUDBrackets: View {
     var color: Color = jarvisCyan
-
     var body: some View {
-        GeometryReader { geo in
-            let w = geo.size.width, h = geo.size.height, l: CGFloat = 10
-            Path { p in
-                p.move(to: .init(x: 0, y: l)); p.addLine(to: .zero); p.addLine(to: .init(x: l, y: 0))
-                p.move(to: .init(x: w - l, y: 0)); p.addLine(to: .init(x: w, y: 0)); p.addLine(to: .init(x: w, y: l))
-                p.move(to: .init(x: w, y: h - l)); p.addLine(to: .init(x: w, y: h)); p.addLine(to: .init(x: w - l, y: h))
-                p.move(to: .init(x: l, y: h)); p.addLine(to: .init(x: 0, y: h)); p.addLine(to: .init(x: 0, y: h - l))
-            }
-            .stroke(color.opacity(0.8), lineWidth: 1.5)
-            Rectangle().strokeBorder(color.opacity(0.15), lineWidth: 1)
-        }
-        .allowsHitTesting(false)
+        RoundedRectangle(cornerRadius: 12).strokeBorder(color.opacity(0.22), lineWidth: 1)
     }
 }
 
@@ -2152,9 +2661,9 @@ private struct Ability: Identifiable {
     let tools: [String]
 
     static let all = [
-        Ability(id: "screen", title: "Screen control", detail: "Clicks, types, reads and navigates apps for you", symbol: "cursorarrow.click.2", tools: ["control_screen", "resume_task", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard", "window_control", "drag_in_app"]),
+        Ability(id: "screen", title: "Screen control", detail: "Reads, clicks, types, drags, and arranges app windows", symbol: "cursorarrow.click.2", tools: ["control_screen", "resume_task", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app", "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard", "window_control", "drag_in_app"]),
         Ability(id: "web", title: "Web, YouTube & TikTok", detail: "Opens websites, searches the web and finds video examples", symbol: "magnifyingglass", tools: ["open_url", "web_search", "ask_chatgpt", "watch_video"]),
-        Ability(id: "apps", title: "Applications", detail: "Opens apps and manages installs with confirmation", symbol: "square.grid.2x2", tools: ["open_app", "install_app", "uninstall_app"]),
+        Ability(id: "apps", title: "Applications", detail: "Finds installed and downloaded apps, shows where they are, opens and quits apps, and manages installs with confirmation", symbol: "square.grid.2x2", tools: ["list_applications", "list_running_apps", "open_app", "quit_app", "install_app", "uninstall_app"]),
         Ability(id: "files", title: "Files & folders", detail: "List, read, copy, move and delete files in your home folder — deletes and moves always ask first", symbol: "folder", tools: ["file_operations"]),
         Ability(id: "media", title: "Music & volume", detail: "Plays, pauses and skips in Spotify or Music", symbol: "music.note", tools: ["media_control", "set_volume"]),
         Ability(id: "status", title: "Time & battery", detail: "Reads the current date, time and battery level", symbol: "battery.75percent", tools: ["system_status"]),
@@ -2219,7 +2728,30 @@ struct AbilitiesView: View {
                 }
                 .pickerStyle(.segmented)
                 .frame(maxWidth: 420)
-                Toggle("Voice shortcut — hold Control+Option to talk", isOn: $chat.voiceHotkey)
+                Toggle("Voice shortcut — tap to open Helm, hold to speak", isOn: $chat.voiceHotkey)
+                Picker("Hold to talk", selection: $chat.voiceShortcut) {
+                    Text("Control + Option").tag("control+option")
+                    Text("Control + Shift").tag("control+shift")
+                    Text("Option + Shift").tag("option+shift")
+                    Text("Control + Command").tag("control+command")
+                    Text("Option + Command").tag("option+command")
+                }
+                .disabled(!chat.voiceHotkey)
+                .help("Choose the modifier keys to hold while speaking.")
+                HStack(spacing: 10) {
+                    Button("Test voice shortcut") { chat.testVoiceShortcut() }
+                        .disabled(!chat.voiceHotkey || chat.voiceShortcutTestPending)
+                    Text(chat.voiceShortcutTestStatus.isEmpty
+                         ? (CGPreflightListenEventAccess() ? "Voice shortcut is ready to test." : "Control+Option+Space opens Helm without Input Monitoring.")
+                         : chat.voiceShortcutTestStatus)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Label(chat.launchShortcutAvailable ? "Control+Option+Space is registered" : "Control+Option+Space could not register", systemImage: chat.launchShortcutAvailable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                    .font(.system(size: 10)).foregroundStyle(chat.launchShortcutAvailable ? Color.green : Color.orange)
+                Text("Open Helm: Control+Option+Space. Tap/hold Control+Option needs Input Monitoring. Helm must be running in the menu bar.")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 Toggle("Speak replies out loud", isOn: $chat.speakReplies)
                 Toggle("Cursor buddy — a little Helm next to your mouse that shows what's happening", isOn: Binding(
                     get: { AgentCursor.shared.buddyEnabled }, set: { AgentCursor.shared.buddyEnabled = $0 }
@@ -2263,9 +2795,10 @@ extension AbilitiesView {
 
 // MARK: - Permissions
 
-private enum PermissionState {
+private enum PermissionState: Equatable {
     case granted
     case needsPermission
+    case notChecked
     case promptOnUse
     case limited
     case unavailable
@@ -2273,8 +2806,9 @@ private enum PermissionState {
 
     var label: String {
         switch self {
-        case .granted: "Available"
+        case .granted: "Allowed"
         case .needsPermission: "Needs permission"
+        case .notChecked: "Test needed"
         case .promptOnUse: "macOS prompt on use"
         case .limited: "Limited access"
         case .unavailable: "Not implemented"
@@ -2286,7 +2820,7 @@ private enum PermissionState {
         switch self {
         case .granted: .green
         case .needsPermission: .orange
-        case .promptOnUse, .limited: .yellow
+        case .notChecked, .promptOnUse, .limited: .yellow
         case .unavailable, .disabled: .secondary
         }
     }
@@ -2299,6 +2833,18 @@ private struct PermissionItem: Identifiable {
     let detail: String
     let state: PermissionState
     let canRequest: Bool
+
+    var privacyPane: String? {
+        switch id {
+        case "microphone": "Privacy_Microphone"
+        case "speech": "Privacy_SpeechRecognition"
+        case "input-monitoring": "Privacy_ListenEvent"
+        case "screen-recording": "Privacy_ScreenCapture"
+        case "accessibility", "keyboard", "mouse": "Privacy_Accessibility"
+        case "automation": "Privacy_Automation"
+        default: nil
+        }
+    }
 }
 
 private enum PermissionManager {
@@ -2347,17 +2893,19 @@ private enum PermissionManager {
     private static let desktopTools: Set<String> = [
         "control_screen", "resume_task", "click_in_app", "menu_in_app", "type_in_app", "keys_in_app",
         "read_screen", "new_document", "paste_into_app", "send_message", "read_chat", "clipboard",
+        "window_control", "drag_in_app",
     ]
 
     static func items(
         disabledTools: Set<String>,
         voiceHotkey: Bool,
-        emergencyStopShortcutAvailable: Bool
+        emergencyStopShortcutAvailable: Bool,
+        pythonScreenCaptureAllowed: Bool?
     ) -> [PermissionItem] {
         let screenEnabled = !disabledTools.contains("control_screen")
         let desktopEnabled = !desktopTools.isSubset(of: disabledTools)
         let browserEnabled = !Set(["open_url", "web_search", "ask_chatgpt", "watch_video"]).isSubset(of: disabledTools)
-        let appsEnabled = !Set(["open_app", "install_app", "uninstall_app"]).isSubset(of: disabledTools)
+        let appsEnabled = Set(["list_applications", "list_running_apps", "open_app", "quit_app", "install_app", "uninstall_app"]).isDisjoint(with: disabledTools)
         let microphoneAllowed = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
         let speechAllowed = SFSpeechRecognizer.authorizationStatus() == .authorized
         let accessibilityAllowed = AXIsProcessTrusted()
@@ -2377,7 +2925,9 @@ private enum PermissionManager {
             ),
             PermissionItem(
                 id: "input-monitoring", symbol: "keyboard", title: "Input Monitoring",
-                detail: "Required for the Control+Option voice shortcut.",
+                detail: CGPreflightListenEventAccess()
+                    ? "Helm's live Input Monitoring preflight is allowed. Required for the modifier-only Control+Option gesture; Control+Option+Space works without it."
+                    : "Helm's live preflight says this running copy is not allowed. If Settings already shows Helm on, remove that old row and add the current app at \(Bundle.main.bundleURL.path); ad-hoc rebuilds can leave a stale grant.",
                 state: voiceHotkey
                     ? (CGPreflightListenEventAccess() ? .granted : .needsPermission)
                     : .disabled,
@@ -2385,21 +2935,19 @@ private enum PermissionManager {
             ),
             PermissionItem(
                 id: "screen-recording", symbol: "rectangle.dashed.badge.record", title: "Screen Recording",
-                detail: "Required to capture the screen for screen-control tasks.",
+                detail: pythonScreenCaptureAllowed == nil
+                    ? "Run a live check to capture an actual screenshot in Helm's own process. Python receives the image through a private loopback connection."
+                    : (pythonScreenCaptureAllowed == true
+                        ? "Verified: Helm's native capture bridge took a screenshot and returned it to the assistant."
+                        : "Helm's live screenshot failed. Check the report below for the app's Screen Recording preflight and exact capture error."),
                 state: screenEnabled
-                    ? (CGPreflightScreenCaptureAccess() ? .granted : .needsPermission)
+                    ? (pythonScreenCaptureAllowed.map { $0 ? .granted : .needsPermission } ?? .notChecked)
                     : .disabled,
                 canRequest: screenEnabled
             ),
             PermissionItem(
-                id: "keyboard", symbol: "keyboard", title: "Keyboard",
-                detail: "Accessibility access is used for in-app typing and shortcuts.",
-                state: desktopEnabled ? (accessibilityAllowed ? .granted : .needsPermission) : .disabled,
-                canRequest: desktopEnabled
-            ),
-            PermissionItem(
-                id: "mouse", symbol: "computermouse", title: "Mouse",
-                detail: "Accessibility access is used for named controls; coordinates are a fallback.",
+                id: "accessibility", symbol: "cursorarrow.click.2", title: "Accessibility control",
+                detail: "Allows Helm to inspect running apps and their controls, click, type, drag, and move, resize, or close windows.",
                 state: desktopEnabled ? (accessibilityAllowed ? .granted : .needsPermission) : .disabled,
                 canRequest: desktopEnabled
             ),
@@ -2412,22 +2960,22 @@ private enum PermissionManager {
                 canRequest: false
             ),
             PermissionItem(
-                id: "automation", symbol: "bolt.horizontal.circle", title: "Automation (Apple Events)",
-                detail: "Needed to script Finder, System Events, Safari and Chrome — used for opening apps correctly, reading browser search results, and verifying chat windows before sending.",
-                state: automationAllowed() ? .granted : .needsPermission,
-                canRequest: true
+                id: "automation", symbol: "bolt.horizontal.circle", title: "App automation",
+                detail: "macOS asks separately the first time Helm needs to automate an app. Approval is per app.",
+                state: .promptOnUse,
+                canRequest: false
             ),
             PermissionItem(
                 id: "files", symbol: "folder", title: "Files",
-                detail: "No general file tools are built in. A configured MCP filesystem server has separate access; only trust servers you configure.",
+                detail: "When Files is enabled in Abilities, Helm's file tools are limited to your home folder. Deletes and moves require confirmation.",
                 state: .limited,
                 canRequest: false
             ),
             PermissionItem(
                 id: "applications", symbol: "square.grid.2x2", title: "Applications",
                 detail: appsEnabled
-                    ? "App launch and install tools are enabled; install/removal still needs confirmation."
-                    : "App launching is turned off in Abilities.",
+                    ? "App discovery shows installed and downloaded bundles and their locations. Opening a downloaded app may still require macOS approval; install and removal always need confirmation."
+                    : "Application listing and management are turned off in Abilities.",
                 state: appsEnabled ? .granted : .disabled,
                 canRequest: false
             ),
@@ -2452,6 +3000,139 @@ private enum PermissionManager {
         ]
     }
 
+    /// Tests the native capture path used by desktop control, including the private bridge to Python.
+    static func runLiveChecks(
+        requestScreenRecording: Bool = false,
+        completion: @escaping (Bool?, String) -> Void
+    ) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            let root = URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+            let python = root.appendingPathComponent(".venv/bin/python")
+            let script = root.appendingPathComponent("assistant.py")
+            let appName = Bundle.main.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String ?? Bundle.main.bundleIdentifier ?? "Helm"
+            let bundleURL = Bundle.main.bundleURL.standardizedFileURL
+            let executableURL = Bundle.main.executableURL?.standardizedFileURL
+            let bundleIdentifier = Bundle.main.bundleIdentifier ?? "unknown"
+            let launchServicesURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleIdentifier)
+            var lines = [
+                "App: \(appName)",
+                "Bundle ID: \(bundleIdentifier)",
+                "App path: \(bundleURL.path)",
+                "Bundle exists: \(FileManager.default.fileExists(atPath: bundleURL.path))",
+                "Bundle executable: \(executableURL?.path ?? "missing from Info.plist")",
+                "Executable exists and is executable: \(executableURL.map { FileManager.default.isExecutableFile(atPath: $0.path) } ?? false)",
+                "Launch Services lookup: \(launchServicesURL?.path ?? "no registered app found for this bundle ID")",
+                "Code signature: \(codeSignatureSummary())",
+                "Helm app Screen Recording preflight: \(CGPreflightScreenCaptureAccess() ? "allowed" : "not allowed")",
+                "Accessibility trust: \(AXIsProcessTrusted() ? "allowed" : "not allowed")",
+                "Input Monitoring preflight: \(CGPreflightListenEventAccess() ? "allowed" : "not allowed")",
+                "Microphone authorization: \(authorizationLabel(AVCaptureDevice.authorizationStatus(for: .audio)))",
+                "Speech Recognition authorization: \(speechAuthorizationLabel(SFSpeechRecognizer.authorizationStatus()))",
+            ]
+
+            let system = AXUIElementCreateSystemWide()
+            var focusedApplication: CFTypeRef?
+            let axResult = AXUIElementCopyAttributeValue(
+                system,
+                kAXFocusedApplicationAttribute as CFString,
+                &focusedApplication
+            )
+            lines.append("Accessibility live query: \(axResult == .success ? "focused app query succeeded" : "AX error \(axResult.rawValue)")")
+            lines.append("App automation: macOS grants Apple Events per target app on first use; Helm does not claim a global grant.")
+            lines.append("Capture identity: Helm app process (authenticated loopback bridge)")
+
+            guard FileManager.default.isExecutableFile(atPath: python.path),
+                  FileManager.default.fileExists(atPath: script.path) else {
+                lines.append("Screenshot test: unavailable — project Python or assistant.py was not found at \(root.path)")
+                DispatchQueue.main.async { completion(nil, lines.joined(separator: "\n")) }
+                return
+            }
+
+            func runBackend(_ arguments: [String]) -> (Int32, String) {
+                let process = Process()
+                let pipe = Pipe()
+                process.executableURL = python
+                process.arguments = ["-u", script.path] + arguments
+                process.currentDirectoryURL = root
+                process.environment = ProcessInfo.processInfo.environment.merging(ScreenCaptureBridge.shared.environment) { _, new in new }
+                process.standardOutput = pipe
+                process.standardError = pipe
+                do {
+                    try process.run()
+                    let output = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+                    process.waitUntilExit()
+                    return (process.terminationStatus, output.trimmingCharacters(in: .whitespacesAndNewlines))
+                } catch {
+                    return (-1, "Could not launch capture backend: \(error.localizedDescription)")
+                }
+            }
+
+            if requestScreenRecording {
+                lines.append("Screen Recording request was made by Helm itself; Python does not request or own this permission.")
+            }
+            let (status, output) = runBackend(["--test-screen-capture"])
+            let capturePassed = output.contains("SCREEN_CAPTURE_OK:")
+            lines.append("Helm native screenshot test through Python: \(capturePassed ? "PASSED" : "FAILED (exit \(status))")")
+            if !output.isEmpty { lines.append("Capture result: \(output)") }
+            DispatchQueue.main.async { completion(capturePassed, lines.joined(separator: "\n")) }
+        }
+    }
+
+    private static func authorizationLabel(_ status: AVAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: "allowed"
+        case .notDetermined: "not requested yet"
+        case .denied: "denied in System Settings"
+        case .restricted: "restricted by macOS policy"
+        @unknown default: "unknown"
+        }
+    }
+
+    private static func speechAuthorizationLabel(_ status: SFSpeechRecognizerAuthorizationStatus) -> String {
+        switch status {
+        case .authorized: "allowed"
+        case .notDetermined: "not requested yet"
+        case .denied: "denied in System Settings"
+        case .restricted: "restricted by macOS policy"
+        @unknown default: "unknown"
+        }
+    }
+
+    private static func codeSigningInfo() -> (summary: String, adHoc: Bool)? {
+        var code: SecStaticCode?
+        guard SecStaticCodeCreateWithPath(Bundle.main.bundleURL as CFURL, [], &code) == errSecSuccess,
+              let code else { return nil }
+        let validity = SecStaticCodeCheckValidity(code, [], nil) == errSecSuccess ? "valid" : "invalid or untrusted"
+        var information: CFDictionary?
+        guard SecCodeCopySigningInformation(code, SecCSFlags(rawValue: kSecCSSigningInformation), &information) == errSecSuccess,
+              let values = information as? [String: Any] else { return nil }
+        let identifier = values[kSecCodeInfoIdentifier as String] as? String ?? "unknown identifier"
+        let team = values[kSecCodeInfoTeamIdentifier as String] as? String
+        let flags = (values[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+        let adhoc = flags & 0x2 == 0x2
+        return ("\(team.map { "Team \($0), " } ?? "")\(identifier), signature \(validity), ad-hoc: \(adhoc ? "yes" : "no")", adhoc)
+    }
+
+    private static func codeSignatureSummary() -> String {
+        codeSigningInfo()?.summary ?? "could not inspect"
+    }
+
+    /// True when the running build is purely ad-hoc signed (no stable "Helm Dev" Keychain
+    /// identity) — macOS then ties TCC grants to this exact binary's hash, so every rebuild
+    /// silently invalidates Screen Recording/Input Monitoring/Accessibility until re-granted.
+    /// This binary's signature never changes at runtime, so the result is cached once.
+    private static var cachedAdHocSigned: Bool?
+
+    static func isAdHocSigned() -> Bool {
+        if let cachedAdHocSigned { return cachedAdHocSigned }
+        let result = codeSigningInfo()?.adHoc ?? true
+        cachedAdHocSigned = result
+        return result
+    }
+
     static func request(_ id: String) {
         switch id {
         case "microphone":
@@ -2468,6 +3149,7 @@ private enum PermissionManager {
             }
         case "input-monitoring":
             _ = CGRequestListenEventAccess()
+            openPrivacySettings("Privacy_ListenEvent")
         case "screen-recording":
             _ = CGRequestScreenCaptureAccess()
         case "keyboard", "mouse":
@@ -2488,70 +3170,179 @@ private enum PermissionManager {
         guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)") else {
             return
         }
-        NSWorkspace.shared.open(url)
+        if !NSWorkspace.shared.open(url), let settingsURL = URL(string: "x-apple.systempreferences:") {
+            NSWorkspace.shared.open(settingsURL)
+        }
     }
 }
 
 struct PermissionsView: View {
     @EnvironmentObject private var chat: ChatController
+    @State private var pythonScreenCaptureAllowed: Bool?
+    @State private var isRunningLiveChecks = false
+    @State private var liveCheckReport: String?
 
     var body: some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(PermissionManager.items(
-                    disabledTools: chat.disabledTools,
-                    voiceHotkey: chat.voiceHotkey,
-                    emergencyStopShortcutAvailable: chat.emergencyStopShortcutAvailable
-                )) { item in
-                    permissionRow(item)
-                }
-                if chat.isEnabled(["media_control"]) {
-                    Label("Music control: macOS asks once, the first time you ask Helm to play something.", systemImage: "info.circle")
-                        .font(.system(size: 11))
-                        .foregroundStyle(.secondary)
-                        .padding(.top, 4)
-                }
-                if chat.isEnabled(["control_screen"]) && !CGPreflightScreenCaptureAccess() {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Label("Already switched on in System Settings but still not allowed here?", systemImage: "exclamationmark.triangle.fill")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(.orange)
-                        Text("macOS only applies Screen Recording after Helm restarts. If it is still off after a restart, the switch belongs to an older build: in Screen & System Audio Recording select LocalDesktopAssistant, press −, then click Allow here again.")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                        Button("Restart Helm") { ChatController.relaunch() }
+            let items = PermissionManager.items(
+                disabledTools: chat.disabledTools,
+                voiceHotkey: chat.voiceHotkey,
+                emergencyStopShortcutAvailable: chat.emergencyStopShortcutAvailable,
+                pythonScreenCaptureAllowed: pythonScreenCaptureAllowed
+            )
+            let missing = items.filter { $0.state == .needsPermission }.count
+            ScrollView {
+                VStack(alignment: .leading, spacing: 13) {
+                    VStack(alignment: .leading, spacing: 9) {
+                        HStack(spacing: 11) {
+                            Image(systemName: "hand.raised.slash.fill").foregroundStyle(jarvisCyan)
+                                .frame(width: 38, height: 38).background(jarvisCyan.opacity(0.14), in: RoundedRectangle(cornerRadius: 12))
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Set up device control").font(.system(size: 15, weight: .semibold))
+                                Text(missing == 0 ? "Required permissions are allowed." : "\(missing) permission\(missing == 1 ? "" : "s") still need your approval.")
+                                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        Text("macOS has no single full-control switch. Enable Screen control in Abilities, then grant the access Helm needs below. Helm cannot grant it for you.")
+                            .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        Button {
+                            runLiveChecks()
+                        } label: {
+                            if isRunningLiveChecks {
+                                Label("Testing actual permissions…", systemImage: "hourglass")
+                            } else {
+                                Label("Run live permission checks", systemImage: "waveform.path.ecg")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent).tint(jarvisCyan).controlSize(.small)
+                        .disabled(isRunningLiveChecks)
+                        HStack(spacing: 8) {
+                            Button {
+                                NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+                            } label: {
+                                Label("Reveal Helm in Finder", systemImage: "folder")
+                            }
+                            .controlSize(.small)
+                            Button("Copy app path") {
+                                NSPasteboard.general.clearContents()
+                                NSPasteboard.general.setString(Bundle.main.bundleURL.path, forType: .string)
+                            }
+                            .controlSize(.small)
+                            Button("Open Screen Recording Settings") {
+                                PermissionManager.openPrivacySettings("Privacy_ScreenCapture")
+                            }
+                            .controlSize(.small)
+                        }
+                        Text("If Helm is missing from the list, use + in Settings, press ⌘⇧G, and select the app bundle at the path shown in the report.")
+                            .font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        if let liveCheckReport {
+                            VStack(alignment: .trailing, spacing: 5) {
+                                Button("Copy diagnostic report") {
+                                    NSPasteboard.general.clearContents()
+                                    NSPasteboard.general.setString(liveCheckReport, forType: .string)
+                                }
+                                .controlSize(.small)
+                                ScrollView {
+                                    Text(liveCheckReport)
+                                        .font(.system(size: 10, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .padding(9)
+                                }
+                                .frame(maxHeight: 190)
+                                .background(Color.black.opacity(0.22), in: RoundedRectangle(cornerRadius: 8))
+                            }
+                        }
                     }
-                    .padding(12)
-                    .background(Color.orange.opacity(0.08))
-                }
-                Button("Open Privacy & Security settings") {
-                    PermissionManager.openPrivacySettings()
-                }
-                .font(.system(size: 11))
-                .padding(.top, 4)
+                    .padding(14).background(helmSurface, in: RoundedRectangle(cornerRadius: 14))
+                    .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(jarvisCyan.opacity(0.2)))
+
+                    if PermissionManager.isAdHocSigned() {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Permissions keep resetting after every rebuild", systemImage: "exclamationmark.triangle.fill")
+                                .font(.system(size: 13, weight: .semibold)).foregroundStyle(.orange)
+                            Text("This build has no stable code-signing identity, so macOS ties what you grant below to this exact binary. The next time Helm is rebuilt, it becomes a different binary as far as macOS is concerned, and Screen Recording / Input Monitoring / Accessibility silently stop working — not because they were revoked, but because the new build was never granted anything.")
+                                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                            Text("Fix this once, permanently: open Keychain Access → menu bar Keychain Access → Certificate Assistant → Create a Certificate. Name it exactly \"Helm Dev\", set Identity Type to Self Signed Root, and Certificate Type to Code Signing. After the next rebuild, run-menubar.sh will find it automatically and every future rebuild keeps today's grants.")
+                                .font(.system(size: 11)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(14)
+                        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 14))
+                        .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.orange.opacity(0.35)))
+                    }
+
+                    sectionTitle("SCREEN CONTROL", detail: "Screen Recording lets Helm see the display. Accessibility lets it inspect controls, click, and type.")
+                    ForEach(items.filter { ["screen-recording", "accessibility"].contains($0.id) }) { permissionCard($0) }
+                    sectionTitle("VOICE & SHORTCUT", detail: "Only needed for voice input and the global shortcut.")
+                    ForEach(items.filter { ["microphone", "speech", "input-monitoring"].contains($0.id) }) { permissionCard($0) }
+                    sectionTitle("OTHER ACCESS", detail: nil)
+                    ForEach(items.filter { !["screen-recording", "accessibility", "microphone", "speech", "input-monitoring"].contains($0.id) }) { permissionCard($0) }
+
+                    if chat.isEnabled(["control_screen"]) && !CGPreflightScreenCaptureAccess() {
+                        VStack(alignment: .leading, spacing: 7) {
+                            Label("Restart Helm after allowing Screen Recording", systemImage: "arrow.clockwise.circle.fill")
+                                .font(.system(size: 12, weight: .semibold)).foregroundStyle(.orange)
+                            Text("macOS applies this permission to the running app after it restarts.").font(.system(size: 11)).foregroundStyle(.secondary)
+                            Button("Restart Helm") { ChatController.relaunch() }
+                        }.padding(12).background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                    }
+                }.padding(.bottom, 10)
             }
         }
     }
 
-    private func permissionRow(_ item: PermissionItem) -> some View {
-        HStack(spacing: 14) {
-            Image(systemName: item.symbol).font(.system(size: 17)).foregroundStyle(item.state.color).frame(width: 26)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(item.title).font(.system(size: 13, weight: .semibold))
-                Text(item.detail).font(.system(size: 11)).foregroundStyle(.secondary)
+    private func sectionTitle(_ title: String, detail: String?) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title).font(.system(size: 9, weight: .bold, design: .monospaced)).tracking(1.1).foregroundStyle(.secondary)
+            if let detail { Text(detail).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true) }
+        }.padding(.top, 4)
+    }
+
+    private func permissionCard(_ item: PermissionItem) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 9) {
+                Image(systemName: item.symbol).font(.system(size: 14)).foregroundStyle(item.state.color).frame(width: 21)
+                Text(item.title).font(.system(size: 12, weight: .semibold))
+                Spacer(minLength: 3)
+                Text(item.state.label).font(.system(size: 9, weight: .semibold)).foregroundStyle(item.state.color)
+                    .padding(.horizontal, 8).padding(.vertical, 4).background(item.state.color.opacity(0.11), in: Capsule())
             }
-            Spacer()
-            Text(item.state.label)
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(item.state.color)
-            if item.canRequest && item.state == .needsPermission {
-                Button("Allow") { PermissionManager.request(item.id) }
+            Text(item.detail).font(.system(size: 10)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if item.state == .needsPermission && (item.canRequest || item.privacyPane != nil) {
+                HStack(spacing: 8) {
+                    if item.canRequest {
+                        Button(item.id == "input-monitoring" ? "Enable Input Monitoring" : "Request access") {
+                            if item.id == "screen-recording" {
+                                PermissionManager.request(item.id)
+                                runLiveChecks(requestScreenRecording: true)
+                            } else {
+                                PermissionManager.request(item.id)
+                            }
+                        }.buttonStyle(.borderedProminent).tint(jarvisCyan).controlSize(.small)
+                    }
+                    if let pane = item.privacyPane {
+                        Button("Open System Settings") { PermissionManager.openPrivacySettings(pane) }.controlSize(.small)
+                    }
+                }
+            }
+            if item.state == .disabled {
+                Text("Turn on the matching ability to use this permission.").font(.system(size: 10)).foregroundStyle(.secondary)
             }
         }
-        .padding(11)
-        .background(Color.white.opacity(0.03))
-        .overlay(HUDBrackets(color: item.state.color.opacity(0.7)))
+        .padding(12).frame(maxWidth: .infinity, alignment: .leading)
+        .background(helmSurface, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.white.opacity(0.07)))
+    }
+
+    private func runLiveChecks(requestScreenRecording: Bool = false) {
+        guard !isRunningLiveChecks else { return }
+        isRunningLiveChecks = true
+        PermissionManager.runLiveChecks(requestScreenRecording: requestScreenRecording) { allowed, report in
+            pythonScreenCaptureAllowed = allowed
+            liveCheckReport = report
+            isRunningLiveChecks = false
+        }
     }
 }
 
@@ -2648,7 +3439,7 @@ struct OnboardingView: View {
             "Run free and private on this Mac with Ollama, or plug in a cloud AI with your own API key. Cloud models are smarter and much better at controlling the screen.",
             "Turn on only what you want. Anything off is never offered to the AI.",
             "macOS asks you to approve each one. Rows turn green as soon as you allow them.",
-            "Here's how Helm is set up. Hold Control+Option and say something, or type below.",
+            "Here's how Helm is set up. Tap Control+Option to open Helm, hold it to speak, or type below.",
         ][step]
     }
 
@@ -2664,14 +3455,57 @@ struct OnboardingView: View {
     }
 
     private var welcome: some View {
-        HStack(alignment: .center, spacing: 34) {
-            Reactor(active: true, listening: false).frame(width: 200, height: 200)
-            VStack(alignment: .leading, spacing: 12) {
-                feature("waveform", "Talk to it", "Hold Control+Option, or click the reactor")
-                feature("cursorarrow.click.2", "Works your Mac", "Opens apps, clicks and types for you")
-                feature("magnifyingglass", "Searches for you", "The web, YouTube and TikTok")
-                feature("music.note", "Runs the room", "Music, volume, time and battery")
-                feature("key", "Your choice of brain", "Local, Claude, ChatGPT, Gemini or OpenRouter")
+        VStack(alignment: .leading, spacing: 22) {
+            HStack(alignment: .center, spacing: 34) {
+                ZStack {
+                    Reactor(active: true, listening: false)
+                    HelmBrandMark(size: 82)
+                        .shadow(color: jarvisBlue.opacity(0.32), radius: 18)
+                }
+                .frame(width: 200, height: 200)
+                .accessibilityLabel("Helm, your Mac assistant")
+                VStack(alignment: .leading, spacing: 12) {
+                    feature("waveform", "Talk to it", "Tap Control+Option to open Helm; hold it to speak")
+                    feature("cursorarrow.click.2", "Works your Mac", "Opens apps, clicks and types for you")
+                    feature("magnifyingglass", "Searches for you", "The web, YouTube and TikTok")
+                    feature("music.note", "Runs the room", "Music, volume, time and battery")
+                    feature("key", "Your choice of brain", "Local, Claude, ChatGPT, Gemini or OpenRouter")
+                }
+            }
+            VStack(alignment: .leading, spacing: 11) {
+                Text("QUICK START")
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .tracking(2)
+                    .foregroundStyle(.secondary)
+                tutorialStep("1", "Choose your setup", "Pick an AI brain, then enable only the abilities you need.")
+                tutorialStep("2", "Give Helm a task", "Type a request in the chat, or use the microphone to dictate into your draft.")
+                tutorialStep("3", "Review before it acts", "Approve proposed actions. Sensitive actions always need your confirmation; Stop ends a task.")
+                tutorialStep("4", "Try a first task", "For example: “Open Safari” or “Find three beginner SwiftUI tutorials.”")
+                Text("Press Control+Option+Space to bring Helm forward. Grant macOS permissions only for abilities you choose to use.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 2)
+                Text("To launch Helm later, double-click Open Helm.command or run bash run-menubar.sh from the project folder.")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func tutorialStep(_ number: String, _ title: String, _ detail: String) -> some View {
+        HStack(alignment: .top, spacing: 11) {
+            Text(number)
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundStyle(jarvisCyan)
+                .frame(width: 18, alignment: .leading)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.system(size: 12, weight: .semibold))
+                Text(detail)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -2692,7 +3526,7 @@ struct OnboardingView: View {
             summaryRow("cpu", "Brain", chat.brainLabel)
             summaryRow("square.stack.3d.up", "Abilities", enabled.isEmpty ? "Chat only" : enabled.map(\.title).joined(separator: ", "))
             summaryRow("hand.raised", "Screen actions", chat.askBeforeActing ? "Asks before each step" : "Full autonomy")
-            summaryRow("waveform", "Voice", chat.voiceHotkey ? "Hold Control+Option" : "Mic button only")
+            summaryRow("waveform", "Voice", chat.voiceHotkey ? "Tap to open, hold to speak" : "Mic button only")
             Text("TRY SAYING")
                 .font(.system(size: 11, weight: .semibold, design: .monospaced))
                 .tracking(2)
@@ -3195,37 +4029,62 @@ struct LogsView: View {
 struct SettingsView: View {
     @EnvironmentObject private var chat: ChatController
     @State private var tab = 0
+    private let pages: [(Int, String, String)] = [
+        (0, "Brain", "brain.head.profile"),
+        (1, "Abilities", "square.grid.2x2"),
+        (2, "Permissions", "hand.raised"),
+        (3, "WhatsApp", "message.fill"),
+        (4, "Telegram", "paperplane.fill"),
+        (5, "Discord", "bubble.left.and.bubble.right.fill"),
+        (6, "Slack", "number"),
+        (7, "Logs", "doc.text.magnifyingglass"),
+    ]
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $tab) {
-                Text("Brain").tag(0)
-                Text("Abilities").tag(1)
-                Text("Permissions").tag(2)
-                Text("WhatsApp").tag(3)
-                Text("Telegram").tag(4)
-                Text("Discord").tag(5)
-                Text("Slack").tag(6)
-                Text("Logs").tag(7)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(20)
-            ScrollView {
-                Group {
-                    switch tab {
-                    case 0: ProviderSettingsView()
-                    case 1: AbilitiesView()
-                    case 2: PermissionsView()
-                    case 3: WhatsAppSettingsView()
-                    case 4: TelegramSettingsView()
-                    case 5: DiscordSettingsView()
-                    case 6: SlackSettingsView()
-                    default: LogsView()
+            HStack(spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("GENERAL").font(.system(size: 9, weight: .semibold, design: .monospaced)).foregroundStyle(.secondary).padding(.horizontal, 8).padding(.top, 5)
+                        ForEach(pages.filter { $0.0 < 3 }, id: \.0) { pageRow($0) }
+                        Text("INTEGRATIONS").font(.system(size: 9, weight: .semibold, design: .monospaced)).foregroundStyle(.secondary).padding(.horizontal, 8).padding(.top, 14)
+                        ForEach(pages.filter { (3...6).contains($0.0) }, id: \.0) { pageRow($0) }
+                        Text("ACTIVITY").font(.system(size: 9, weight: .semibold, design: .monospaced)).foregroundStyle(.secondary).padding(.horizontal, 8).padding(.top, 14)
+                        ForEach(pages.filter { $0.0 == 7 }, id: \.0) { pageRow($0) }
                     }
+                    .padding(12)
                 }
-                .padding(.horizontal, 24)
-                .padding(.bottom, 20)
+                .frame(width: 175)
+                .background(Color.white.opacity(0.025))
+                Rectangle().fill(jarvisCyan.opacity(0.14)).frame(width: 1)
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack {
+                            Text(pages.first(where: { $0.0 == tab })?.1 ?? "Settings")
+                                .font(.system(size: 20, weight: .semibold))
+                            Spacer()
+                            if let bridgeStatus {
+                                Label(bridgeStatus, systemImage: bridgeStatus == "Running" ? "checkmark.circle.fill" : "circle.dashed")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .foregroundStyle(bridgeStatus == "Running" ? .green : .secondary)
+                            }
+                        }
+                        Group {
+                            switch tab {
+                            case 0: ProviderSettingsView()
+                            case 1: AbilitiesView()
+                            case 2: PermissionsView()
+                            case 3: WhatsAppSettingsView()
+                            case 4: TelegramSettingsView()
+                            case 5: DiscordSettingsView()
+                            case 6: SlackSettingsView()
+                            default: LogsView()
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(22)
+                }
             }
             HStack {
                 Button("Run setup again") {
@@ -3240,7 +4099,48 @@ struct SettingsView: View {
             }
             .padding(20)
         }
-        .frame(width: 660, height: 640)
+        .frame(width: 820, height: 660)
+        .onAppear {
+            if let requested = chat.requestedSettingsTab {
+                tab = requested
+                chat.requestedSettingsTab = nil
+            }
+        }
+    }
+
+    private var bridgeStatus: String? {
+        let value: String?
+        switch tab {
+        case 3: value = chat.whatsappBridgeStatus
+        case 4: value = chat.telegramBridgeStatus
+        case 5: value = chat.discordBridgeStatus
+        case 6: value = chat.slackBridgeStatus
+        default: value = nil
+        }
+        guard let value else { return nil }
+        if value.hasPrefix("Running") { return "Running" }
+        if value == "Not configured" || value == "Stopped" { return "Setup needed" }
+        return "Check status"
+    }
+
+    private func pageRow(_ page: (Int, String, String)) -> some View {
+        Button {
+            withAnimation(.easeInOut(duration: 0.16)) { tab = page.0 }
+        } label: {
+            HStack(spacing: 9) {
+                Image(systemName: page.2).frame(width: 16)
+                Text(page.1).lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .font(.system(size: 11, weight: tab == page.0 ? .semibold : .regular))
+            .foregroundStyle(tab == page.0 ? jarvisCyan : .primary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 8)
+            .background(tab == page.0 ? jarvisCyan.opacity(0.12) : .clear)
+            .clipShape(RoundedRectangle(cornerRadius: 7))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -3263,18 +4163,21 @@ final class AgentCursor: ObservableObject {
     static let shared = AgentCursor()
     static let colors: [String: Color] = [
         "Helm": jarvisCyan,
-        "Agent 1": Color(red: 1.0, green: 0.35, blue: 0.75),
-        "Agent 2": Color(red: 1.0, green: 0.72, blue: 0.2),
-        "Agent 3": Color(red: 0.45, green: 0.95, blue: 0.45),
+        "Agent 1": Color(red: 0.55, green: 0.67, blue: 0.88),
+        "Agent 2": Color(red: 0.83, green: 0.67, blue: 0.45),
+        "Agent 3": Color(red: 0.49, green: 0.70, blue: 0.59),
     ]
 
     @Published var cursors: [CursorState] = []
     @Published var mouse = CGPoint(x: -200, y: -200)
     @Published var buddyText = ""
-    @Published var buddyEnabled = UserDefaults.standard.object(forKey: "cursorBuddy") as? Bool ?? true {
+    @Published var buddyEnabled = UserDefaults.standard.object(forKey: "cursorBuddy") as? Bool ?? false {
         didSet {
             UserDefaults.standard.set(buddyEnabled, forKey: "cursorBuddy")
-            buddyEnabled ? startFollowing() : stopFollowing()
+            if !buddyEnabled {
+                buddyText = ""
+                stopFollowing()
+            }
         }
     }
     private var panel: NSPanel?
@@ -3284,7 +4187,6 @@ final class AgentCursor: ObservableObject {
 
     func start() {
         ensurePanel()
-        if buddyEnabled { startFollowing() }
     }
 
     /// `point` uses screen points with a top-left origin (what Accessibility and pyautogui use).
@@ -3296,6 +4198,7 @@ final class AgentCursor: ObservableObject {
         if let point { cursor.position = point }
         cursor.action = action
         cursor.visible = true
+        if !action.isEmpty { say("\(id) · \(action)") }
         if click { cursor.clicks += 1 }
         if let index = cursors.firstIndex(where: { $0.id == id }) { cursors[index] = cursor } else { cursors.append(cursor) }
         hideTasks[id]?.cancel()
@@ -3307,16 +4210,22 @@ final class AgentCursor: ObservableObject {
     }
 
     func say(_ text: String) {
-        buddyText = String(text.prefix(140))
+        guard buddyEnabled else { return }
+        buddyText = String(text.prefix(72))
+        startFollowing()
         hideTasks["buddy"]?.cancel()
-        let task = DispatchWorkItem { [weak self] in self?.buddyText = "" }
+        let task = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.buddyText = ""
+            self.stopFollowing()
+        }
         hideTasks["buddy"] = task
         DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: task)
     }
 
     private func startFollowing() {
         guard followTimer == nil else { return }
-        followTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30, repeats: true) { [weak self] _ in
+        followTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 20, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
                 let location = NSEvent.mouseLocation  // bottom-left origin
@@ -3352,15 +4261,22 @@ private struct AgentCursorView: View {
     @EnvironmentObject private var overlay: AgentCursor
 
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            Color.clear
-            ForEach(overlay.cursors) { cursor in
-                OneCursor(cursor: cursor)
+        GeometryReader { geometry in
+            ZStack(alignment: .topLeading) {
+                Color.clear
+                ForEach(overlay.cursors) { cursor in OneCursor(cursor: cursor, screenSize: geometry.size) }
+                if overlay.buddyEnabled && !overlay.buddyText.isEmpty {
+                    Buddy(text: overlay.buddyText, busy: overlay.cursors.contains { $0.visible })
+                        .frame(width: 252, height: 48, alignment: .leading)
+                        .offset(
+                            x: min(max(overlay.mouse.x < geometry.size.width * 0.65 ? overlay.mouse.x + 20 : overlay.mouse.x - 272,
+                                       8), max(8, geometry.size.width - 260)),
+                            y: min(max(overlay.mouse.y < geometry.size.height * 0.68 ? overlay.mouse.y + 22 : overlay.mouse.y - 56,
+                                       8), max(8, geometry.size.height - 54))
+                        )
+                }
             }
-            if overlay.buddyEnabled {
-                Buddy(text: overlay.buddyText, busy: overlay.cursors.contains { $0.visible })
-                    .offset(x: overlay.mouse.x + 16, y: overlay.mouse.y + 18)
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         }
         .allowsHitTesting(false)
     }
@@ -3368,32 +4284,48 @@ private struct AgentCursorView: View {
 
 private struct OneCursor: View {
     let cursor: CursorState
+    let screenSize: CGSize
     @State private var ripple = false
 
     var body: some View {
         ZStack(alignment: .topLeading) {
             Circle()
-                .stroke(cursor.color, lineWidth: 3)
-                .frame(width: ripple ? 54 : 6, height: ripple ? 54 : 6)
-                .opacity(ripple ? 0 : 0.9)
+                .stroke(cursor.color.opacity(0.8), lineWidth: 1.5)
+                .frame(width: ripple ? 34 : 7, height: ripple ? 34 : 7)
+                .opacity(ripple ? 0 : 0.75)
                 .position(cursor.position)
-            HStack(alignment: .top, spacing: 4) {
-                CursorArrow()
-                    .fill(cursor.color)
-                    .overlay(CursorArrow().stroke(Color.white, lineWidth: 1.5))
-                    .frame(width: 20, height: 26)
-                    .shadow(color: cursor.color.opacity(0.9), radius: 8)
-                Text(cursor.action.isEmpty ? cursor.id : "\(cursor.id) · \(cursor.action)")
-                    .font(.system(size: 11, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.black)
-                    .padding(.horizontal, 7)
-                    .padding(.vertical, 3)
-                    .background(cursor.color.opacity(0.95), in: Capsule())
-                    .offset(y: 16)
+            CursorArrow()
+                .fill(cursor.color)
+                .overlay(CursorArrow().stroke(Color.black.opacity(0.65), lineWidth: 1))
+                .frame(width: 15, height: 20)
+                .shadow(color: .black.opacity(0.45), radius: 2, y: 1)
+                .offset(x: cursor.position.x - 2, y: cursor.position.y - 2)
+            HStack(spacing: 6) {
+                RoundedRectangle(cornerRadius: 1).fill(cursor.color).frame(width: 2, height: 23)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(cursor.id)
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.66))
+                    if !cursor.action.isEmpty {
+                        Text(cursor.action)
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.94))
+                            .lineLimit(1)
+                    }
+                }
+                .frame(maxWidth: 156, alignment: .leading)
             }
-            .offset(x: cursor.position.x - 2, y: cursor.position.y - 2)
-            .animation(.easeInOut(duration: 0.45), value: cursor.position)
+            .padding(.horizontal, 8).padding(.vertical, 6)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous).strokeBorder(Color.white.opacity(0.13)))
+            .shadow(color: .black.opacity(0.30), radius: 8, y: 3)
+            .offset(
+                x: min(max(cursor.position.x > screenSize.width - 190 ? cursor.position.x - 190 : cursor.position.x + 16, 6), max(6, screenSize.width - 184)),
+                y: min(max(cursor.position.y > screenSize.height - 48 ? cursor.position.y - 47 : cursor.position.y + 13, 6), max(6, screenSize.height - 42))
+            )
         }
+        .frame(width: screenSize.width, height: screenSize.height, alignment: .topLeading)
+        .animation(.easeInOut(duration: 0.28), value: cursor.position)
         .opacity(cursor.visible ? 1 : 0)
         .animation(.easeOut(duration: 0.3), value: cursor.visible)
         .onChange(of: cursor.clicks) { _ in
@@ -3403,35 +4335,42 @@ private struct OneCursor: View {
     }
 }
 
-/// The little Helm that rides next to your pointer.
+/// Quiet task-status pill beside the pointer. It never intercepts clicks.
 private struct Buddy: View {
     let text: String
     let busy: Bool
 
     var body: some View {
-        HStack(alignment: .top, spacing: 6) {
+        HStack(spacing: 10) {
             ZStack {
-                Circle().fill(jarvisCyan.opacity(0.35)).blur(radius: 5)
-                Circle().fill(AngularGradient(colors: [jarvisCyan, jarvisBlue, jarvisCyan], center: .center))
-                Circle().strokeBorder(Color.white.opacity(0.7), lineWidth: 1).padding(3)
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(LinearGradient(colors: [jarvisCyan.opacity(0.30), jarvisBlue.opacity(0.16)],
+                                         startPoint: .topLeading, endPoint: .bottomTrailing))
+                Image(systemName: busy ? "sparkles" : "sparkle")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(jarvisCyan)
             }
-            .frame(width: 16, height: 16)
-            .scaleEffect(busy ? 1.15 : 1)
-            .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: busy)
-            if !text.isEmpty {
+            .frame(width: 30, height: 30)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 5) {
+                    Circle().fill(busy ? jarvisCyan : Color.white.opacity(0.42)).frame(width: 5, height: 5)
+                    Text(busy ? "HELM · IN PROGRESS" : "HELM")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .tracking(0.7).foregroundStyle(.secondary)
+                }
                 Text(text)
-                    .font(.system(size: 11, weight: .medium, design: .rounded))
-                    .foregroundStyle(.white)
-                    .lineLimit(3)
-                    .frame(maxWidth: 220, alignment: .leading)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 6)
-                    .background(Color.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 10))
-                    .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(jarvisCyan.opacity(0.5)))
-                    .transition(.opacity)
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(.primary.opacity(0.94))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .animation(.easeOut(duration: 0.2), value: text)
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(Color.white.opacity(0.15)))
+        .shadow(color: .black.opacity(0.24), radius: 10, y: 3)
+        .animation(.easeOut(duration: 0.20), value: text)
+        .accessibilityLabel(busy ? "Helm is working: \(text)" : "Helm cursor companion")
     }
 }
 
@@ -3553,15 +4492,37 @@ private struct VoiceToastView: View {
 /// One background agent: its own Helm engine process, conversation file, cursor colour and approvals.
 @MainActor
 final class AgentRun: ObservableObject, Identifiable {
+    static let roles = ["researcher", "operator", "verifier"]
     let number: Int
     var id: String { "Agent \(number)" }
+    var role: String {
+        switch number {
+        case 1: "researcher"
+        case 2: "operator"
+        default: "verifier"
+        }
+    }
+    var roleLabel: String { role.capitalized }
+    var roleDescription: String {
+        switch role {
+        case "researcher": "Find evidence and cite sources"
+        case "operator": "Carry out the approved task"
+        default: "Check results and report gaps"
+        }
+    }
     var color: Color { AgentCursor.colors[id] ?? jarvisCyan }
     @Published var task = ""
+    @Published var plan: [String] = []
     @Published var activity: [String] = []
     @Published var reply = ""
     @Published var pendingApproval: String?
     @Published var isRunning = false
     @Published var failed = false
+    @Published var completed = false
+    @Published var stoppedByUser = false
+    @Published private(set) var startedAt: Date?
+    @Published private(set) var finishedAt: Date?
+    fileprivate var workflowID: String?
     private weak var owner: ChatController?
     private var process: Process?
     private var inputPipe: Pipe?
@@ -3586,20 +4547,25 @@ final class AgentRun: ObservableObject, Identifiable {
         _ = ChatController.appendToHelmLog(filename: logFilename, text: text)
     }
 
-    func run(_ text: String) {
+    func run(_ text: String, workflowID: String? = nil, displayTask: String? = nil) {
         guard let owner, !isRunning else { return }
-        try? FileManager.default.removeItem(at: historyURL)  // each task starts fresh
-        task = text
+        self.workflowID = workflowID
+        task = displayTask ?? text
+        plan = []
         activity = ["Starting…"]
         reply = ""
         failed = false
+        completed = false
+        stoppedByUser = false
+        startedAt = Date()
+        finishedAt = nil
         log("\n=== \(Date()) task: \(text)\n")
         let child = Process()
         let output = Pipe()
         let input = Pipe()
         child.executableURL = owner.projectRoot.appendingPathComponent(".venv/bin/python")
         child.arguments = ["-u", owner.projectRoot.appendingPathComponent("assistant.py").path]
-            + owner.engineArguments(for: text, history: historyURL)
+            + owner.engineArguments(for: text, history: historyURL, agentRole: role)
         child.currentDirectoryURL = owner.projectRoot
         child.standardOutput = output
         child.standardError = output
@@ -3622,6 +4588,8 @@ final class AgentRun: ObservableObject, Identifiable {
         } catch {
             activity = ["Could not start: \(error.localizedDescription)"]
             failed = true
+            finishedAt = Date()
+            owner.agentDidFinish(self, status: 1)
         }
     }
 
@@ -3630,7 +4598,24 @@ final class AgentRun: ObservableObject, Identifiable {
 
     func stop() {
         pendingApproval = nil
+        stoppedByUser = true
+        note("Stopped by you. You can resume or take over this task.")
         process?.terminate()
+    }
+
+    func resume() {
+        guard !task.isEmpty, !isRunning, stoppedByUser || failed else { return }
+        run("Continue the previous task from its saved conversation. First inspect what has already been completed, do not repeat irreversible actions, and continue only the remaining steps. Report what you verify and what remains.", workflowID: workflowID, displayTask: task)
+    }
+
+    func takeOver() {
+        owner?.takeOver(from: self)
+    }
+
+    func openLog() {
+        let url = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/Helm/\(logFilename)")
+        NSWorkspace.shared.open(url)
     }
 
     private func respond(_ answer: String) {
@@ -3648,6 +4633,22 @@ final class AgentRun: ObservableObject, Identifiable {
         for line in parts.dropLast() where !line.trimmingCharacters(in: .whitespaces).isEmpty {
             if line.hasPrefix("APPROVAL_REQUIRED: ") {
                 pendingApproval = String(line.dropFirst("APPROVAL_REQUIRED: ".count))
+            } else if line.hasPrefix("TASK_PLAN_JSON:") {
+                let data = Data(line.dropFirst("TASK_PLAN_JSON:".count).utf8)
+                if let decoded = try? JSONDecoder().decode([String].self, from: data), !decoded.isEmpty {
+                    plan = decoded
+                    note("Plan ready · \(decoded.count) checkpoints")
+                    owner?.recordPlan(decoded, from: self)
+                } else {
+                    note("Could not read the task plan.")
+                    failed = true
+                }
+            } else if line.hasPrefix("RESEARCH_SOURCE_JSON:") {
+                let data = Data(line.dropFirst("RESEARCH_SOURCE_JSON:".count).utf8)
+                if let source = try? JSONDecoder().decode(ResearchSource.self, from: data) {
+                    owner?.recordSource(source, from: self)
+                    note("Source saved · \(source.title)")
+                }
             } else if line.hasPrefix("CURSOR: ") {
                 if let data = line.dropFirst("CURSOR: ".count).data(using: .utf8),
                    let info = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
@@ -3666,6 +4667,8 @@ final class AgentRun: ObservableObject, Identifiable {
                 // which was needlessly yanking focus while agents ran "in the background."
                 if ChatController.actingTools.contains(tool) { NSApp.deactivate() }
                 note(ChatController.toolLabels[tool] ?? tool.replacingOccurrences(of: "_", with: " "))
+            } else if line.hasPrefix("RESULT: ") {
+                note(String(line.dropFirst("RESULT: ".count)))
             } else if line.hasPrefix("Error:") {
                 note(line)
                 failed = true
@@ -3676,74 +4679,316 @@ final class AgentRun: ObservableObject, Identifiable {
     }
 
     private func note(_ text: String) {
-        activity = Array((activity + [text]).suffix(3))
+        activity = Array((activity + [String(text.prefix(400))]).suffix(40))
+        owner?.recordAgentActivity(text, from: self)
     }
 
     private func finish(status: Int32) {
-        if status != 0 && reply.isEmpty { failed = true; note("Stopped (exit \(status)).") }
+        finishedAt = Date()
+        if stoppedByUser {
+            note("Stopped by you. Resume continues from the saved agent conversation.")
+        } else if status != 0 && reply.isEmpty {
+            failed = true
+            note("Run failed with exit code \(status). Review the activity and logs before resuming.")
+        } else {
+            completed = status == 0 && !failed
+            if reply.isEmpty { note("Process finished without a final report. Review activity before treating the task as complete.") }
+            else { note("Run finished. Review the agent report and activity before relying on the result.") }
+        }
         log("\n=== \(Date()) exited with status \(status)\n")
         process = nil
         inputPipe = nil
         pendingApproval = nil
         isRunning = false
+        owner?.agentDidFinish(self, status: status)
     }
 }
 
-/// The three agent lanes shown in the HUD.
+/// Task board: show the user's goal and the agent's current work before decorative activity.
 struct AgentsBoard: View {
     @EnvironmentObject private var chat: ChatController
+    @State private var isExpanded = false
+    private var activeCount: Int { chat.agents.filter(\.isRunning).count }
+    private var attentionCount: Int { chat.agents.filter { $0.pendingApproval != nil }.count }
 
     var body: some View {
-        HStack(spacing: 10) {
-            ForEach(chat.agents) { agent in
-                AgentLane(agent: agent)
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Button { withAnimation(.easeInOut(duration: 0.18)) { isExpanded.toggle() } } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "sparkles").foregroundStyle(jarvisCyan)
+                        Text("Agent team").font(.system(size: 11, weight: .semibold))
+                        Text("\(activeCount) active · \(attentionCount) approvals")
+                            .font(.system(size: 9)).foregroundStyle(.secondary)
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .semibold)).foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(isExpanded ? 180 : 0))
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(isExpanded ? "Hide" : "Show") agent team, \(activeCount) active, \(attentionCount) approvals")
+                Spacer()
+                if activeCount > 0 {
+                    Button("Stop all") { chat.agents.filter(\.isRunning).forEach { $0.stop() } }
+                        .font(.system(size: 9, weight: .medium)).foregroundStyle(.secondary).buttonStyle(.plain)
+                }
+                if !chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Button { chat.dispatchDraft() } label: {
+                        Label("Run with team", systemImage: "arrow.turn.down.right")
+                            .font(.system(size: 9, weight: .semibold))
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .tint(jarvisCyan)
+                    .controlSize(.mini)
+                    .disabled(activeCount > 0 || attentionCount > 0)
+                    .help("Research, perform, and verify this task with Helm's three agents")
+                }
+            }
+            if isExpanded {
+                HStack(alignment: .top, spacing: 8) {
+                    ForEach(chat.agents) { agent in
+                        AgentLane(agent: agent, hasDraft: !chat.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty) {
+                            chat.dispatchDraft(to: agent)
+                        }
+                        .environmentObject(chat)
+                    }
+                }
+                if let workflow = chat.workflowRecord {
+                    WorkflowProgressCard(record: workflow, resume: { chat.resumeWorkflow() })
+                }
             }
         }
+        .padding(.horizontal, 1)
+        .padding(.top, 8)
+        .onChange(of: activeCount) { count in if count > 0 { isExpanded = true } }
+        .onChange(of: attentionCount) { count in if count > 0 { isExpanded = true } }
+    }
+}
+
+private struct WorkflowProgressCard: View {
+    let record: AgentWorkflowRecord
+    let resume: () -> Void
+
+    private var tint: Color {
+        switch record.status {
+        case "completed": .green
+        case "blocked", "interrupted": .orange
+        default: jarvisCyan
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 7) {
+                Image(systemName: record.status == "completed" ? "checkmark.seal.fill" : "rectangle.3.group")
+                    .foregroundStyle(tint)
+                Text("Task workflow").font(.system(size: 11, weight: .semibold))
+                Text(record.status.capitalized).font(.system(size: 9, weight: .medium)).foregroundStyle(tint)
+                Spacer()
+                if ["interrupted", "blocked"].contains(record.status) {
+                    Button("Resume workflow", action: resume).buttonStyle(.borderedProminent).tint(jarvisCyan).controlSize(.small)
+                }
+            }
+            Text(record.task).font(.system(size: 10, weight: .medium)).lineLimit(2)
+            HStack(alignment: .top, spacing: 8) {
+                ForEach(record.checkpoints) { checkpoint in
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 4) {
+                            Image(systemName: checkpoint.status == "done" ? "checkmark.circle.fill" : checkpoint.status == "in_progress" ? "circle.dotted" : checkpoint.status == "interrupted" || checkpoint.status == "blocked" ? "exclamationmark.circle.fill" : "circle")
+                            Text(checkpoint.title).lineLimit(2)
+                        }
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundStyle(checkpoint.status == "done" ? Color.green : checkpoint.status == "interrupted" || checkpoint.status == "blocked" ? Color.orange : .secondary)
+                        if !checkpoint.evidence.isEmpty {
+                            Text(checkpoint.evidence).font(.system(size: 8)).foregroundStyle(.secondary).lineLimit(2)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if !record.sources.isEmpty {
+                HStack(spacing: 5) {
+                    Image(systemName: "link").foregroundStyle(.secondary)
+                    Text("Sources:").foregroundStyle(.secondary)
+                    ForEach(Array(record.sources.prefix(4).enumerated()), id: \.offset) { index, source in
+                        if let url = URL(string: source.url) {
+                            Link("[\(index + 1)] \(source.title)", destination: url).lineLimit(1)
+                        }
+                    }
+                    if record.sources.count > 4 { Text("+\(record.sources.count - 4)").foregroundStyle(.secondary) }
+                }.font(.system(size: 8))
+            }
+            if record.status == "completed" {
+                Label("Verification report is included in the final response. Review the evidence before relying on it.", systemImage: "checkmark.shield")
+                    .font(.system(size: 9)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(10)
+        .background(helmSurface, in: RoundedRectangle(cornerRadius: 9))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(tint.opacity(0.25)))
     }
 }
 
 private struct AgentLane: View {
     @ObservedObject var agent: AgentRun
+    @EnvironmentObject private var chat: ChatController
+    let hasDraft: Bool
+    let assignDraft: () -> Void
+    @State private var showingDetails = false
 
-    private var status: String {
-        if agent.pendingApproval != nil { return "needs your OK" }
-        if agent.isRunning { return "working" }
-        if agent.failed { return "stopped" }
-        return agent.task.isEmpty ? "idle" : "done"
+    private var status: (String, Color, String) {
+        if agent.pendingApproval != nil { return ("Needs approval", .orange, "hand.raised.fill") }
+        if agent.isRunning { return ("Running", jarvisCyan, "circle.dotted") }
+        if agent.failed { return ("Failed", .red, "xmark.circle.fill") }
+        if agent.stoppedByUser { return ("Stopped", .secondary, "stop.circle") }
+        if agent.completed { return ("Finished · review", .green, "checkmark.circle.fill") }
+        return ("Ready", .secondary, "circle")
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 6) {
-                Circle().fill(agent.color).frame(width: 8, height: 8)
-                    .shadow(color: agent.color, radius: agent.isRunning ? 4 : 0)
-                Text(agent.id.uppercased()).font(.system(size: 10, weight: .bold, design: .monospaced))
-                Spacer()
-                Text(status).font(.system(size: 9, design: .monospaced)).foregroundStyle(.secondary)
-            }
-            Text(agent.task.isEmpty ? "Waiting for a task" : agent.task)
-                .font(.system(size: 11, weight: .medium))
-                .lineLimit(1)
-            Text(agent.reply.isEmpty ? agent.activity.joined(separator: " → ") : agent.reply)
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(agent.color.opacity(0.85))
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, minHeight: 26, alignment: .topLeading)
-            if let action = agent.pendingApproval {
-                Text(action).font(.system(size: 10)).lineLimit(1)
-                HStack {
-                    Button("Allow") { agent.approve() }
-                    Button("All") { agent.approve(all: true) }
-                    Button("Stop") { agent.reject() }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: status.2).font(.system(size: 11, weight: .semibold)).foregroundStyle(status.1)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(agent.roleLabel).font(.system(size: 11, weight: .semibold))
+                    Text(agent.roleDescription).font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(1)
                 }
-                .controlSize(.mini)
+                Spacer(minLength: 3)
+                Text(status.0).font(.system(size: 9, weight: .medium)).foregroundStyle(status.1).lineLimit(1)
+            }
+            Text(agent.task.isEmpty ? "Ready for a task" : agent.task)
+                .font(.system(size: 11, weight: .medium)).lineLimit(3).frame(maxWidth: .infinity, minHeight: 40, alignment: .topLeading)
+                .foregroundStyle(agent.task.isEmpty ? Color.secondary : Color.primary.opacity(0.9))
+            if !agent.plan.isEmpty {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("PLAN").font(.system(size: 8, weight: .bold, design: .monospaced)).tracking(1).foregroundStyle(agent.color)
+                    ForEach(Array(agent.plan.prefix(3).enumerated()), id: \.offset) { index, step in
+                        HStack(alignment: .top, spacing: 5) {
+                            Text("\(index + 1)").foregroundStyle(agent.color).monospacedDigit()
+                            Text(step).foregroundStyle(.secondary).lineLimit(2)
+                        }.font(.system(size: 9))
+                    }
+                    if agent.plan.count > 3 { Text("+\(agent.plan.count - 3) more steps").font(.system(size: 9)).foregroundStyle(.tertiary) }
+                }
+            }
+            if let action = agent.pendingApproval {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Approval needed", systemImage: "hand.raised.fill").font(.system(size: 10, weight: .semibold)).foregroundStyle(.orange)
+                    Text(action).font(.system(size: 10)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 7) {
+                        Button("Allow once") { agent.approve() }.buttonStyle(.borderedProminent).tint(.orange).controlSize(.small)
+                        Button("Deny") { agent.reject() }.buttonStyle(.bordered).controlSize(.small)
+                    }
+                }
+                .padding(8).background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
             } else if agent.isRunning {
-                Button("Stop") { agent.stop() }.controlSize(.mini)
+                HStack(spacing: 7) {
+                    ProgressView().controlSize(.small).tint(agent.color)
+                    Text(agent.activity.last ?? "Starting task…").font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(2)
+                    Spacer(minLength: 0)
+                }
+            } else if !agent.reply.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("AGENT REPORT · REVIEW BEFORE RELYING ON IT")
+                        .font(.system(size: 8, weight: .bold, design: .monospaced)).tracking(0.4).foregroundStyle(status.1)
+                    Text(agent.reply).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(4)
+                }
+            } else if hasDraft && !agent.isRunning {
+                Button(action: assignDraft) {
+                    Label("Assign current task", systemImage: "arrow.turn.down.right")
+                        .font(.system(size: 10, weight: .medium)).frame(maxWidth: .infinity, alignment: .leading)
+                }.buttonStyle(.plain).foregroundStyle(agent.color).disabled(!hasDraft)
+            } else if !agent.activity.isEmpty {
+                Text(agent.activity.last ?? "").font(.system(size: 9)).foregroundStyle(.secondary).lineLimit(2)
+            } else {
+                Text("Type a task below to assign it.").font(.system(size: 9)).foregroundStyle(.tertiary).lineLimit(2)
+            }
+            Divider().opacity(0.45)
+            HStack(spacing: 10) {
+                Button("Details") { showingDetails = true }.buttonStyle(.plain).font(.system(size: 9, weight: .medium))
+                Spacer(minLength: 0)
+                if agent.isRunning {
+                    Button("Take over") { agent.takeOver() }.buttonStyle(.plain).font(.system(size: 9, weight: .medium)).foregroundStyle(jarvisCyan)
+                    Button("Stop") { agent.stop() }.buttonStyle(.plain).font(.system(size: 9, weight: .medium)).foregroundStyle(.red)
+                } else if !agent.task.isEmpty {
+                    Button("Take over") { agent.takeOver() }.buttonStyle(.plain).font(.system(size: 9, weight: .medium)).foregroundStyle(jarvisCyan)
+                    if agent.stoppedByUser || agent.failed {
+                        Button("Resume") { agent.resume() }.buttonStyle(.plain).font(.system(size: 9, weight: .medium)).foregroundStyle(agent.color)
+                            .disabled(agent.isRunning || agent.pendingApproval != nil)
+                    }
+                }
             }
         }
-        .padding(9)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(agent.color.opacity(agent.isRunning ? 0.10 : 0.04))
-        .overlay(HUDBrackets(color: agent.color.opacity(agent.isRunning ? 0.9 : 0.35)))
+        .padding(10).frame(maxWidth: .infinity, minHeight: 210, alignment: .topLeading)
+        .background(Color.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10)
+            .strokeBorder(agent.color.opacity(agent.isRunning || agent.pendingApproval != nil ? 0.3 : 0.09)))
+        .sheet(isPresented: $showingDetails) {
+            AgentTaskDetail(agent: agent, onTakeOver: { chat.takeOver(from: agent) })
+                .environmentObject(chat)
+                .preferredColorScheme(.dark)
+        }
+    }
+}
+
+private struct AgentTaskDetail: View {
+    @ObservedObject var agent: AgentRun
+    @EnvironmentObject private var chat: ChatController
+    @Environment(\.dismiss) private var dismiss
+    let onTakeOver: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("\(agent.roleLabel) task").font(.system(size: 18, weight: .semibold))
+                    Text(agent.task.isEmpty ? "No task assigned" : agent.task).font(.system(size: 12)).foregroundStyle(.secondary).textSelection(.enabled)
+                }
+                Spacer()
+                Text(agent.isRunning ? "Running" : agent.failed ? "Failed" : agent.stoppedByUser ? "Stopped" : agent.completed ? "Finished · review" : "Ready")
+                    .font(.system(size: 10, weight: .semibold)).foregroundStyle(agent.failed ? .red : agent.pendingApproval != nil ? .orange : jarvisCyan)
+            }
+            if !agent.plan.isEmpty {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("PLAN").font(.system(size: 9, weight: .bold, design: .monospaced)).tracking(1).foregroundStyle(.secondary)
+                    ForEach(Array(agent.plan.enumerated()), id: \.offset) { index, step in
+                        HStack(alignment: .top, spacing: 8) {
+                            Text("\(index + 1)").font(.system(size: 10, weight: .semibold)).foregroundStyle(agent.color).frame(width: 18)
+                            Text(step).font(.system(size: 11)).textSelection(.enabled)
+                        }
+                    }
+                }.padding(12).background(helmSurface, in: RoundedRectangle(cornerRadius: 10))
+            }
+            if !agent.reply.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Agent report · verify before relying on it", systemImage: "doc.text.magnifyingglass")
+                        .font(.system(size: 11, weight: .semibold)).foregroundStyle(jarvisCyan)
+                    Text(agent.reply).font(.system(size: 12)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                }.padding(12).background(helmSurface, in: RoundedRectangle(cornerRadius: 10))
+            }
+            Text("ACTIVITY · MOST RECENT FIRST").font(.system(size: 9, weight: .bold, design: .monospaced)).tracking(1).foregroundStyle(.secondary)
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(Array(agent.activity.reversed().enumerated()), id: \.offset) { _, entry in
+                        HStack(alignment: .top, spacing: 9) {
+                            Circle().fill(agent.color.opacity(0.75)).frame(width: 6, height: 6).padding(.top, 5)
+                            Text(entry).font(.system(size: 11)).textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading)
+                        }.padding(.vertical, 7)
+                        Divider().opacity(0.35)
+                    }
+                }
+            }.frame(minHeight: 130)
+            HStack {
+                if agent.isRunning { Button("Stop task", role: .destructive) { agent.stop() } }
+                Button("Open full activity log") { agent.openLog() }
+                Button("Take over in Helm") { onTakeOver(); dismiss() }.buttonStyle(.borderedProminent).tint(jarvisCyan)
+                if agent.stoppedByUser || agent.failed {
+                    Button("Resume") { agent.resume() }.disabled(agent.isRunning || agent.pendingApproval != nil)
+                }
+                Spacer()
+            }
+        }
+        .padding(20).frame(minWidth: 560, minHeight: 560)
     }
 }

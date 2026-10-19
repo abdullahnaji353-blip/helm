@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import ApplicationServices
 import CoreGraphics
 import Speech
@@ -9,6 +10,7 @@ final class VoiceInputController {
     var onPartialTranscript: ((String) -> Void)?
     var onTranscript: ((String, Bool) -> Void)?
     var onError: ((String) -> Void)?
+    var onShortcutTap: (() -> Void)?
 
     private let recognizer = SFSpeechRecognizer(locale: Locale.current)
     private let audioEngine = AVAudioEngine()
@@ -19,11 +21,59 @@ final class VoiceInputController {
     private var currentCaptureUsesHotkey = false
     private var wantsToListen = false
     private var isListening = false
+    private var shortcut = "control+option"
+    private var shortcutEnabled = true
+    fileprivate var isConfiguredShortcutPressed = false
+    private var shortcutHoldTask: DispatchWorkItem?
+    private var shortcutStartedVoice = false
+
+    func setShortcut(_ value: String) {
+        let allowed = ["control+option", "control+shift", "option+shift", "control+command", "option+command"]
+        shortcut = allowed.contains(value) ? value : "control+option"
+        isConfiguredShortcutPressed = false
+        hotkeyPressed = false
+        shortcutHoldTask?.cancel()
+        publish(listening: isListening, status: isListening ? "Listening…" : "Tap \(shortcutLabel) to open Helm; hold to speak.")
+    }
+
+    func setShortcutEnabled(_ enabled: Bool) {
+        shortcutEnabled = enabled
+        if !enabled {
+            isConfiguredShortcutPressed = false
+            hotkeyPressed = false
+            shortcutHoldTask?.cancel()
+            shortcutHoldTask = nil
+        }
+        if enabled { installHotkey() }
+        else if isListening && currentCaptureUsesHotkey { stopListening() }
+        publish(listening: isListening, status: isListening ? "Listening…" : (enabled ? "Tap \(shortcutLabel) to open Helm; hold to speak." : "Voice shortcut is off."))
+    }
+
+    fileprivate var shortcutLabel: String {
+        shortcut.split(separator: "+").map { part in
+            switch part {
+            case "control": "Control"
+            case "option": "Option"
+            case "shift": "Shift"
+            case "command": "Command"
+            default: String(part)
+            }
+        }.joined(separator: "+")
+    }
 
     func installHotkey() {
-        guard eventTap == nil else { return }
-        if !CGPreflightListenEventAccess() {
+        guard shortcutEnabled, eventTap == nil else { return }
+        guard CGPreflightListenEventAccess() else {
             _ = CGRequestListenEventAccess()
+            guard CGPreflightListenEventAccess() else {
+                publish(
+                    listening: false,
+                    status: "Allow Helm in System Settings → Privacy & Security → Input Monitoring, then return to Helm."
+                )
+                return
+            }
+            installHotkey()
+            return
         }
         let eventMask = CGEventMask(1 << CGEventType.flagsChanged.rawValue)
         guard let tap = CGEvent.tapCreate(
@@ -34,13 +84,9 @@ final class VoiceInputController {
             callback: modifierEventTapCallback,
             userInfo: Unmanaged.passUnretained(self).toOpaque()
         ) else {
-            let options = [
-                kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
-            ] as CFDictionary
-            _ = AXIsProcessTrustedWithOptions(options)
             publish(
                 listening: false,
-                status: "Grant shortcut permissions, then retry."
+                status: "Helm could not listen for the shortcut. Check Input Monitoring in System Settings, then retry."
             )
             return
         }
@@ -49,7 +95,7 @@ final class VoiceInputController {
         CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
         CGEvent.tapEnable(tap: tap, enable: true)
         eventTap = tap
-        publish(listening: false, status: "Hold Control+Option to speak.")
+        publish(listening: false, status: shortcutEnabled ? "Tap \(shortcutLabel) to open Helm; hold to speak." : "Voice shortcut is off.")
     }
 
     func toggleCapture() {
@@ -63,17 +109,30 @@ final class VoiceInputController {
     }
 
     fileprivate func setShortcutPressed(_ pressed: Bool) {
+        guard shortcutEnabled else { return }
         guard pressed != hotkeyPressed else { return }
         hotkeyPressed = pressed
         if pressed {
-            currentCaptureUsesHotkey = true
-            wantsToListen = true
-            requestPermissionsAndStart()
-        } else {
-            wantsToListen = false
-            if isListening {
-                stopListening()
+            shortcutStartedVoice = false
+            let task = DispatchWorkItem { [weak self] in
+                guard let self, self.hotkeyPressed, self.shortcutEnabled else { return }
+                self.shortcutStartedVoice = true
+                self.currentCaptureUsesHotkey = true
+                self.wantsToListen = true
+                self.requestPermissionsAndStart()
             }
+            shortcutHoldTask = task
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(350), execute: task)
+        } else {
+            shortcutHoldTask?.cancel()
+            shortcutHoldTask = nil
+            if shortcutStartedVoice {
+                wantsToListen = false
+                if isListening { stopListening() }
+            } else {
+                onShortcutTap?()
+            }
+            shortcutStartedVoice = false
         }
     }
 
@@ -81,6 +140,22 @@ final class VoiceInputController {
         if let eventTap {
             CGEvent.tapEnable(tap: eventTap, enable: true)
         }
+    }
+
+    fileprivate func handleModifierFlags(_ flags: CGEventFlags) {
+        let parts = shortcut.split(separator: "+")
+        let pressed = shortcutEnabled && parts.allSatisfy { part in
+            switch part {
+            case "control": flags.contains(.maskControl)
+            case "option": flags.contains(.maskAlternate)
+            case "shift": flags.contains(.maskShift)
+            case "command": flags.contains(.maskCommand)
+            default: false
+            }
+        }
+        guard pressed != isConfiguredShortcutPressed else { return }
+        isConfiguredShortcutPressed = pressed
+        setShortcutPressed(pressed)
     }
 
     private func requestPermissionsAndStart() {
@@ -95,7 +170,7 @@ final class VoiceInputController {
                     guard self.wantsToListen else {
                         self.publish(
                             listening: false,
-                            status: "Permission step ended. Hold Control+Option again to speak."
+                            status: "Permission step ended. Hold \(self.shortcutLabel) again to speak."
                         )
                         return
                     }
@@ -126,7 +201,7 @@ final class VoiceInputController {
                     guard self.wantsToListen else {
                         self.publish(
                             listening: false,
-                            status: "Permission step ended. Hold Control+Option again to speak."
+                            status: "Permission step ended. Hold \(self.shortcutLabel) again to speak."
                         )
                         return
                     }
@@ -192,7 +267,7 @@ final class VoiceInputController {
         do {
             try audioEngine.start()
             isListening = true
-            publish(listening: true, status: "Listening… release Control+Option when done.")
+            publish(listening: true, status: "Listening… release \(shortcutLabel) when done.")
         } catch {
             input.removeTap(onBus: 0)
             recognitionTask?.cancel()
@@ -262,9 +337,8 @@ private let modifierEventTapCallback: CGEventTapCallBack = {
         return Unmanaged.passUnretained(event)
     }
     let flags = event.flags
-    let pressed = flags.contains(.maskControl) && flags.contains(.maskAlternate)
     Task { @MainActor in
-        controller.setShortcutPressed(pressed)
+        controller.handleModifierFlags(flags)
     }
     return Unmanaged.passUnretained(event)
 }

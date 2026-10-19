@@ -2,18 +2,30 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
     <key>CFBundleExecutable</key>
-    <string>LocalDesktopAssistant</string>
+    <string>Helm</string>
     <key>CFBundleIdentifier</key>
     <string>local.desktop-assistant</string>
+    <key>CFBundleIconFile</key>
+    <string>Helm</string>
     <key>CFBundleName</key>
+    <string>Helm</string>
+    <key>CFBundleDisplayName</key>
     <string>Helm</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
+    <key>CFBundleSupportedPlatforms</key>
+    <array>
+        <string>MacOSX</string>
+    </array>
     <key>CFBundleShortVersionString</key>
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
     <key>CFBundleURLTypes</key>
     <array>
         <dict>
@@ -33,5 +45,7 @@
     <string>Input Monitoring detects when Control and Option are held for voice input.</string>
     <key>NSSpeechRecognitionUsageDescription</key>
     <string>Speech is transcribed on this Mac to create the task you requested.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Helm uses Apple Events to automate apps only when you request an action that needs it.</string>
 </dict>
 </plist>

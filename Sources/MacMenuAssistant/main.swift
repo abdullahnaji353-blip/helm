@@ -5,6 +5,127 @@ import CoreGraphics
 import Security
 import SwiftUI
 import os
+import Darwin
+
+/// Keeps screen capture in Helm's signed, user-authorized process. Python talks to this
+/// loopback-only server using a per-launch bearer token; it never captures the display itself.
+final class ScreenCaptureBridge {
+    static let shared = ScreenCaptureBridge()
+
+    private let lock = NSLock()
+    private var listener: Int32 = -1
+    private(set) var port: UInt16 = 0
+    private(set) var token = UUID().uuidString
+
+    var environment: [String: String] {
+        lock.lock()
+        defer { lock.unlock() }
+        guard port != 0 else { return [:] }
+        return ["HELM_CAPTURE_URL": "http://127.0.0.1:\(port)", "HELM_CAPTURE_TOKEN": token]
+    }
+
+    func start() {
+        lock.lock()
+        defer { lock.unlock() }
+        guard listener < 0 else { return }
+        let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, Darwin.listen(fd, 8) == 0 else {
+            Darwin.close(fd)
+            return
+        }
+        var actual = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let named = withUnsafeMutablePointer(to: &actual) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(fd, $0, &length)
+            }
+        }
+        guard named == 0 else {
+            Darwin.close(fd)
+            return
+        }
+        listener = fd
+        port = UInt16(bigEndian: actual.sin_port)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.acceptLoop(fd) }
+    }
+
+    private func acceptLoop(_ fd: Int32) {
+        while true {
+            let client = Darwin.accept(fd, nil, nil)
+            guard client >= 0 else { continue }
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.handle(client)
+            }
+        }
+    }
+
+    private func handle(_ client: Int32) {
+        defer { Darwin.close(client) }
+        var request = Data()
+        var buffer = [UInt8](repeating: 0, count: 2048)
+        while request.count < 8192 && request.range(of: Data("\r\n\r\n".utf8)) == nil {
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.recv(client, bytes.baseAddress, bytes.count, 0)
+            }
+            guard count > 0 else { return }
+            request.append(contentsOf: buffer.prefix(count))
+        }
+        guard let header = String(data: request, encoding: .utf8),
+              let firstLine = header.components(separatedBy: "\r\n").first,
+              firstLine.hasPrefix("GET "),
+              header.localizedCaseInsensitiveContains("authorization: bearer \(token)") else {
+            respond(client, status: "401 Unauthorized", type: "text/plain", body: Data("Unauthorized".utf8))
+            return
+        }
+        let path = firstLine.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+        guard CGPreflightScreenCaptureAccess() else {
+            respond(client, status: "403 Forbidden", type: "text/plain", body: Data("Helm does not have Screen Recording access".utf8))
+            return
+        }
+        guard path == "/status" || path == "/screenshot" else {
+            respond(client, status: "404 Not Found", type: "text/plain", body: Data("Not found".utf8))
+            return
+        }
+        guard let image = CGWindowListCreateImage(.infinite, .optionOnScreenOnly, kCGNullWindowID, [.bestResolution]) else {
+            respond(client, status: "500 Internal Server Error", type: "text/plain", body: Data("Helm could not capture the display".utf8))
+            return
+        }
+        if path == "/status" {
+            respond(client, status: "200 OK", type: "application/json", body: Data("{\"allowed\":true,\"width\":\(image.width),\"height\":\(image.height)}".utf8))
+            return
+        }
+        guard let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) else {
+            respond(client, status: "500 Internal Server Error", type: "text/plain", body: Data("Helm could not encode the screenshot".utf8))
+            return
+        }
+        respond(client, status: "200 OK", type: "image/png", body: png)
+    }
+
+    private func respond(_ client: Int32, status: String, type: String, body: Data) {
+        var response = Data("HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(body.count)\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n".utf8)
+        response.append(body)
+        response.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var sent = 0
+            while sent < response.count {
+                let count = Darwin.send(client, base.advanced(by: sent), response.count - sent, 0)
+                guard count > 0 else { return }
+                sent += count
+            }
+        }
+    }
+}
 
 private enum DeviceControlError: Error {
     case unsupportedAction(String)
@@ -254,6 +375,7 @@ struct MacMenuAssistantApp: App {
             exit(0)
         }
         NSApplication.shared.setActivationPolicy(.accessory)
+        ScreenCaptureBridge.shared.start()
         StartupDiagnostics.log()
     }
 
@@ -394,6 +516,7 @@ final class TaskController: ObservableObject {
     @Published var isListening = false
     @Published var voiceStatus = "Hold Control+Option to speak."
     @Published var hasScreenCaptureAccess = CGPreflightScreenCaptureAccess()
+    @Published var pythonScreenCaptureAccess: Bool?
     @Published var mcpConfig = """
     {
       "mcpServers": {}
@@ -516,10 +639,19 @@ final class TaskController: ObservableObject {
 
     func refreshScreenCaptureAccess() {
         hasScreenCaptureAccess = CGPreflightScreenCaptureAccess()
+        launchBackend(
+            arguments: ["--screen-access"],
+            initialOutput: "Checking Helm’s native Screen Recording capture…\n"
+        )
     }
 
     func requestScreenCaptureAccess() {
+        // The app that owns this permission also performs every screenshot.
         hasScreenCaptureAccess = CGRequestScreenCaptureAccess()
+        launchBackend(
+            arguments: ["--request-screen-access"],
+            initialOutput: "Checking Helm’s native capture after the permission request…\n"
+        )
     }
 
     func openScreenCaptureSettings() {
@@ -690,6 +822,7 @@ final class TaskController: ObservableObject {
         child.executableURL = python
         child.arguments = ["-u", script.path] + arguments
         child.currentDirectoryURL = root
+        child.environment = ProcessInfo.processInfo.environment.merging(ScreenCaptureBridge.shared.environment) { _, new in new }
         child.standardOutput = stdout
         child.standardError = stdout
         child.standardInput = stdin
@@ -769,11 +902,16 @@ final class TaskController: ObservableObject {
             if line.hasPrefix("APPROVAL_REQUIRED: ") {
                 pendingApproval = String(line.dropFirst("APPROVAL_REQUIRED: ".count))
             } else if line.hasPrefix("SCREEN_ACCESS_DENIED:") {
-                hasScreenCaptureAccess = false
+                pythonScreenCaptureAccess = false
                 output += String(line.dropFirst("SCREEN_ACCESS_DENIED:".count)).trimmingCharacters(in: .whitespaces) + "\n"
             } else if line.hasPrefix("SCREEN_CAPTURE_OK:") {
-                hasScreenCaptureAccess = true
+                pythonScreenCaptureAccess = true
                 output += "Screen capture succeeded (\(line.dropFirst("SCREEN_CAPTURE_OK:".count))).\n"
+            } else if line.hasPrefix("SCREEN_ACCESS_JSON:") {
+                let value = String(line.dropFirst("SCREEN_ACCESS_JSON:".count))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                pythonScreenCaptureAccess = value == "true"
+                output += "Helm Screen Recording access: \(pythonScreenCaptureAccess == true ? "enabled" : "not granted").\n"
             } else if line.hasPrefix("CHAT_REPLY_JSON:") {
                 receiveChatReply(String(line.dropFirst("CHAT_REPLY_JSON:".count)))
             } else if line.hasPrefix("MCP_RESULT_JSON:") {
@@ -1031,18 +1169,22 @@ struct AssistantPanel: View {
     private var screenCaptureControls: some View {
         VStack(alignment: .leading, spacing: 9) {
             Label(
-                controller.hasScreenCaptureAccess
-                    ? "Screen Recording access is enabled"
-                    : "Screen Recording access is not detected",
-                systemImage: controller.hasScreenCaptureAccess
+                controller.pythonScreenCaptureAccess == true
+                    ? "Helm has Screen Recording access"
+                    : "Helm needs Screen Recording access",
+                systemImage: controller.pythonScreenCaptureAccess == true
                     ? "checkmark.circle.fill"
                     : "exclamationmark.triangle.fill"
             )
             .font(.system(size: 12, weight: .medium))
-            .foregroundStyle(controller.hasScreenCaptureAccess ? .green : .orange)
+            .foregroundStyle(controller.pythonScreenCaptureAccess == true ? .green : .orange)
 
-            if !controller.hasScreenCaptureAccess {
-                Text("Enable this app in macOS Screen Recording settings. Use Test Capture to verify the Python control process too.")
+            Text("Helm app permission: \(controller.hasScreenCaptureAccess ? "enabled" : "not detected")")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+
+            if controller.pythonScreenCaptureAccess != true {
+                Text("Helm takes screenshots inside the app itself. Use Request Access, allow Helm in Screen Recording settings, then restart Helm and run Test Capture.")
                     .font(.system(size: 10))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

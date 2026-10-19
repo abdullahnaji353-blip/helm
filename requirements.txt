@@ -2,5 +2,10 @@ PyAutoGUI>=0.9.54,<1
 pyobjc-framework-Cocoa==11.1; sys_platform == "darwin"
 pyobjc-framework-quartz==11.1; sys_platform == "darwin"
 pyobjc-framework-ApplicationServices==11.1; sys_platform == "darwin"
+pywinauto>=0.6.8,<1; sys_platform == "win32"
+pywin32>=306; sys_platform == "win32"
+psutil>=5.9,<6; sys_platform == "win32"
+pyttsx3>=2.90,<3; sys_platform == "win32"
+pystray>=0.19,<1; sys_platform == "win32"
 anthropic>=0.125,<1
 playwright>=1.60,<2

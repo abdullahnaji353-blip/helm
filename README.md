@@ -1,16 +1,31 @@
 # Local Desktop Assistant
 
-A local-first macOS assistant prototype. It uses Ollama for local language and
-vision models and offers a Terminal interface plus a native menu-bar interface
-for task-scoped desktop control.
+A local-first desktop assistant prototype (macOS and Windows). It uses Ollama
+for local language and vision models and offers a Terminal interface plus a
+native menu-bar/tray interface for task-scoped desktop control.
 
 ## Requirements
 
+### macOS
 - macOS
 - Python 3.9 or newer
 - Xcode Command Line Tools for the menu-bar interface
 - [Ollama](https://ollama.com/) with a model downloaded locally
 - PyAutoGUI for optional desktop control
+
+### Windows
+- Windows 10 or newer
+- Python 3.9 or newer
+- [Ollama](https://ollama.com/) with a model downloaded locally
+- PyAutoGUI plus `pywinauto`/`pywin32` for screen control (installed
+  automatically from `requirements.txt`)
+
+The Windows tray UI is a first pass: chat, task execution, the approval flow,
+and screen control/app discovery are ported. Voice input, the 3-background-
+agent pipeline view, the Logs tab, bridge (WhatsApp/Telegram/Discord/Slack)
+settings, and global hotkeys are not yet — see
+`platform_compat.py`/`screen_elements_win.py`/`app_discovery_win.py` for what
+each covers.
 
 ## Get started
 
@@ -36,6 +51,33 @@ To launch the native menu-bar interface instead:
 bash run-menubar.sh
 ```
 
+You can also double-click `Open Helm.command` in Finder to launch it.
+
+### Windows
+
+1. Install [Ollama](https://ollama.com/) and start it, then pull a model:
+
+   ```powershell
+   ollama pull llama3.2
+   ```
+
+2. From this folder, in PowerShell:
+
+   ```powershell
+   powershell -ExecutionPolicy Bypass -File run-menubar.ps1
+   ```
+
+   This creates `.venv`, installs `requirements.txt` (which pulls in the
+   Windows-only `pywinauto`/`pywin32`/`psutil`/`pyttsx3`/`pystray` packages),
+   and starts the tray icon. Right-click or left-click the tray icon and
+   choose **Open Chat**.
+
+   To run the terminal chat instead of the tray UI:
+
+   ```powershell
+   .venv\Scripts\python.exe assistant.py
+   ```
+
 The launcher compiles the small Swift app with the selected Xcode Command Line
 Tools and starts it. The first launch may take a little while to compile.
 
@@ -51,23 +93,67 @@ or change credentials/settings still require confirmation, even in autonomous
 mode. Simple requests such as “Open Safari” use macOS's direct app launcher
 instead of screen-click automation.
 
-Hold **Control+Option** while speaking, then release the keys to run the
-transcribed task autonomously. Speech recognition is configured to run
-on-device; if macOS does not support on-device recognition for the selected
-language, the app reports that and does not send microphone audio elsewhere.
-The first use asks for Microphone and Speech Recognition permissions. The
-global shortcut needs Input Monitoring, and macOS may also require
-Accessibility. If prompted, grant them to Local Desktop Assistant in System
-Settings → Privacy & Security → Input Monitoring / Accessibility, then use
-**Retry shortcut** or restart the app.
+Press **Control+Option+Space** to open or bring Helm forward. Helm must already
+be running in the menu bar; this shortcut works without Input Monitoring.
+Modifier-only **Control+Option** is an optional gesture: tap it to open Helm or
+hold it while speaking, then release to submit the transcription. That gesture
+requires Input Monitoring. In Settings → Abilities, use **Test voice shortcut**
+to confirm macOS detects it. Speech recognition is configured to run on-device;
+if macOS does not support on-device recognition for the selected language, the
+app reports that and does not send microphone audio elsewhere. The first voice
+use asks for Microphone and Speech Recognition permissions. Accessibility is
+needed separately for operating other apps, not for opening Helm. Grant these
+permissions to Helm in System Settings → Privacy & Security.
+In **Abilities**, **Applications** enables viewing every running app (including
+apps without visible windows), opening and quitting apps, and managing installs.
+It can also list installed apps and `.app` bundles in Downloads with their paths
+and running status, and open any uniquely named bundle. A downloaded app is not
+reported as installed until it is in an Applications folder. macOS may still
+show its own first-open security prompt. Helm always asks before installing or
+removing an app. **Screen control** uses
+Accessibility to inspect controls, drag items, and move, resize, or close
+windows; Screen Recording lets it see the display. Click coordinates are derived
+from the current screen and are not saved, since window positions and displays
+can change.
 The menu-bar microphone button is also available for starting and stopping
 voice capture manually.
+The microphone beside the chat keyboard field dictates into the draft, so you
+can review and edit the transcript before sending. **Control+Shift+D** starts
+the same dictation mode.
+
+### Background agents
+
+The three background lanes have different specialties: **Researcher** finds
+evidence and cites sources, **Operator** performs the assigned task using the
+existing approval checks, and **Verifier** checks results and reports gaps.
+Researcher and Verifier have read-oriented tool allowlists; only Operator gets
+the full task-action toolset, with the same sensitive-action confirmations.
+Each task shows a short generated plan and live tool/checkpoint activity. Each
+agent keeps its own conversation history between tasks; start a new chat to
+clear the main conversation, or remove the per-agent history files from
+`~/Library/Application Support/Local Desktop Assistant/` to reset agent memory.
+Agent planning uses the selected model provider, so cloud-provider tasks send
+their task text there; local Ollama tasks stay on the Mac.
+If a workflow is interrupted, resuming instructs the agent to inspect its saved
+conversation and current state before continuing, and to ask you rather than
+repeat a side effect it cannot verify. Screen and browser tasks also save each
+successful action and persist the action about to run; if Helm restarts during
+an action, it asks the agent to inspect the current state before retrying.
+When browser automation sees multiple controls with the same accessible name,
+it stops instead of automatically choosing the first one.
 
 Select **Search the web for examples** to opt in to a browser search (Chrome or
 Safari) before a typed or spoken task. The task text is searched on Google and the results are
 shown in Activity; only titles, links, and snippets are supplied to the local
 vision model. Web results are untrusted reference material, not instructions.
 Leave the option off to keep the task query local.
+
+For web tasks in Helm's Playwright browser, Helm also reads up to 4,000
+characters of visible page text and labeled controls to help it research and
+fill forms. Page text is untrusted and is sent to the selected model provider;
+Helm still asks before submitting, posting, or sending. Completed browser tasks
+include a short list of pages visited; query strings and URL credentials are
+excluded from those links.
 
 Basic two-number arithmetic can use the dedicated Calculator tool. It clears
 the real Calculator app, enters the expression, and checks the visible result
@@ -186,6 +272,14 @@ allows JavaScript from Apple Events.
 
 ## WhatsApp remote access
 
+To jump to a connection page, ask Helm to open that service's settings, for
+example, “Open Telegram settings.” Helm opens the matching page and shows
+whether the bridge is running. Finish account setup with the service itself,
+then enter tokens only in Helm's secure settings fields—not in chat. macOS
+privacy permissions must be granted separately by the user in System Settings.
+For a simple launch request such as “Open Safari” or “Open Discord,” Telegram
+uses Helm's app launcher directly and reports the launcher's actual result.
+
 The menu-bar app includes an opt-in **WhatsApp** settings tab for Meta's
 WhatsApp Business Cloud API. This is not a direct link to a personal WhatsApp
 session: you need a Meta developer app with WhatsApp Cloud API, a phone number
@@ -224,7 +318,7 @@ live-tested without credentials.
 - Copy text, then use `/read` to speak the clipboard contents. The clipboard is
   only read after you explicitly run this command.
 - `/open Safari`, `/open Notes`, `/open Calendar`, `/open Calculator`, or
-  `/open Finder` opens one of the allowlisted apps.
+  `/open Finder` opens an installed app or a downloaded `.app` bundle by name.
 - `/open-url https://example.com` opens an HTTP or HTTPS URL in the browser.
 - `/do <task>` asks a local vision model to perform a task using the screen.
   It proposes one click, keystroke, typing, or scrolling action at a time and

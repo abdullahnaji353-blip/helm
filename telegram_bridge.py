@@ -9,6 +9,7 @@ messages it their chat ID (and does nothing else) so setup is copy-paste.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import logging.handlers
 import os
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+import fcntl
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -34,6 +36,10 @@ LOGGER = logging.getLogger("helm.telegram")
 
 
 class TelegramError(RuntimeError):
+    pass
+
+
+class TelegramConflictError(TelegramError):
     pass
 
 
@@ -75,6 +81,17 @@ class TelegramBotAPI:
         except TelegramError:
             raise
         except HTTPError as error:
+            if error.code == 409 and method == "getUpdates":
+                try:
+                    body = json.loads(error.read())
+                    detail = body.get("description", "") if isinstance(body, dict) else ""
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    detail = ""
+                explanation = f" Telegram says: {detail}" if detail else ""
+                raise TelegramConflictError(
+                    "Telegram polling conflict (HTTP 409). Another process is already polling this bot. "
+                    "Stop any other Helm instance or service using this bot token, then restart Helm." + explanation
+                ) from error
             raise TelegramError(f"Telegram returned HTTP {error.code} for {method}.") from error
         except (URLError, TimeoutError, OSError) as error:
             raise TelegramError(f"Could not reach Telegram for {method}.") from error
@@ -123,15 +140,20 @@ class TelegramBridge:
         self._active_process: subprocess.Popen[str] | None = None
         self._stopping = threading.Event()
 
-    def run_forever(self) -> None:
+    def run_forever(self) -> int:
         while not self._stopping.is_set():
             try:
                 for update in self.api.get_updates(self._offset):
                     self._offset = update["update_id"] + 1
                     self._handle_update(update)
+            except TelegramConflictError as error:
+                LOGGER.error("Poll stopped: %s", error)
+                print(f"TELEGRAM_BRIDGE_ERROR:{error}", flush=True)
+                return 1
             except TelegramError as error:
                 LOGGER.warning("Poll failed: %s", error)
                 time.sleep(3)  # back off before retrying so a flaky network doesn't spin
+        return 0
 
     def stop(self) -> None:
         self._stopping.set()
@@ -321,6 +343,26 @@ def configure_logging() -> Path:
     return log_path
 
 
+def acquire_polling_lock(bot_token: str):
+    """Prevent two local Helm processes from polling the same Telegram bot token."""
+    token_hash = hashlib.sha256(bot_token.strip().encode("utf-8")).hexdigest()[:24]
+    lock_directory = Path.home() / "Library" / "Application Support" / "Helm"
+    lock_directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(lock_directory, 0o700)
+    lock_path = lock_directory / f"telegram-poller-{token_hash}.lock"
+    lock_file = lock_path.open("a", encoding="utf-8")
+    os.chmod(lock_path, 0o600)
+    try:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        lock_file.close()
+        raise TelegramError(
+            "Another Helm process is already polling this Telegram bot on this Mac. "
+            "Switch to that Helm window or stop it before starting this bridge."
+        ) from error
+    return lock_file
+
+
 def bridge_from_environment() -> TelegramBridge:
     bot_token = os.environ.get("HELM_TELEGRAM_BOT_TOKEN", "")
     if not bot_token:
@@ -344,8 +386,14 @@ def bridge_from_environment() -> TelegramBridge:
 
 def run_bridge() -> int:
     configure_logging()
+    polling_lock = None
     try:
         bridge = bridge_from_environment()
+        polling_lock = acquire_polling_lock(os.environ["HELM_TELEGRAM_BOT_TOKEN"])
+    except TelegramError as error:
+        LOGGER.error("Telegram bridge could not start: %s", error)
+        print(f"TELEGRAM_BRIDGE_ERROR:{error}", flush=True)
+        return 1
     except ValueError as error:
         LOGGER.exception("Telegram bridge configuration failed")
         print(f"TELEGRAM_BRIDGE_ERROR:{error}", flush=True)
@@ -368,10 +416,13 @@ def run_bridge() -> int:
     signal.signal(signal.SIGINT, stop_bridge)
     signal.signal(signal.SIGUSR1, cancel_active_task)
     try:
-        bridge.run_forever()
+        exit_code = bridge.run_forever()
     except KeyboardInterrupt:
-        pass
-    return 0
+        exit_code = 0
+    finally:
+        if polling_lock is not None:
+            polling_lock.close()
+    return exit_code
 
 
 if __name__ == "__main__":
