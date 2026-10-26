@@ -19,6 +19,8 @@ on:
       - "mcp_client.py"
       - "providers.py"
       - "writing_check.py"
+      - "phone_control.py"
+      - "phone_mirror.py"
       - "requirements.txt"
       - ".github/workflows/build-windows.yml"
   workflow_dispatch: {}
@@ -51,11 +53,18 @@ jobs:
             --collect-all pystray --collect-all PIL `
             windows_tray/app.py
 
+      - name: Build PhoneMirror.exe (Android phone control)
+        run: |
+          pyinstaller --onefile --name PhoneMirror --windowed `
+            --collect-all PIL `
+            phone_mirror.py
+
       - name: Assemble release folder
         run: |
           mkdir dist\helm-windows
           copy dist\assistant.exe dist\helm-windows\
           copy dist\Helm.exe dist\helm-windows\
+          copy dist\PhoneMirror.exe dist\helm-windows\
           copy README.md dist\helm-windows\
 
       - uses: actions/upload-artifact@v4

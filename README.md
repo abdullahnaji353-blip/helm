@@ -252,6 +252,66 @@ Chat prompts and desktop screenshots go only to Ollama on this Mac
 (`localhost`). No API key is required. Desktop-control Python packages are
 installed into the project virtual environment.
 
+## Phone Mirror (control an Android phone with your mouse)
+
+`phone_mirror.py` shows your Android phone's screen in a desktop window and
+lets you drive it with the mouse and keyboard. It works on macOS and Windows,
+over USB or Wi-Fi, and needs nothing installed on the phone.
+
+**Android only.** iPhones have no public API for being controlled from another
+computer. On a Mac with macOS 15+ and iOS 18+, Apple's built-in **iPhone
+Mirroring** app does this already.
+
+### Setup (once)
+
+1. Install **adb** from Google's
+   [platform-tools](https://developer.android.com/tools/releases/platform-tools)
+   (or `brew install android-platform-tools` on macOS). Unzip it and leave the
+   `platform-tools` folder in your home or Downloads folder, next to this
+   project, or on your `PATH`. Phone Mirror finds it in any of those.
+2. On the phone: **Settings → About phone → tap Build number 7 times**, then
+   **Settings → System → Developer options → USB debugging** on.
+3. Plug the phone in, unlock it, and tap **Allow** on the "Allow USB
+   debugging?" prompt.
+
+### Run it
+
+```sh
+python phone_mirror.py          # macOS: inside the .venv from "Get started"
+```
+
+On Windows, double-click `PhoneMirror.exe` from the `helm-windows` build
+artifact, or run `.venv\Scripts\python.exe phone_mirror.py`. On macOS with
+Homebrew Python, Tk may need `brew install python-tk`.
+
+| On the computer          | On the phone                   |
+| ------------------------ | ------------------------------ |
+| Click                    | Tap                            |
+| Click and hold           | Long press                     |
+| Drag                     | Swipe (keeps your drag speed)  |
+| Scroll wheel             | Scroll                         |
+| Right-click / Esc        | Back                           |
+| Typing, Enter, Backspace | Typing into the focused field  |
+| Ctrl+H / B / S / P       | Home / Back / Recents / Power  |
+| Ctrl+Up / Ctrl+Down      | Volume up / down               |
+| Ctrl+V                   | Types the computer's clipboard |
+
+(Use Cmd instead of Ctrl on macOS.) **Screenshot** saves a full-resolution
+PNG to your Pictures folder.
+
+**Wireless:** with the phone on USB and on the same Wi-Fi as the computer,
+choose **Wireless → Switch USB phone to Wi-Fi**, then unplug. On Android 11+
+you can skip USB entirely: **Wireless → Pair new phone** with the code from
+Developer options → Wireless debugging, then **Connect by IP**.
+
+**Limits, honestly:** the screen updates a few times per second (it uses
+`adb screencap`), and each tap takes a fraction of a second to land, so it's
+great for tapping around, replying to messages, and navigating apps, but not for
+video or games. For that, install [scrcpy](https://github.com/Genymobile/scrcpy)
+and use **Wireless → Open in scrcpy** for smooth 60 fps. Typing over adb only
+supports plain English characters (no emoji). Apps that block screenshots
+(banking, some streaming) show up black.
+
 ## AI providers and API keys
 
 Helm runs on local Ollama by default. To use a cloud model instead, open

@@ -6,3 +6,4 @@ __pycache__/
 .DS_Store
 chat_history.json
 training/results.jsonl
+platform-tools/
