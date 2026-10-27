@@ -1705,9 +1705,14 @@ class TvControlDispatchTests(unittest.TestCase):
         self._temp = tempfile.TemporaryDirectory()
         self.addCleanup(self._temp.cleanup)
         self.tv_serial_path = Path(self._temp.name) / "tv_device.txt"
-        patcher = patch("assistant.TV_SERIAL_PATH", self.tv_serial_path)
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        self.tv_devices_path = Path(self._temp.name) / "tv_devices.json"
+        for patch_target, value in (
+            ("assistant.TV_SERIAL_PATH", self.tv_serial_path),
+            ("assistant.TV_DEVICES_PATH", self.tv_devices_path),
+        ):
+            patcher = patch(patch_target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
     def test_tv_connect_saves_serial_and_reports_device_name(self):
         assistant = DesktopAssistant()
@@ -1786,6 +1791,109 @@ class TvControlDispatchTests(unittest.TestCase):
             result = assistant.run_tool("tv_remote_key", {"key": "home"})
         send_key.assert_called_once_with("192.168.1.5:5555", "home")
         self.assertEqual(result, "Sent home to the TV.")
+
+    def test_tv_connect_saves_device_under_slugified_name(self):
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.connect", return_value="192.168.1.5:5555"),
+            patch("assistant.tv_control.device_name", return_value="Living Room TV"),
+        ):
+            assistant.run_tool("tv_connect", {"host": "192.168.1.5"})
+        devices = json.loads(self.tv_devices_path.read_text(encoding="utf-8"))
+        self.assertEqual(devices, {"living_room_tv": "192.168.1.5:5555"})
+
+    def test_tv_connect_honors_explicit_name(self):
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.connect", return_value="192.168.1.5:5555"),
+            patch("assistant.tv_control.device_name", return_value="Living Room TV"),
+        ):
+            result = assistant.run_tool("tv_connect", {"host": "192.168.1.5", "name": "Bedroom"})
+        devices = json.loads(self.tv_devices_path.read_text(encoding="utf-8"))
+        self.assertEqual(devices, {"bedroom": "192.168.1.5:5555"})
+        self.assertIn("'bedroom'", result)
+
+    def test_tv_list_devices_marks_the_active_one(self):
+        self.tv_devices_path.write_text(
+            json.dumps({"living_room": "192.168.1.5:5555", "bedroom": "192.168.1.9:5555"}),
+            encoding="utf-8",
+        )
+        self.tv_serial_path.write_text("192.168.1.9:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        result = assistant.run_tool("tv_list_devices", {})
+        self.assertIn("living_room: 192.168.1.5:5555\n", result)
+        self.assertIn("bedroom: 192.168.1.9:5555 (active)", result)
+
+    def test_tv_use_device_switches_active_serial(self):
+        self.tv_devices_path.write_text(
+            json.dumps({"bedroom": "192.168.1.9:5555"}), encoding="utf-8",
+        )
+        assistant = DesktopAssistant()
+        with patch("assistant.tv_control.is_connected", return_value=True):
+            result = assistant.run_tool("tv_use_device", {"name": "Bedroom"})
+        self.assertEqual(self.tv_serial_path.read_text(encoding="utf-8"), "192.168.1.9:5555")
+        self.assertIn("Switched to 'Bedroom'", result)
+
+    def test_tv_use_device_reports_unknown_name(self):
+        assistant = DesktopAssistant()
+        result = assistant.run_tool("tv_use_device", {"name": "Nope"})
+        self.assertIn("No saved TV", result)
+
+    def test_tv_search_opens_deep_link(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.search") as search,
+        ):
+            result = assistant.run_tool("tv_search", {"app": "Netflix", "query": "Bluey"})
+        search.assert_called_once_with("192.168.1.5:5555", "Netflix", "Bluey")
+        self.assertIn("Netflix", result)
+        self.assertIn("Bluey", result)
+
+    def test_tv_set_volume_dispatches(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.set_volume") as set_volume,
+        ):
+            result = assistant.run_tool("tv_set_volume", {"level": 5})
+        set_volume.assert_called_once_with("192.168.1.5:5555", 5)
+        self.assertIn("5", result)
+
+    def test_tv_wake_dispatches(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.wake") as wake,
+        ):
+            result = assistant.run_tool("tv_wake", {})
+        wake.assert_called_once_with("192.168.1.5:5555")
+        self.assertEqual(result, "Woke the TV.")
+
+    def test_tv_sleep_dispatches(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.sleep_device") as sleep_device,
+        ):
+            result = assistant.run_tool("tv_sleep", {})
+        sleep_device.assert_called_once_with("192.168.1.5:5555")
+        self.assertEqual(result, "Put the TV to sleep.")
+
+    def test_tv_tap_text_dispatches(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.tap_text") as tap_text,
+        ):
+            result = assistant.run_tool("tv_tap_text", {"text": "Always"})
+        tap_text.assert_called_once_with("192.168.1.5:5555", "Always")
+        self.assertIn("Always", result)
 
 
 if __name__ == "__main__":

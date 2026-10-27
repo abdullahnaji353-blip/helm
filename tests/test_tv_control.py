@@ -110,5 +110,153 @@ class WallpaperTests(unittest.TestCase):
                 tv_control.set_wallpaper("serial", str(bad))
 
 
+class SearchTests(unittest.TestCase):
+    def test_search_builds_correct_youtube_url(self):
+        with patch("subprocess.run", return_value=fake_run()) as mock_run:
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                tv_control.search("serial", "YouTube", "Ms Rachel")
+        args = mock_run.call_args[0][0]
+        joined = " ".join(args)
+        self.assertIn("android.intent.action.VIEW", joined)
+        self.assertIn("https://www.youtube.com/results?search_query=Ms+Rachel", joined)
+
+    def test_search_rejects_unknown_app(self):
+        with self.assertRaises(tv_control.AdbError):
+            tv_control.search("serial", "SomeRandomApp", "query")
+
+    def test_search_rejects_empty_query(self):
+        with self.assertRaises(tv_control.AdbError):
+            tv_control.search("serial", "YouTube", "   ")
+
+
+class VolumeTests(unittest.TestCase):
+    def test_set_volume_rejects_negative(self):
+        with self.assertRaises(tv_control.AdbError):
+            tv_control.set_volume("serial", -1)
+
+    def test_set_volume_rejects_above_explicit_max(self):
+        with self.assertRaises(tv_control.AdbError):
+            tv_control.set_volume("serial", 99, max_level=15)
+
+    def test_set_volume_rejects_above_autodetected_max(self):
+        with patch("tv_control.get_volume_range", return_value=(0, 15)):
+            with self.assertRaises(tv_control.AdbError):
+                tv_control.set_volume("serial", 99)
+
+    def test_set_volume_proceeds_when_range_cannot_be_detected(self):
+        with (
+            patch("tv_control.get_volume_range", return_value=None),
+            patch("subprocess.run", return_value=fake_run()) as mock_run,
+        ):
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                tv_control.set_volume("serial", 99)
+        self.assertIn("media_session", mock_run.call_args[0][0])
+
+    def test_set_volume_sends_correct_command(self):
+        with patch("tv_control.get_volume_range", return_value=(0, 100)):
+            with patch("subprocess.run", return_value=fake_run()) as mock_run:
+                with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                    tv_control.set_volume("serial", 7)
+        args = mock_run.call_args[0][0]
+        self.assertIn("media_session", args)
+        self.assertIn("7", args)
+
+    def test_get_volume_range_parses_min_and_max(self):
+        output = "- STREAM_MUSIC:\n   Min: 0\n   Max: 100\n   streamVolume:8\n"
+        with patch("subprocess.run", return_value=fake_run(stdout=output)):
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                range_ = tv_control.get_volume_range("serial")
+        self.assertEqual(range_, (0, 100))
+
+    def test_get_volume_parses_dumpsys_output(self):
+        # Real-world dumpsys format: "Current:" lists a device-code -> level map, not the
+        # level itself (device code 2 = speaker here) — the actual level is streamVolume.
+        output = (
+            "- STREAM_MUSIC:\n   Muted: false\n   Max: 100\n   streamVolume:8\n"
+            "   Current: 2 (speaker): 8, 4 (headset): 8\n"
+        )
+        with patch("subprocess.run", return_value=fake_run(stdout=output)):
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                level = tv_control.get_volume("serial")
+        self.assertEqual(level, 8)
+
+    def test_get_volume_does_not_mistake_device_code_for_level(self):
+        # Regression test: an earlier regex matched the "2" in "Current: 2 (speaker): 10"
+        # (a device-code field) instead of the real level (10).
+        output = "- STREAM_MUSIC:\n   streamVolume:10\n   Current: 2 (speaker): 10\n"
+        with patch("subprocess.run", return_value=fake_run(stdout=output)):
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                level = tv_control.get_volume("serial")
+        self.assertEqual(level, 10)
+
+    def test_get_volume_returns_none_when_unparseable(self):
+        with patch("subprocess.run", return_value=fake_run(stdout="nonsense")):
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                level = tv_control.get_volume("serial")
+        self.assertIsNone(level)
+
+
+class PowerTests(unittest.TestCase):
+    def test_wake_sends_wakeup_keycode(self):
+        with patch("subprocess.run", return_value=fake_run()) as mock_run:
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                tv_control.wake("serial")
+        self.assertIn("224", mock_run.call_args[0][0])
+
+    def test_sleep_sends_sleep_keycode(self):
+        with patch("subprocess.run", return_value=fake_run()) as mock_run:
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                tv_control.sleep_device("serial")
+        self.assertIn("223", mock_run.call_args[0][0])
+
+
+SAMPLE_UI_DUMP = """<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy>
+  <node text="YouTube" resource-id="com.android.tv.settings:id/app_label"
+        clickable="true" bounds="[100,200][400,300]" />
+  <node text="" resource-id="com.android.tv.settings:id/icon"
+        clickable="false" bounds="[0,0][50,50]" />
+  <node text="Always" resource-id="android:id/button_always"
+        clickable="true" bounds="[1200,980][1400,1050]" />
+</hierarchy>"""
+
+
+class UiTreeTests(unittest.TestCase):
+    def test_find_elements_matches_by_text(self):
+        with patch("tv_control.ui_dump", return_value=SAMPLE_UI_DUMP):
+            matches = tv_control.find_elements("serial", "Always")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].resource_id, "android:id/button_always")
+
+    def test_find_elements_is_case_insensitive(self):
+        with patch("tv_control.ui_dump", return_value=SAMPLE_UI_DUMP):
+            matches = tv_control.find_elements("serial", "always")
+        self.assertEqual(len(matches), 1)
+
+    def test_element_center_is_midpoint_of_bounds(self):
+        element = tv_control.UiElement(
+            text="Always", resource_id="x", bounds=(1200, 980, 1400, 1050), clickable=True,
+        )
+        self.assertEqual(element.center, (1300, 1015))
+
+    def test_tap_text_taps_the_matched_element_center(self):
+        with (
+            patch("tv_control.ui_dump", return_value=SAMPLE_UI_DUMP),
+            patch("tv_control.tap") as mock_tap,
+        ):
+            element = tv_control.tap_text("serial", "Always")
+        mock_tap.assert_called_once_with("serial", 1300, 1015)
+        self.assertEqual(element.resource_id, "android:id/button_always")
+
+    def test_tap_text_raises_when_no_match(self):
+        with patch("tv_control.ui_dump", return_value=SAMPLE_UI_DUMP):
+            with self.assertRaises(tv_control.AdbError):
+                tv_control.tap_text("serial", "NoSuchButton")
+
+    def test_parse_ui_dump_raises_on_invalid_xml(self):
+        with self.assertRaises(tv_control.AdbError):
+            tv_control._parse_ui_dump("not xml")
+
+
 if __name__ == "__main__":
     unittest.main()

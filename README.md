@@ -319,6 +319,29 @@ don't need to reconnect every session, as long as the TV keeps the same IP.
   platforms like Samsung Tizen or LG webOS) don't support a custom home
   wallpaper at all; on those this will push the image but have no visible
   effect.
+- "Search Netflix for Bluey" / "search YouTube for Ms Rachel" — opens
+  in-app search results for a query (`tv_search`). Supported apps: YouTube,
+  Netflix, Prime Video, Disney+, Spotify, Plex. Best-effort: depends on the
+  app's web deep link still working.
+- "Set the TV volume to 7" — sets an exact volume level (`tv_set_volume`).
+  The valid range varies by device (commonly 0-15, sometimes 0-100); if you
+  don't know the TV's range, just say "turn it up/down" and Helm will use
+  `tv_remote_key` with `volume_up`/`volume_down` instead.
+- "Wake the TV" / "put the TV to sleep" — standby control (`tv_wake`,
+  `tv_sleep`), not a full power-off. A TV with Wi-Fi fully powered down
+  can't be reached at all until it's turned back on at the set.
+- "Connect to the TV in the bedroom" / "switch to the living room TV" —
+  Helm remembers every TV you've connected to by name (`tv_list_devices`,
+  `tv_use_device`), so you can have more than one and switch between them.
+- Helm can also read what's on screen instead of guessing blind: it takes a
+  screenshot, or dumps the on-screen layout and taps a button by its visible
+  text (`tv_tap_text`) — useful for one-off dialogs like "Open with... /
+  Always" that don't have a dedicated remote-key shortcut. The on-screen
+  layout dump only works for apps that expose standard Android
+  accessibility nodes; some custom-rendered UIs (games, some video players)
+  won't show anything useful there, and some TV apps ignore synthetic taps
+  entirely since they're built for D-pad only — screenshots + remote keys
+  are the fallback for those.
 
 Replacing Google Assistant as the TV's *system-level* default assistant isn't
 supported by most Android TV builds without rooting the device, which this

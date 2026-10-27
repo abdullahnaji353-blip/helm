@@ -131,7 +131,9 @@ CHAT_HISTORY_PATH = (
     / "chat_history.json"
 )
 TV_SERIAL_PATH = CHAT_HISTORY_PATH.parent / "tv_device.txt"
+TV_DEVICES_PATH = CHAT_HISTORY_PATH.parent / "tv_devices.json"
 APK_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_./~ -]{1,500}\.apk$")
+TV_DEVICE_NAME_PATTERN = re.compile(r"[^a-z0-9]+")
 MAX_HISTORY_MESSAGES = 30
 # Replaying old tool_calls/tool-result turns verbatim measurably degrades tool-calling
 # accuracy on small/local models (noisy schemas, stale context) without adding anything a
@@ -479,12 +481,23 @@ CHAT_TOOLS = [
         "name": "tv_connect",
         "description": (
             "Connect to an Android TV / Google TV over the network for tv_* actions. "
-            "The TV needs Developer options -> Network/USB debugging enabled first."
+            "The TV needs Developer options -> Network/USB debugging enabled first. "
+            "Saves the TV under a name for later tv_use_device switching."
         ),
         "parameters": {"type": "object", "properties": {
             "host": {"type": "string", "description": "TV's IP address, e.g. 192.168.1.42"},
             "port": {"type": "integer", "description": "Defaults to 5555"},
+            "name": {"type": "string", "description": "Optional label, e.g. 'living room'"},
         }, "required": ["host"]}}},
+    {"type": "function", "function": {
+        "name": "tv_list_devices",
+        "description": "List every Android TV Helm has connected to before, and which one is active.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "tv_use_device",
+        "description": "Switch the active TV to a previously connected one by its saved name.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "tv_open_app",
         "description": "Open/launch an app on the connected Android TV, e.g. Netflix or YouTube.",
@@ -522,6 +535,43 @@ CHAT_TOOLS = [
         "parameters": {"type": "object", "properties": {
             "image_path": {"type": "string", "description": "Local path to a .png/.jpg image"}},
             "required": ["image_path"]}}},
+    {"type": "function", "function": {
+        "name": "tv_search",
+        "description": (
+            "Search and show results for a query inside an app on the connected TV, e.g. "
+            "search Netflix for a show, or YouTube for a video topic. Known apps: "
+            + ", ".join(sorted(tv_control.SEARCH_URL_TEMPLATES)) + "."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "app": {"type": "string"},
+            "query": {"type": "string"},
+        }, "required": ["app", "query"]}}},
+    {"type": "function", "function": {
+        "name": "tv_set_volume",
+        "description": (
+            "Set the connected TV's volume to an exact level. The valid range varies by "
+            "device (commonly 0-15, sometimes 0-100); ask the user for a rough fraction "
+            "like 'half' if unsure, rather than guessing a number."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "level": {"type": "integer"}}, "required": ["level"]}}},
+    {"type": "function", "function": {
+        "name": "tv_wake",
+        "description": "Wake the connected TV from standby.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "tv_sleep",
+        "description": "Put the connected TV into standby (not a full power-off).",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "tv_tap_text",
+        "description": (
+            "Find an on-screen button/label on the connected TV by its visible text and tap it. "
+            "Use this instead of guessing remote-key presses when a dialog or menu needs a "
+            "specific choice (e.g. 'Always', 'Allow', a search result title)."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string"}}, "required": ["text"]}}},
 ]
 MEDIA_COMMANDS = {
     "play": "play", "pause": "pause", "toggle": "playpause",
@@ -1857,7 +1907,13 @@ class DesktopAssistant:
             if name == "resume_task":
                 return self.resume_task()
             if name == "tv_connect":
-                return self.tv_connect(str(args.get("host", "")), int(args.get("port") or 5555))
+                return self.tv_connect(
+                    str(args.get("host", "")), int(args.get("port") or 5555), str(args.get("name", "")),
+                )
+            if name == "tv_list_devices":
+                return self.tv_list_devices()
+            if name == "tv_use_device":
+                return self.tv_use_device(str(args.get("name", "")))
             if name == "tv_open_app":
                 return self.tv_open_app(str(args.get("name", "")))
             if name == "tv_list_apps":
@@ -1870,6 +1926,16 @@ class DesktopAssistant:
                 return self.tv_remote_key(str(args.get("key", "")))
             if name == "tv_set_wallpaper":
                 return self.tv_set_wallpaper(str(args.get("image_path", "")))
+            if name == "tv_search":
+                return self.tv_search(str(args.get("app", "")), str(args.get("query", "")))
+            if name == "tv_set_volume":
+                return self.tv_set_volume(int(args.get("level", 0)))
+            if name == "tv_wake":
+                return self.tv_wake()
+            if name == "tv_sleep":
+                return self.tv_sleep()
+            if name == "tv_tap_text":
+                return self.tv_tap_text(str(args.get("text", "")))
         except subprocess.CalledProcessError:
             return f"{name} failed; the app or command was not found."
         except (RuntimeError, ValueError) as error:
@@ -2865,7 +2931,30 @@ class DesktopAssistant:
             )
         return serial
 
-    def tv_connect(self, host: str, port: int = 5555) -> str:
+    @staticmethod
+    def _slugify_tv_name(name: str) -> str:
+        slug = TV_DEVICE_NAME_PATTERN.sub("_", name.strip().lower()).strip("_")
+        return slug or "tv"
+
+    @staticmethod
+    def _load_tv_devices() -> dict[str, str]:
+        try:
+            loaded = json.loads(TV_DEVICES_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+
+    @staticmethod
+    def _save_tv_devices(devices: dict[str, str]) -> None:
+        TV_DEVICES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TV_DEVICES_PATH.write_text(json.dumps(devices, indent=2), encoding="utf-8")
+
+    @staticmethod
+    def _set_active_tv(serial: str) -> None:
+        TV_SERIAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TV_SERIAL_PATH.write_text(serial, encoding="utf-8")
+
+    def tv_connect(self, host: str, port: int = 5555, name: str = "") -> str:
         host = host.strip()
         if not host:
             return "A TV IP address is required."
@@ -2873,16 +2962,41 @@ class DesktopAssistant:
             serial = tv_control.connect(host, port)
         except tv_control.AdbError as error:
             return f"Could not connect to the TV at {host}:{port}: {error}"
-        TV_SERIAL_PATH.parent.mkdir(parents=True, exist_ok=True)
-        TV_SERIAL_PATH.write_text(serial, encoding="utf-8")
         try:
-            name = tv_control.device_name(serial)
+            device_label = tv_control.device_name(serial)
         except tv_control.AdbError:
-            name = serial
+            device_label = serial
+        key = self._slugify_tv_name(name or device_label)
+        devices = self._load_tv_devices()
+        devices[key] = serial
+        self._save_tv_devices(devices)
+        self._set_active_tv(serial)
         return (
-            f"Connected to {name} ({serial}). If the TV is showing an authorization prompt, "
-            "accept it on the TV screen, then try again."
+            f"Connected to {device_label} ({serial}), saved as '{key}'. If the TV is showing an "
+            "authorization prompt, accept it on the TV screen, then try again."
         )
+
+    def tv_list_devices(self) -> str:
+        devices = self._load_tv_devices()
+        if not devices:
+            return "No TVs have been connected yet."
+        try:
+            active = TV_SERIAL_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            active = ""
+        lines = [f"- {key}: {serial}" + (" (active)" if serial == active else "")
+                 for key, serial in devices.items()]
+        return "Known TVs:\n" + "\n".join(lines)
+
+    def tv_use_device(self, name: str) -> str:
+        key = self._slugify_tv_name(name)
+        serial = self._load_tv_devices().get(key)
+        if serial is None:
+            return f"No saved TV named '{name}'. Use tv_list_devices to see what's saved."
+        if not tv_control.is_connected(serial):
+            return f"'{name}' ({serial}) isn't reachable right now. Try tv_connect again."
+        self._set_active_tv(serial)
+        return f"Switched to '{name}' ({serial})."
 
     def tv_open_app(self, name: str) -> str:
         app = name.strip()
@@ -2965,6 +3079,53 @@ class DesktopAssistant:
         except tv_control.AdbError as error:
             return f"Could not set the TV's wallpaper: {error}"
         return f"Set {Path(image_path).name} as the TV's wallpaper."
+
+    def tv_search(self, app: str, query: str) -> str:
+        app = app.strip()
+        query = query.strip()
+        if not app or not query:
+            return "An app and a search query are required."
+        try:
+            serial = self._tv_serial()
+            tv_control.search(serial, app, query)
+        except tv_control.AdbError as error:
+            return f"Could not search {app} on the TV: {error}"
+        return f"Opened {app} search results for '{query}' on the TV."
+
+    def tv_set_volume(self, level: int) -> str:
+        try:
+            serial = self._tv_serial()
+            tv_control.set_volume(serial, level)
+        except tv_control.AdbError as error:
+            return f"Could not set the TV's volume: {error}"
+        return f"Set the TV's volume to {level}."
+
+    def tv_wake(self) -> str:
+        try:
+            serial = self._tv_serial()
+            tv_control.wake(serial)
+        except tv_control.AdbError as error:
+            return f"Could not wake the TV: {error}"
+        return "Woke the TV."
+
+    def tv_sleep(self) -> str:
+        try:
+            serial = self._tv_serial()
+            tv_control.sleep_device(serial)
+        except tv_control.AdbError as error:
+            return f"Could not put the TV to sleep: {error}"
+        return "Put the TV to sleep."
+
+    def tv_tap_text(self, text: str) -> str:
+        text = text.strip()
+        if not text:
+            return "Text to tap is required."
+        try:
+            serial = self._tv_serial()
+            tv_control.tap_text(serial, text)
+        except tv_control.AdbError as error:
+            return f"Could not tap '{text}' on the TV: {error}"
+        return f"Tapped '{text}' on the TV."
 
     def ask_chatgpt(self, question: str) -> str:
         """Ask on chatgpt.com in the browser: its page text is readable, the desktop app's is not."""

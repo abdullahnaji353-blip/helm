@@ -11,10 +11,13 @@ variable, `vendor/platform-tools/adb` next to this file, or `adb` on PATH.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote_plus
 
 ADB_TIMEOUT = 15
 
@@ -61,6 +64,25 @@ KEY_EVENTS: dict[str, int] = {
     "mute": 164,
     "power": 26,
 }
+
+# Web deep links that open in-app search results on devices where the app handles
+# https links (most Android TV apps register as the default handler for their own domain).
+# Best-effort: an app update can change or drop this without notice.
+SEARCH_URL_TEMPLATES: dict[str, str] = {
+    "youtube": "https://www.youtube.com/results?search_query={query}",
+    "netflix": "https://www.netflix.com/search?q={query}",
+    "prime video": "https://app.primevideo.com/search/?phrase={query}",
+    "amazon prime video": "https://app.primevideo.com/search/?phrase={query}",
+    "disney+": "https://www.disneyplus.com/search/{query}",
+    "disney plus": "https://www.disneyplus.com/search/{query}",
+    "spotify": "https://open.spotify.com/search/{query}",
+    "plex": "https://app.plex.tv/desktop/#!/search?query={query}",
+}
+
+# STREAM_MUSIC, the stream Android TV remotes/volume keys control.
+_VOLUME_STREAM = "3"
+_KEYCODE_WAKEUP = "224"
+_KEYCODE_SLEEP = "223"
 
 
 class AdbError(RuntimeError):
@@ -231,3 +253,149 @@ def set_wallpaper(serial: str, image_path: str) -> str:
             f"Pushed the image to the TV, but the TV's launcher rejected setting it as "
             f"wallpaper ({error}). Not all Android TV launchers support a custom wallpaper."
         ) from error
+
+
+def open_url(serial: str, url: str) -> None:
+    """Open a URL with whichever app handles it (usually that app's own TV client)."""
+    _shell(serial, "am", "start", "-a", "android.intent.action.VIEW", "-d", url, timeout=20)
+
+
+def search(serial: str, app: str, query: str) -> str:
+    """Open search results for `query` inside `app` via a web deep link. Returns the matched
+    app key. Best-effort: depends on the app still handling its own search URL."""
+    key = app.strip().casefold()
+    template = SEARCH_URL_TEMPLATES.get(key)
+    if template is None:
+        raise AdbError(
+            f"No search deep link is known for {app!r}. Known apps: "
+            f"{', '.join(sorted(SEARCH_URL_TEMPLATES))}."
+        )
+    query = query.strip()
+    if not query:
+        raise AdbError("A search query is required.")
+    open_url(serial, template.format(query=quote_plus(query)))
+    return key
+
+
+_DUMPSYS_VOLUME_PATTERN = re.compile(r"STREAM_MUSIC:?[\s\S]*?streamVolume:\s*(\d+)")
+_DUMPSYS_VOLUME_RANGE_PATTERN = re.compile(r"STREAM_MUSIC:?[\s\S]*?Min:\s*(\d+)[\s\S]*?Max:\s*(\d+)")
+
+
+def get_volume(serial: str) -> int | None:
+    """Best-effort read of the current media volume. Returns None if it can't be parsed
+    (dumpsys output format varies across OEMs/Android versions)."""
+    try:
+        output = _shell(serial, "dumpsys", "audio", timeout=10)
+    except AdbError:
+        return None
+    match = _DUMPSYS_VOLUME_PATTERN.search(output)
+    return int(match.group(1)) if match else None
+
+
+def get_volume_range(serial: str) -> tuple[int, int] | None:
+    """Best-effort (min, max) volume bounds for this device. Android TV devices vary widely
+    here (commonly 0-15, but some OEM audio HALs use 0-100) — don't assume a fixed range."""
+    try:
+        output = _shell(serial, "dumpsys", "audio", timeout=10)
+    except AdbError:
+        return None
+    match = _DUMPSYS_VOLUME_RANGE_PATTERN.search(output)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def set_volume(serial: str, level: int, max_level: int | None = None) -> None:
+    """Set the TV's media volume to an exact level. If max_level isn't given, it's read from
+    the device (dumpsys audio); if that also fails, the level is sent unvalidated and the
+    device itself will reject or clamp an out-of-range value."""
+    if level < 0:
+        raise AdbError("Volume level can't be negative.")
+    if max_level is None:
+        detected_range = get_volume_range(serial)
+        max_level = detected_range[1] if detected_range else None
+    if max_level is not None and level > max_level:
+        raise AdbError(f"Volume level must be between 0 and {max_level}.")
+    _shell(serial, "cmd", "media_session", "volume", "--stream", _VOLUME_STREAM,
+           "--set", str(level), "--show", timeout=10)
+
+
+def wake(serial: str) -> None:
+    """Wake the TV from standby. Many Android TV devices keep Wi-Fi alive in standby for this
+    to work; a fully powered-off TV (unplugged or with Wi-Fi disabled) can't be reached."""
+    _shell(serial, "input", "keyevent", _KEYCODE_WAKEUP)
+
+
+def sleep_device(serial: str) -> None:
+    """Put the TV into standby (not a full power-off)."""
+    _shell(serial, "input", "keyevent", _KEYCODE_SLEEP)
+
+
+@dataclass(frozen=True)
+class UiElement:
+    text: str
+    resource_id: str
+    bounds: tuple[int, int, int, int]
+    clickable: bool
+
+    @property
+    def center(self) -> tuple[int, int]:
+        x1, y1, x2, y2 = self.bounds
+        return (x1 + x2) // 2, (y1 + y2) // 2
+
+
+_BOUNDS_PATTERN = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
+
+
+def ui_dump(serial: str) -> str:
+    """Dump the current screen's accessibility tree as XML. Needs the app on screen to expose
+    accessibility nodes; some custom-rendered UIs (games, some video players) won't show anything
+    useful here, in which case fall back to screenshot() + send_key()/tap()."""
+    _shell(serial, "uiautomator", "dump", "/sdcard/window_dump.xml", timeout=20)
+    return _shell(serial, "cat", "/sdcard/window_dump.xml", timeout=15)
+
+
+def _parse_ui_dump(xml_text: str) -> list[UiElement]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as error:
+        raise AdbError(f"Could not parse the TV's on-screen layout: {error}") from error
+    elements = []
+    for node in root.iter("node"):
+        match = _BOUNDS_PATTERN.match(node.get("bounds", ""))
+        if not match:
+            continue
+        bounds = (int(match[1]), int(match[2]), int(match[3]), int(match[4]))
+        elements.append(UiElement(
+            text=node.get("text", ""),
+            resource_id=node.get("resource-id", ""),
+            bounds=bounds,
+            clickable=node.get("clickable") == "true",
+        ))
+    return elements
+
+
+def find_elements(serial: str, text: str) -> list[UiElement]:
+    """On-screen elements whose visible text contains `text` (case-insensitive)."""
+    query = text.strip().casefold()
+    return [el for el in _parse_ui_dump(ui_dump(serial)) if query in el.text.casefold()]
+
+
+def tap(serial: str, x: int, y: int) -> None:
+    """Tap a screen coordinate. Some D-pad-only TV apps ignore synthetic touch events."""
+    _shell(serial, "input", "tap", str(x), str(y))
+
+
+def tap_text(serial: str, text: str) -> UiElement:
+    """Find the on-screen element containing `text` and tap its center. Raises if none or
+    multiple ambiguous (non-clickable-filtered) matches are found."""
+    matches = find_elements(serial, text)
+    if not matches:
+        raise AdbError(f"No on-screen element containing {text!r} was found.")
+    if len(matches) > 1:
+        clickable = [el for el in matches if el.clickable]
+        if len(clickable) == 1:
+            matches = clickable
+        else:
+            raise AdbError(f"Multiple on-screen elements match {text!r}; be more specific.")
+    element = matches[0]
+    tap(serial, *element.center)
+    return element
