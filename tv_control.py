@@ -205,7 +205,11 @@ def screenshot(serial: str, destination: str) -> Path:
         raise AdbError("adb screenshot timed out.") from error
     if result.returncode != 0 or not result.stdout:
         raise AdbError((result.stderr or b"screencap failed").decode(errors="replace").strip())
-    dest.write_bytes(result.stdout)
+    # Some devices write diagnostic lines to stdout before the PNG bytes; find the real start.
+    png_start = result.stdout.find(b"\x89PNG\r\n")
+    if png_start == -1:
+        raise AdbError("screencap did not return a PNG image.")
+    dest.write_bytes(result.stdout[png_start:])
     return dest
 
 
