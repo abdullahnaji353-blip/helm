@@ -24,6 +24,7 @@ from urllib.request import Request, urlopen
 
 import browser_automation
 import platform_compat
+import tv_control
 from providers import PROVIDERS, anthropic_turn, check_provider, openai_turn, parse_json_object, provider_key
 
 if platform.system() == "Windows":
@@ -129,6 +130,8 @@ CHAT_HISTORY_PATH = (
     Path.home() / "Library" / "Application Support" / "Local Desktop Assistant"
     / "chat_history.json"
 )
+TV_SERIAL_PATH = CHAT_HISTORY_PATH.parent / "tv_device.txt"
+APK_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_./~ -]{1,500}\.apk$")
 MAX_HISTORY_MESSAGES = 30
 # Replaying old tool_calls/tool-result turns verbatim measurably degrades tool-calling
 # accuracy on small/local models (noisy schemas, stale context) without adding anything a
@@ -472,6 +475,53 @@ CHAT_TOOLS = [
             "Picks up from the last completed step instead of starting over."
         ),
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "tv_connect",
+        "description": (
+            "Connect to an Android TV / Google TV over the network for tv_* actions. "
+            "The TV needs Developer options -> Network/USB debugging enabled first."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "host": {"type": "string", "description": "TV's IP address, e.g. 192.168.1.42"},
+            "port": {"type": "integer", "description": "Defaults to 5555"},
+        }, "required": ["host"]}}},
+    {"type": "function", "function": {
+        "name": "tv_open_app",
+        "description": "Open/launch an app on the connected Android TV, e.g. Netflix or YouTube.",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "tv_list_apps",
+        "description": "List apps installed on the connected Android TV.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "tv_install_app",
+        "description": "Install an .apk file onto the connected Android TV (the user always confirms).",
+        "parameters": {"type": "object", "properties": {
+            "apk_path": {"type": "string", "description": "Local path to the .apk file"}},
+            "required": ["apk_path"]}}},
+    {"type": "function", "function": {
+        "name": "tv_uninstall_app",
+        "description": "ONLY when the user explicitly says uninstall or remove a TV app (the user always confirms).",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
+    {"type": "function", "function": {
+        "name": "tv_remote_key",
+        "description": (
+            "Send one remote-control button press to the connected Android TV: home, back, up, "
+            "down, left, right, select, menu, play_pause, volume_up, volume_down, mute, power."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "key": {"type": "string"}}, "required": ["key"]}}},
+    {"type": "function", "function": {
+        "name": "tv_set_wallpaper",
+        "description": (
+            "Set a custom home-screen wallpaper image on the connected Android TV (the user "
+            "always confirms). Not all TV launchers support this."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "image_path": {"type": "string", "description": "Local path to a .png/.jpg image"}},
+            "required": ["image_path"]}}},
 ]
 MEDIA_COMMANDS = {
     "play": "play", "pause": "pause", "toggle": "playpause",
@@ -1806,6 +1856,20 @@ class DesktopAssistant:
                 return self.desktop_task(task)
             if name == "resume_task":
                 return self.resume_task()
+            if name == "tv_connect":
+                return self.tv_connect(str(args.get("host", "")), int(args.get("port") or 5555))
+            if name == "tv_open_app":
+                return self.tv_open_app(str(args.get("name", "")))
+            if name == "tv_list_apps":
+                return self.tv_list_apps()
+            if name == "tv_install_app":
+                return self.tv_install_app(str(args.get("apk_path", "")))
+            if name == "tv_uninstall_app":
+                return self.tv_uninstall_app(str(args.get("name", "")))
+            if name == "tv_remote_key":
+                return self.tv_remote_key(str(args.get("key", "")))
+            if name == "tv_set_wallpaper":
+                return self.tv_set_wallpaper(str(args.get("image_path", "")))
         except subprocess.CalledProcessError:
             return f"{name} failed; the app or command was not found."
         except (RuntimeError, ValueError) as error:
@@ -2786,6 +2850,121 @@ class DesktopAssistant:
         if result.returncode:
             return f"macOS did not allow removing {name}: {result.stderr.strip()[:200]}"
         return f"Moved {name} to the Trash. Drag it back out of the Trash to undo."
+
+    @staticmethod
+    def _tv_serial() -> str:
+        """The currently connected TV's adb serial, saved by the last successful tv_connect."""
+        try:
+            serial = TV_SERIAL_PATH.read_text(encoding="utf-8").strip()
+        except OSError:
+            serial = ""
+        if not serial or not tv_control.is_connected(serial):
+            raise tv_control.AdbError(
+                "No TV is connected. Use tv_connect with the TV's IP address first "
+                "(Settings -> Developer options -> Network/USB debugging on the TV)."
+            )
+        return serial
+
+    def tv_connect(self, host: str, port: int = 5555) -> str:
+        host = host.strip()
+        if not host:
+            return "A TV IP address is required."
+        try:
+            serial = tv_control.connect(host, port)
+        except tv_control.AdbError as error:
+            return f"Could not connect to the TV at {host}:{port}: {error}"
+        TV_SERIAL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TV_SERIAL_PATH.write_text(serial, encoding="utf-8")
+        try:
+            name = tv_control.device_name(serial)
+        except tv_control.AdbError:
+            name = serial
+        return (
+            f"Connected to {name} ({serial}). If the TV is showing an authorization prompt, "
+            "accept it on the TV screen, then try again."
+        )
+
+    def tv_open_app(self, name: str) -> str:
+        app = name.strip()
+        if not app:
+            return "An app name is required."
+        try:
+            serial = self._tv_serial()
+            package = tv_control.find_package(serial, app)
+            if package is None:
+                return f"{app} is not installed on the TV, or the name didn't match an installed app."
+            tv_control.launch_app(serial, package)
+        except tv_control.AdbError as error:
+            return f"Could not open {app} on the TV: {error}"
+        return f"Opened {app} on the TV."
+
+    def tv_list_apps(self) -> str:
+        try:
+            serial = self._tv_serial()
+            packages = tv_control.list_packages(serial)
+        except tv_control.AdbError as error:
+            return f"Could not list TV apps: {error}"
+        if not packages:
+            return "No third-party apps found on the TV."
+        return "Installed TV apps:\n" + "\n".join(f"- {pkg}" for pkg in packages[:100])
+
+    def tv_install_app(self, apk_path: str) -> str:
+        apk_path = apk_path.strip()
+        if not APK_NAME_PATTERN.match(apk_path):
+            return "That doesn't look like a path to an .apk file."
+        if os.environ.get("HELM_DRY_RUN") == "1":
+            return f"Dry run: would install {apk_path} on the TV; nothing was installed."
+        print(f"APPROVAL_REQUIRED: install {apk_path} on the TV", flush=True)
+        if not action_approved(input("Confirm installing this app on the TV? [y/yes/N] ")):
+            return "The user declined, so nothing was installed."
+        try:
+            serial = self._tv_serial()
+            tv_control.install_apk(serial, apk_path)
+        except tv_control.AdbError as error:
+            return f"Could not install {apk_path} on the TV: {error}"
+        return f"Installed {Path(apk_path).name} on the TV."
+
+    def tv_uninstall_app(self, name: str) -> str:
+        app = name.strip()
+        if not app:
+            return "An app name is required."
+        try:
+            serial = self._tv_serial()
+            package = tv_control.find_package(serial, app)
+        except tv_control.AdbError as error:
+            return f"Could not uninstall {app} from the TV: {error}"
+        if package is None:
+            return f"{app} is not installed on the TV, or the name didn't match an installed app."
+        print(f"APPROVAL_REQUIRED: uninstall {package} from the TV", flush=True)
+        if not action_approved(input("Allow this action? [y/yes/N] ")):
+            return "The user declined, so nothing was removed."
+        try:
+            tv_control.uninstall_app(serial, package)
+        except tv_control.AdbError as error:
+            return f"Could not uninstall {app} from the TV: {error}"
+        return f"Uninstalled {app} from the TV."
+
+    def tv_remote_key(self, key: str) -> str:
+        try:
+            serial = self._tv_serial()
+            tv_control.send_key(serial, key)
+        except tv_control.AdbError as error:
+            return f"Could not send {key!r} to the TV: {error}"
+        return f"Sent {key} to the TV."
+
+    def tv_set_wallpaper(self, image_path: str) -> str:
+        image_path = image_path.strip()
+        if not image_path:
+            return "An image path is required."
+        print(f"APPROVAL_REQUIRED: set {image_path} as the TV's wallpaper", flush=True)
+        if not action_approved(input("Confirm changing the TV's wallpaper? [y/yes/N] ")):
+            return "The user declined, so the wallpaper was not changed."
+        try:
+            serial = self._tv_serial()
+            tv_control.set_wallpaper(serial, image_path)
+        except tv_control.AdbError as error:
+            return f"Could not set the TV's wallpaper: {error}"
+        return f"Set {Path(image_path).name} as the TV's wallpaper."
 
     def ask_chatgpt(self, question: str) -> str:
         """Ask on chatgpt.com in the browser: its page text is readable, the desktop app's is not."""

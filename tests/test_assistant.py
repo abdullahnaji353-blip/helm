@@ -40,6 +40,7 @@ from assistant import (
 )
 from mcp_client import MCPConnector, MCPError
 from providers import openai_turn, parse_json_object, to_anthropic_messages, to_openai_messages
+import tv_control
 
 
 class ValidateOllamaHostTests(unittest.TestCase):
@@ -1697,6 +1698,94 @@ class MissingToolCallRetryTests(unittest.TestCase):
         with patch.object(assistant, "model_turn", return_value={"content": "It is sunny today."}) as model_turn:
             assistant.chat("what's the weather like?")
         model_turn.assert_called_once()
+
+
+class TvControlDispatchTests(unittest.TestCase):
+    def setUp(self):
+        self._temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temp.cleanup)
+        self.tv_serial_path = Path(self._temp.name) / "tv_device.txt"
+        patcher = patch("assistant.TV_SERIAL_PATH", self.tv_serial_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_tv_connect_saves_serial_and_reports_device_name(self):
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.connect", return_value="192.168.1.5:5555"),
+            patch("assistant.tv_control.device_name", return_value="Chromecast with Google TV"),
+        ):
+            result = assistant.run_tool("tv_connect", {"host": "192.168.1.5"})
+        self.assertEqual(self.tv_serial_path.read_text(encoding="utf-8"), "192.168.1.5:5555")
+        self.assertIn("Chromecast with Google TV", result)
+
+    def test_tv_connect_reports_adb_error(self):
+        assistant = DesktopAssistant()
+        with patch("assistant.tv_control.connect", side_effect=tv_control.AdbError("timed out")):
+            result = assistant.run_tool("tv_connect", {"host": "192.168.1.5"})
+        self.assertIn("Could not connect", result)
+
+    def test_tv_open_app_requires_a_connected_tv(self):
+        assistant = DesktopAssistant()
+        result = assistant.run_tool("tv_open_app", {"name": "Netflix"})
+        self.assertIn("No TV is connected", result)
+
+    def test_tv_open_app_launches_known_package(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.find_package", return_value="com.netflix.ninja") as find_package,
+            patch("assistant.tv_control.launch_app") as launch_app,
+        ):
+            result = assistant.run_tool("tv_open_app", {"name": "Netflix"})
+        find_package.assert_called_once_with("192.168.1.5:5555", "Netflix")
+        launch_app.assert_called_once_with("192.168.1.5:5555", "com.netflix.ninja")
+        self.assertEqual(result, "Opened Netflix on the TV.")
+
+    def test_tv_install_app_asks_for_confirmation_first(self):
+        assistant = DesktopAssistant()
+        with patch("builtins.input", return_value="no") as prompt:
+            result = assistant.run_tool("tv_install_app", {"apk_path": "/tmp/app.apk"})
+        prompt.assert_called_once()
+        self.assertIn("declined", result)
+
+    def test_tv_install_app_installs_after_confirmation(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("builtins.input", return_value="yes"),
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.install_apk") as install_apk,
+        ):
+            result = assistant.run_tool("tv_install_app", {"apk_path": "/tmp/app.apk"})
+        install_apk.assert_called_once_with("192.168.1.5:5555", "/tmp/app.apk")
+        self.assertIn("Installed", result)
+
+    def test_tv_uninstall_app_asks_for_confirmation_first(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.find_package", return_value="com.netflix.ninja"),
+            patch("assistant.tv_control.uninstall_app") as uninstall_app,
+            patch("builtins.input", return_value="no") as prompt,
+        ):
+            result = assistant.run_tool("tv_uninstall_app", {"name": "Netflix"})
+        prompt.assert_called_once()
+        uninstall_app.assert_not_called()
+        self.assertIn("declined", result)
+
+    def test_tv_remote_key_sends_key(self):
+        self.tv_serial_path.write_text("192.168.1.5:5555", encoding="utf-8")
+        assistant = DesktopAssistant()
+        with (
+            patch("assistant.tv_control.is_connected", return_value=True),
+            patch("assistant.tv_control.send_key") as send_key,
+        ):
+            result = assistant.run_tool("tv_remote_key", {"key": "home"})
+        send_key.assert_called_once_with("192.168.1.5:5555", "home")
+        self.assertEqual(result, "Sent home to the TV.")
 
 
 if __name__ == "__main__":

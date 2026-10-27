@@ -279,6 +279,61 @@ web search tool, which opens a Google, YouTube or TikTok search in Chrome or
 Safari (`--browser chrome|safari`) and reads the result links when the browser
 allows JavaScript from Apple Events.
 
+## Android TV control
+
+Helm can drive an Android TV / Google TV over ADB (Android Debug Bridge) on
+your home network: open/close apps, install or uninstall APKs, send remote
+button presses, take a screenshot of what's on screen, and (on TV launchers
+that support it) set a custom home wallpaper.
+
+### One-time TV setup
+
+1. On the TV: **Settings → System → About**, click **Build** 7 times to
+   unlock Developer options.
+2. **Settings → System → Developer options** → turn on **Network debugging**
+   (older Android TV builds call this **USB debugging**; if only that toggle
+   exists and the TV/box has a USB-C or micro-USB host port, you can instead
+   connect it to this Mac with a USB cable).
+3. Find the TV's IP address under **Settings → Network & Internet**.
+4. In Helm, ask it to connect, e.g. "connect to my TV at 192.168.1.42" (this
+   calls the `tv_connect` tool). The TV will show a one-time authorization
+   prompt the first time — accept it on the TV with the remote.
+
+Helm remembers the last connected TV (in
+`~/Library/Application Support/Local Desktop Assistant/tv_device.txt`) so you
+don't need to reconnect every session, as long as the TV keeps the same IP.
+
+### What it can do
+
+- "Open Netflix on the TV" / "open YouTube on the TV" — launches the app
+  (`tv_open_app`). Known apps are matched by friendly name; anything else is
+  matched against installed package names.
+- "What apps are on the TV?" — lists installed packages (`tv_list_apps`).
+- "Install ~/Downloads/someapp.apk on the TV" — always asks you to confirm
+  first (`tv_install_app`), same policy as installing a Mac app.
+- "Uninstall Netflix from the TV" — always asks first (`tv_uninstall_app`).
+- "Press home/back/up/down/select on the TV" — sends a remote key event
+  (`tv_remote_key`).
+- "Set the TV wallpaper to ~/Pictures/sunset.jpg" — always asks first
+  (`tv_set_wallpaper`). Many Android TV OEM launchers (and all closed
+  platforms like Samsung Tizen or LG webOS) don't support a custom home
+  wallpaper at all; on those this will push the image but have no visible
+  effect.
+
+Replacing Google Assistant as the TV's *system-level* default assistant isn't
+supported by most Android TV builds without rooting the device, which this
+project does not do. Helm itself fills that role instead: you talk to Helm,
+and Helm drives the TV over ADB.
+
+### Requirements
+
+The `adb` binary from Android SDK Platform Tools. Either:
+- place it at `vendor/platform-tools/adb` (relative to this project — not
+  committed to git), or
+- install it some other way (e.g. Homebrew's `android-platform-tools`) and
+  make sure it's on your `PATH`, or
+- set `HELM_ADB_PATH=/path/to/adb`.
+
 ## WhatsApp remote access
 
 To jump to a connection page, ask Helm to open that service's settings, for
