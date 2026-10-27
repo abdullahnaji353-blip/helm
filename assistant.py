@@ -25,6 +25,7 @@ from urllib.request import Request, urlopen
 import browser_automation
 import platform_compat
 import tv_control
+import tv_scheduler
 from providers import PROVIDERS, anthropic_turn, check_provider, openai_turn, parse_json_object, provider_key
 
 if platform.system() == "Windows":
@@ -572,6 +573,30 @@ CHAT_TOOLS = [
         ),
         "parameters": {"type": "object", "properties": {
             "text": {"type": "string"}}, "required": ["text"]}}},
+    {"type": "function", "function": {
+        "name": "tv_schedule_action",
+        "description": (
+            "Schedule a recurring daily TV action at a fixed time, via macOS's native "
+            "scheduler (launchd) — keeps running even when Helm's chat isn't open, as long "
+            "as the Mac itself is awake and on. The user always confirms first, since this "
+            "installs a persistent background job."
+        ),
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "A label for this schedule, e.g. 'bedtime'"},
+            "action": {"type": "string", "enum": ["wake", "sleep", "open_app", "set_volume", "remote_key"]},
+            "arg": {"type": "string", "description": "App name / volume level / key name, if the action needs one"},
+            "hour": {"type": "integer", "description": "24-hour hour, 0-23"},
+            "minute": {"type": "integer", "description": "0-59"},
+        }, "required": ["name", "action", "hour", "minute"]}}},
+    {"type": "function", "function": {
+        "name": "tv_list_scheduled_actions",
+        "description": "List every scheduled recurring TV action.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "tv_remove_scheduled_action",
+        "description": "Remove a scheduled TV action by its name (the user always confirms).",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string"}}, "required": ["name"]}}},
 ]
 MEDIA_COMMANDS = {
     "play": "play", "pause": "pause", "toggle": "playpause",
@@ -1936,6 +1961,15 @@ class DesktopAssistant:
                 return self.tv_sleep()
             if name == "tv_tap_text":
                 return self.tv_tap_text(str(args.get("text", "")))
+            if name == "tv_schedule_action":
+                return self.tv_schedule_action(
+                    str(args.get("name", "")), str(args.get("action", "")), str(args.get("arg", "")),
+                    int(args.get("hour", 0)), int(args.get("minute", 0)),
+                )
+            if name == "tv_list_scheduled_actions":
+                return self.tv_list_scheduled_actions()
+            if name == "tv_remove_scheduled_action":
+                return self.tv_remove_scheduled_action(str(args.get("name", "")))
         except subprocess.CalledProcessError:
             return f"{name} failed; the app or command was not found."
         except (RuntimeError, ValueError) as error:
@@ -3126,6 +3160,50 @@ class DesktopAssistant:
         except tv_control.AdbError as error:
             return f"Could not tap '{text}' on the TV: {error}"
         return f"Tapped '{text}' on the TV."
+
+    def tv_schedule_action(self, name: str, action: str, arg: str, hour: int, minute: int) -> str:
+        name = name.strip()
+        arg = arg.strip()
+        if not name:
+            return "A name for this schedule is required."
+        description = f"{action}{' ' + arg if arg else ''}"
+        print(
+            f"APPROVAL_REQUIRED: schedule the TV to run '{description}' daily at "
+            f"{hour:02d}:{minute:02d}, saved as '{name}'", flush=True,
+        )
+        if not action_approved(input("Confirm creating this scheduled TV action? [y/yes/N] ")):
+            return "The user declined, so nothing was scheduled."
+        try:
+            tv_scheduler.schedule_action(name, action, [arg] if arg else [], hour, minute)
+        except tv_scheduler.SchedulerError as error:
+            return f"Could not create the schedule: {error}"
+        return f"Scheduled '{name}': {description} daily at {hour:02d}:{minute:02d}."
+
+    def tv_list_scheduled_actions(self) -> str:
+        schedules = tv_scheduler.list_scheduled_actions()
+        if not schedules:
+            return "No TV actions are scheduled."
+        lines = []
+        for entry in schedules:
+            time_label = (
+                f"{entry['hour']:02d}:{entry['minute']:02d}" if entry["hour"] is not None else "unknown time"
+            )
+            arg_label = " " + " ".join(entry["args"]) if entry["args"] else ""
+            lines.append(f"- {entry['name']}: {entry['action']}{arg_label} daily at {time_label}")
+        return "Scheduled TV actions:\n" + "\n".join(lines)
+
+    def tv_remove_scheduled_action(self, name: str) -> str:
+        name = name.strip()
+        if not name:
+            return "A schedule name is required."
+        print(f"APPROVAL_REQUIRED: remove the scheduled TV action '{name}'", flush=True)
+        if not action_approved(input("Allow this action? [y/yes/N] ")):
+            return "The user declined, so nothing was removed."
+        try:
+            tv_scheduler.remove_scheduled_action(name)
+        except tv_scheduler.SchedulerError as error:
+            return f"Could not remove the schedule: {error}"
+        return f"Removed the scheduled TV action '{name}'."
 
     def ask_chatgpt(self, question: str) -> str:
         """Ask on chatgpt.com in the browser: its page text is readable, the desktop app's is not."""

@@ -1895,6 +1895,58 @@ class TvControlDispatchTests(unittest.TestCase):
         tap_text.assert_called_once_with("192.168.1.5:5555", "Always")
         self.assertIn("Always", result)
 
+    def test_tv_schedule_action_asks_for_confirmation_first(self):
+        assistant = DesktopAssistant()
+        with patch("builtins.input", return_value="no") as prompt:
+            result = assistant.run_tool(
+                "tv_schedule_action", {"name": "bedtime", "action": "sleep", "hour": 21, "minute": 0},
+            )
+        prompt.assert_called_once()
+        self.assertIn("declined", result)
+
+    def test_tv_schedule_action_schedules_after_confirmation(self):
+        assistant = DesktopAssistant()
+        with (
+            patch("builtins.input", return_value="yes"),
+            patch("assistant.tv_scheduler.schedule_action") as schedule_action,
+        ):
+            result = assistant.run_tool(
+                "tv_schedule_action",
+                {"name": "movie_time", "action": "open_app", "arg": "Netflix", "hour": 20, "minute": 0},
+            )
+        schedule_action.assert_called_once_with("movie_time", "open_app", ["Netflix"], 20, 0)
+        self.assertIn("movie_time", result)
+        self.assertIn("20:00", result)
+
+    def test_tv_list_scheduled_actions_formats_entries(self):
+        assistant = DesktopAssistant()
+        with patch("assistant.tv_scheduler.list_scheduled_actions", return_value=[
+            {"name": "bedtime", "action": "sleep", "args": [], "hour": 21, "minute": 0},
+        ]):
+            result = assistant.run_tool("tv_list_scheduled_actions", {})
+        self.assertIn("bedtime: sleep daily at 21:00", result)
+
+    def test_tv_remove_scheduled_action_asks_for_confirmation_first(self):
+        assistant = DesktopAssistant()
+        with (
+            patch("builtins.input", return_value="no") as prompt,
+            patch("assistant.tv_scheduler.remove_scheduled_action") as remove_action,
+        ):
+            result = assistant.run_tool("tv_remove_scheduled_action", {"name": "bedtime"})
+        prompt.assert_called_once()
+        remove_action.assert_not_called()
+        self.assertIn("declined", result)
+
+    def test_tv_remove_scheduled_action_removes_after_confirmation(self):
+        assistant = DesktopAssistant()
+        with (
+            patch("builtins.input", return_value="yes"),
+            patch("assistant.tv_scheduler.remove_scheduled_action") as remove_action,
+        ):
+            result = assistant.run_tool("tv_remove_scheduled_action", {"name": "bedtime"})
+        remove_action.assert_called_once_with("bedtime")
+        self.assertIn("Removed", result)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -346,7 +346,29 @@ don't need to reconnect every session, as long as the TV keeps the same IP.
 Replacing Google Assistant as the TV's *system-level* default assistant isn't
 supported by most Android TV builds without rooting the device, which this
 project does not do. Helm itself fills that role instead: you talk to Helm,
-and Helm drives the TV over ADB.
+and Helm drives the TV over ADB — by typing, or by voice. Voice dictation
+already reuses the same chat pipeline as typed messages, so saying "open
+Netflix on the TV" works exactly like typing it, with no separate setup.
+
+### Scheduled TV actions
+
+"Put the TV to sleep every night at 11" or "open Netflix every day at 8pm"
+installs a recurring job in macOS's own scheduler (launchd), under
+`~/Library/LaunchAgents`, so it keeps firing even when Helm's chat window
+isn't open — as long as this Mac is awake and powered on (it won't wake a
+sleeping Mac, and a fully powered-off TV can't be reached either).
+
+- `tv_schedule_action` — always asks you to confirm first, since this
+  installs a persistent background job. Supported actions: `wake`, `sleep`,
+  `open_app` (needs an app name), `set_volume` (needs a level),
+  `remote_key` (needs a key name).
+- `tv_list_scheduled_actions` — lists everything currently scheduled.
+- `tv_remove_scheduled_action` — removes one by name, also always confirms.
+
+Each schedule runs `tv_schedule_cli.py` directly (not through the chat
+model), using whichever TV was last connected at the time the job fires, so
+the TV needs to already be reachable over the network when the schedule
+runs. Logs for scheduled runs go to `~/Library/Logs/Helm/tv-schedule.log`.
 
 ### Requirements
 
