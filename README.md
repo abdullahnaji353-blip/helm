@@ -370,6 +370,38 @@ model), using whichever TV was last connected at the time the job fires, so
 the TV needs to already be reachable over the network when the schedule
 runs. Logs for scheduled runs go to `~/Library/Logs/Helm/tv-schedule.log`.
 
+### Web remote (control it from your phone)
+
+```sh
+python3 tv_web_server.py
+```
+
+Prints a URL like `http://192.168.1.x:8766/?token=...` — open that on your
+phone's browser (same Wi-Fi as this Mac) for a touch remote: app shortcuts,
+D-pad, volume, search, wake/sleep, and a small clock + note widget in the
+top-right corner. The note is just a short persisted sticky note, not
+anything synced elsewhere.
+
+It has a "Hey Helm" mic button for voice commands (say the wake phrase, then
+e.g. "open Netflix" or "search YouTube for Ms Rachel"), but phone browsers
+only allow microphone access on secure (HTTPS) origins — over plain
+`http://` on your LAN, most browsers will block it, and the page says so and
+disables the button rather than pretending to listen. The touch controls
+work regardless. For reliable voice control today, use Helm's existing
+voice dictation on the Mac — it already has every `tv_*` tool available,
+with no setup needed.
+
+Only non-destructive actions are exposed over this web API (launch/search
+apps, remote keys, volume, wake/sleep, the note) — installing or
+uninstalling apps and changing the wallpaper stay chat-only, where Helm can
+ask you to confirm each one; this server has no interactive terminal to ask
+through, and it's reachable by anyone on your Wi-Fi who has the link. A
+random token (saved in
+`~/Library/Application Support/Local Desktop Assistant/tv_web_token.txt`,
+printed each time you start the server) is required for every API call, but
+there's no further authentication — don't share the link outside your
+household, and don't port-forward this server to the internet.
+
 ### Requirements
 
 The `adb` binary from Android SDK Platform Tools. Either:

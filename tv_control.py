@@ -191,6 +191,9 @@ def find_package(serial: str, name: str) -> str | None:
 
 
 def launch_app(serial: str, package: str) -> None:
+    # Dismiss any screensaver/dream first: a launch intent sent while one is active gets queued
+    # silently behind it instead of coming to the front.
+    wake(serial)
     _shell(
         serial, "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1",
         timeout=20,
@@ -256,7 +259,9 @@ def set_wallpaper(serial: str, image_path: str) -> str:
 
 
 def open_url(serial: str, url: str) -> None:
-    """Open a URL with whichever app handles it (usually that app's own TV client)."""
+    """Open a URL with whichever app handles it (usually that app's own TV client). Dismisses
+    any active screensaver first, same reasoning as launch_app."""
+    wake(serial)
     _shell(serial, "am", "start", "-a", "android.intent.action.VIEW", "-d", url, timeout=20)
 
 

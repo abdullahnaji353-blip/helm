@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Helm TV Remote</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot" id="status-dot"></span>
+      <div>
+        <div class="brand-title">Helm TV</div>
+        <div class="brand-sub" id="device-label">Connecting…</div>
+      </div>
+    </div>
+    <div class="corner-widget">
+      <div class="clock" id="clock">--:--</div>
+      <div class="note-wrap">
+        <textarea id="note" class="note" placeholder="Note…" maxlength="280"></textarea>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section class="card mic-card">
+      <button id="mic-btn" class="mic-btn" disabled>
+        <span class="mic-icon">●</span>
+        <span id="mic-label">Hey Helm</span>
+      </button>
+      <p id="mic-hint" class="hint"></p>
+    </section>
+
+    <section class="card">
+      <form id="search-form" class="search-row">
+        <select id="search-app"></select>
+        <input id="search-query" type="text" placeholder="Search…" autocomplete="off">
+        <button type="submit">Go</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <div class="app-grid" id="app-grid"></div>
+    </section>
+
+    <section class="card dpad-card">
+      <div class="dpad">
+        <button data-key="up" class="dpad-up">▲</button>
+        <button data-key="left" class="dpad-left">◀</button>
+        <button data-key="select" class="dpad-center">●</button>
+        <button data-key="right" class="dpad-right">▶</button>
+        <button data-key="down" class="dpad-down">▼</button>
+      </div>
+      <div class="row-buttons">
+        <button data-key="back">Back</button>
+        <button data-key="home">Home</button>
+        <button data-key="menu">Menu</button>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="volume-row">
+        <button data-key="volume_down">－</button>
+        <input id="volume-slider" type="range" min="0" max="20" value="10">
+        <button data-key="volume_up">＋</button>
+        <button data-key="mute">Mute</button>
+      </div>
+      <div class="power-row">
+        <button id="wake-btn">Wake</button>
+        <button id="sleep-btn">Sleep</button>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

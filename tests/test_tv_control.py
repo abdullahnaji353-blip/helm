@@ -64,6 +64,31 @@ class PackageLookupTests(unittest.TestCase):
         self.assertIsNone(package)
 
 
+class LaunchAppTests(unittest.TestCase):
+    def test_launch_app_wakes_the_device_first(self):
+        # Regression test: a launch intent sent while a screensaver/dream is active gets
+        # queued silently behind it instead of coming to the front, unless woken first.
+        with patch("subprocess.run", return_value=fake_run()) as mock_run:
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                tv_control.launch_app("serial", "com.netflix.ninja")
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn(tv_control._KEYCODE_WAKEUP, calls[0])
+        self.assertIn("monkey", calls[1])
+        self.assertIn("com.netflix.ninja", calls[1])
+
+
+class OpenUrlTests(unittest.TestCase):
+    def test_open_url_wakes_the_device_first(self):
+        with patch("subprocess.run", return_value=fake_run()) as mock_run:
+            with patch.dict("os.environ", {"HELM_ADB_PATH": "adb"}):
+                tv_control.open_url("serial", "https://example.com")
+        calls = [c.args[0] for c in mock_run.call_args_list]
+        self.assertEqual(len(calls), 2)
+        self.assertIn(tv_control._KEYCODE_WAKEUP, calls[0])
+        self.assertIn("https://example.com", calls[1])
+
+
 class InstallAndUninstallTests(unittest.TestCase):
     def test_install_apk_rejects_non_apk(self):
         with self.assertRaises(tv_control.AdbError):
